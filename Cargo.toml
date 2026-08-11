@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/lyra-player-core",
+  "crates/lyra-player-device",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0"
+rust-version = "1.85"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"

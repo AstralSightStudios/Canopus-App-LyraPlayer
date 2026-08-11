@@ -1,0 +1,18 @@
+[package]
+name = "lyra-player-core"
+description = "No-std application model and protocols for Lyra Player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+std = ["serde/std", "serde_json/std", "base64/std"]
+
+[dependencies]
+canopus-ui-core = { path = "../../../Canopus/sdk/rust/canopus-ui-core" }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+qrcodegen-no-heap = "1.8"

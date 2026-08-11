@@ -1,0 +1,6 @@
+/target/
+/build/
+__pycache__/
+/watchfaces/lyra-player/module.bin
+/watchfaces/lyra-player/receipt.bin
+.DS_Store

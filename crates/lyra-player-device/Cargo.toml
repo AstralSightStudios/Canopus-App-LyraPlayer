@@ -1,0 +1,25 @@
+[package]
+name = "lyra-player-device"
+description = "Canopus native device module for Lyra Player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+default = []
+device = ["dep:canopus-target-private"]
+target-xiaomi-band-10-pro-3-101-030 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-030"]
+target-xiaomi-band-10-pro-3-101-036 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-036"]
+target-xiaomi-band-9-pro-3-1-175 = ["device", "canopus-target-private/target-xiaomi-band-9-pro-3-1-175"]
+
+[dependencies]
+lyra-player-core = { path = "../lyra-player-core", default-features = false }
+canopus-abi = { path = "../../../Canopus/sdk/rust/canopus-abi" }
+canopus-runtime = { path = "../../../Canopus/sdk/rust/canopus-runtime" }
+canopus-ui-core = { path = "../../../Canopus/sdk/rust/canopus-ui-core" }
+canopus-target-private = { path = "../../../Canopus/sdk/rust/canopus-target-private", optional = true, default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
