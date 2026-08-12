@@ -1,137 +1,194 @@
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
+use aes::Aes128;
+use cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
+use md5::{Digest, Md5};
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::{AlbumRef, Artist, Playlist, Profile, Song};
 
-pub const DEFAULT_API_BASE: &str = "http://127.0.0.1:3000";
+pub const DEFAULT_API_BASE: &str = "https://interfacepc.music.163.com";
+const EAPI_KEY: &[u8; 16] = b"e82ckenh8dichen8";
+const EAPI_DELIMITER: &str = "-36cd479b6b5-";
+const USER_AGENT: &str =
+    "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiRequest {
-    pub path: String,
-    pub cookie: Option<String>,
-}
-
-impl ApiRequest {
-    pub fn url(&self, base: &str) -> String {
-        format!("{}{}", base.trim_end_matches('/'), self.path)
-    }
+    pub url: String,
+    pub method: &'static str,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
 }
 
 pub fn qr_key() -> ApiRequest {
-    request("/login/qr/key?timestamp=1")
+    eapi("/api/login/qrcode/unikey", json!({ "type": 3 }), None, 1)
 }
 
-pub fn qr_create(key: &str) -> ApiRequest {
-    request(&format!("/login/qr/create?key={}&qrimg=false", encode(key)))
+pub fn qr_url(key: &str) -> String {
+    format!("https://music.163.com/login?codekey={}", encode(key))
 }
 
 pub fn qr_check(key: &str, nonce: u64) -> ApiRequest {
-    request(&format!(
-        "/login/qr/check?key={}&timestamp={nonce}",
-        encode(key)
-    ))
+    eapi(
+        "/api/login/qrcode/client/login",
+        json!({ "key": key, "type": 3 }),
+        None,
+        nonce,
+    )
 }
 
 pub fn login_status(cookie: &str, nonce: u64) -> ApiRequest {
-    authenticated(format!("/login/status?timestamp={nonce}"), cookie)
+    eapi("/api/w/nuser/account/get", json!({}), Some(cookie), nonce)
 }
 
 pub fn user_playlists(uid: u64, offset: u32, cookie: &str) -> ApiRequest {
-    authenticated(
-        format!("/user/playlist?uid={uid}&limit=20&offset={offset}"),
-        cookie,
+    eapi(
+        "/api/user/playlist",
+        json!({ "uid": uid, "limit": 20, "offset": offset, "includeVideo": true }),
+        Some(cookie),
+        u64::from(offset) + 1,
     )
 }
 
 pub fn daily_playlists(cookie: &str, nonce: u64) -> ApiRequest {
-    authenticated(format!("/recommend/resource?timestamp={nonce}"), cookie)
+    eapi(
+        "/api/v1/discovery/recommend/resource",
+        json!({}),
+        Some(cookie),
+        nonce,
+    )
 }
 
 pub fn daily_songs(cookie: &str, nonce: u64) -> ApiRequest {
-    authenticated(format!("/recommend/songs?timestamp={nonce}"), cookie)
+    eapi(
+        "/api/v3/discovery/recommend/songs",
+        json!({ "afresh": false }),
+        Some(cookie),
+        nonce,
+    )
 }
 
 pub fn playlist_detail(id: u64, cookie: &str, nonce: u64) -> ApiRequest {
-    authenticated(
-        format!("/playlist/detail?id={id}&s=0&timestamp={nonce}"),
-        cookie,
+    eapi(
+        "/api/v6/playlist/detail",
+        json!({ "id": id, "n": 100000, "s": 0 }),
+        Some(cookie),
+        nonce,
     )
 }
 
 pub fn playlist_tracks(id: u64, offset: u32, cookie: &str) -> ApiRequest {
-    authenticated(
-        format!("/playlist/track/all?id={id}&limit=30&offset={offset}"),
-        cookie,
+    eapi(
+        "/api/v6/playlist/detail",
+        json!({ "id": id, "n": 100000, "s": 0, "lyra_offset": offset }),
+        Some(cookie),
+        u64::from(offset) + 1,
     )
 }
 
 pub fn song_url(id: u64, cookie: &str, nonce: u64) -> ApiRequest {
-    authenticated(
-        format!("/song/url/v1?id={id}&level=standard&timestamp={nonce}"),
-        cookie,
+    eapi(
+        "/api/song/enhance/player/url",
+        json!({ "ids": format!("[\"{id}\"]"), "br": 320000 }),
+        Some(cookie),
+        nonce,
     )
 }
 
 pub fn lyric(id: u64, cookie: &str, nonce: u64) -> ApiRequest {
-    authenticated(format!("/lyric/new?id={id}&timestamp={nonce}"), cookie)
-}
-
-pub fn search_songs(query: &str, offset: u32, cookie: Option<&str>) -> ApiRequest {
-    with_cookie(
-        format!(
-            "/search?keywords={}&type=1&limit=20&offset={offset}",
-            encode(query)
-        ),
-        cookie,
+    eapi(
+        "/api/song/lyric/v1",
+        json!({ "id": id, "cp": false, "tv": 0, "lv": 0, "rv": 0, "kv": 0, "yv": 0, "ytv": 0, "yrv": 0 }),
+        Some(cookie),
+        nonce,
     )
 }
 
+pub fn search_songs(query: &str, offset: u32, cookie: Option<&str>) -> ApiRequest {
+    search(query, 1, 20, offset, cookie)
+}
+
 pub fn search_artists(query: &str, offset: u32, cookie: Option<&str>) -> ApiRequest {
-    with_cookie(
-        format!(
-            "/search?keywords={}&type=100&limit=10&offset={offset}",
-            encode(query)
-        ),
+    search(query, 100, 10, offset, cookie)
+}
+
+fn search(query: &str, kind: u32, limit: u32, offset: u32, cookie: Option<&str>) -> ApiRequest {
+    eapi(
+        "/api/search/get",
+        json!({ "s": query, "type": kind, "limit": limit, "offset": offset }),
         cookie,
+        u64::from(offset) + 1,
     )
 }
 
 pub fn artist_detail(id: u64, cookie: Option<&str>) -> ApiRequest {
-    with_cookie(format!("/artist/detail?id={id}"), cookie)
+    eapi("/api/artist/head/info/get", json!({ "id": id }), cookie, id)
 }
 
 pub fn artist_songs(id: u64, offset: u32, cookie: Option<&str>) -> ApiRequest {
-    with_cookie(
-        format!("/artist/songs?id={id}&order=hot&limit=30&offset={offset}"),
+    eapi(
+        "/api/v1/artist/songs",
+        json!({ "id": id, "private_cloud": "true", "work_type": 1, "order": "hot", "limit": 30, "offset": offset }),
         cookie,
+        id.wrapping_add(u64::from(offset)),
     )
 }
 
 pub fn artist_albums(id: u64, offset: u32, cookie: Option<&str>) -> ApiRequest {
-    with_cookie(
-        format!("/artist/album?id={id}&limit=20&offset={offset}"),
+    eapi(
+        &format!("/api/artist/albums/{id}"),
+        json!({ "limit": 20, "offset": offset, "total": true }),
         cookie,
+        id.wrapping_add(u64::from(offset)),
     )
 }
 
-fn request(path: &str) -> ApiRequest {
-    ApiRequest {
-        path: path.into(),
-        cookie: None,
+fn eapi(path: &str, mut data: Value, cookie: Option<&str>, nonce: u64) -> ApiRequest {
+    let header = json!({
+        "osver": "16.2",
+        "deviceId": "canopus-lyra-player",
+        "os": "iPhone OS",
+        "appver": "9.0.90",
+        "versioncode": "5038",
+        "buildver": "1700000000",
+        "resolution": "336x480",
+        "channel": "distribution",
+        "requestId": format!("{nonce}_0000"),
+    });
+    if let Value::Object(fields) = &mut data {
+        fields.insert("header".into(), header);
+        fields.insert("e_r".into(), Value::Bool(false));
     }
-}
-
-fn authenticated(path: String, cookie: &str) -> ApiRequest {
-    ApiRequest {
-        path,
-        cookie: Some(cookie.into()),
+    let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+    let digest = Md5::digest(
+        format!("nobody{path}use{text}md5forencrypt").as_bytes(),
+    );
+    let signed = format!(
+        "{path}{EAPI_DELIMITER}{text}{EAPI_DELIMITER}{digest:x}"
+    );
+    let mut bytes = signed.into_bytes();
+    let message_len = bytes.len();
+    bytes.resize(message_len + 16, 0);
+    let encrypted = Aes128::new(EAPI_KEY.into())
+        .encrypt_padded_mut::<Pkcs7>(&mut bytes, message_len)
+        .unwrap_or(&[]);
+    let mut params = String::with_capacity(encrypted.len() * 2);
+    for byte in encrypted {
+        params.push_str(&format!("{byte:02X}"));
     }
-}
-
-fn with_cookie(path: String, cookie: Option<&str>) -> ApiRequest {
+    let mut headers = vec![
+        ("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+        ("User-Agent".into(), USER_AGENT.into()),
+    ];
+    if let Some(cookie) = cookie.filter(|value| !value.is_empty()) {
+        headers.push(("Cookie".into(), cookie.into()));
+    }
     ApiRequest {
-        path,
-        cookie: cookie.map(Into::into),
+        url: format!("{DEFAULT_API_BASE}/eapi/{}", path.trim_start_matches("/api/")),
+        method: "POST",
+        headers,
+        body: Some(format!("params={params}")),
     }
 }
 
@@ -171,7 +228,10 @@ fn ensure_ok(json: &str) -> Result<(), ApiError> {
 #[derive(Deserialize)]
 struct QrKeyEnvelope {
     code: i32,
-    data: QrKeyData,
+    #[serde(default)]
+    unikey: String,
+    #[serde(default)]
+    data: Option<QrKeyData>,
 }
 #[derive(Deserialize)]
 struct QrKeyData {
@@ -183,7 +243,11 @@ pub fn parse_qr_key(json: &str) -> Result<String, ApiError> {
     if value.code != 200 {
         return Err(ApiError::Server(value.code));
     }
-    Ok(value.data.unikey)
+    if value.unikey.is_empty() {
+        value.data.map(|data| data.unikey).ok_or(ApiError::Missing)
+    } else {
+        Ok(value.unikey)
+    }
 }
 
 #[derive(Deserialize)]
@@ -246,8 +310,10 @@ pub fn parse_profile(json: &str) -> Result<Profile, ApiError> {
 #[derive(Deserialize)]
 struct PlaylistsEnvelope {
     code: i32,
-    #[serde(default, alias = "recommend")]
+    #[serde(default)]
     playlist: Vec<Playlist>,
+    #[serde(default)]
+    recommend: Vec<Playlist>,
 }
 
 pub fn parse_playlists(json: &str) -> Result<Vec<Playlist>, ApiError> {
@@ -255,7 +321,11 @@ pub fn parse_playlists(json: &str) -> Result<Vec<Playlist>, ApiError> {
     if value.code != 200 {
         return Err(ApiError::Server(value.code));
     }
-    Ok(value.playlist)
+    if value.playlist.is_empty() {
+        Ok(value.recommend)
+    } else {
+        Ok(value.playlist)
+    }
 }
 
 #[derive(Deserialize)]
@@ -277,6 +347,14 @@ struct SongsEnvelope {
     code: i32,
     #[serde(default)]
     songs: Vec<Song>,
+    #[serde(default)]
+    playlist: Option<PlaylistSongs>,
+}
+
+#[derive(Default, Deserialize)]
+struct PlaylistSongs {
+    #[serde(default)]
+    tracks: Vec<Song>,
 }
 
 pub fn parse_songs(json: &str) -> Result<Vec<Song>, ApiError> {
@@ -284,7 +362,11 @@ pub fn parse_songs(json: &str) -> Result<Vec<Song>, ApiError> {
     if value.code != 200 {
         return Err(ApiError::Server(value.code));
     }
-    Ok(value.songs)
+    if value.songs.is_empty() {
+        Ok(value.playlist.map(|playlist| playlist.tracks).unwrap_or_default())
+    } else {
+        Ok(value.songs)
+    }
 }
 
 #[derive(Deserialize)]
@@ -406,11 +488,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoints_encode_queries_and_attach_cookie() {
+    fn endpoints_encrypt_posts_and_attach_cookie() {
         let request = search_songs("宇多田 ヒカル", 20, Some("MUSIC_U=abc"));
-        assert!(request.path.contains("%E5%AE%87"));
-        assert!(request.path.contains("offset=20"));
-        assert_eq!(request.cookie.as_deref(), Some("MUSIC_U=abc"));
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "https://interfacepc.music.163.com/eapi/search/get");
+        assert!(request.body.as_deref().unwrap_or("").starts_with("params="));
+        assert!(request.headers.iter().any(|(key, value)| {
+            key == "Cookie" && value == "MUSIC_U=abc"
+        }));
+        assert!(!request.body.as_deref().unwrap_or("").contains("宇多田"));
+    }
+
+    #[test]
+    fn qr_url_is_local_and_encoded() {
+        assert_eq!(
+            qr_url("a+b"),
+            "https://music.163.com/login?codekey=a%2Bb"
+        );
+    }
+
+    #[test]
+    fn direct_shapes_parse_without_node_envelopes() {
+        let playlists = parse_playlists(
+            r#"{"code":200,"recommend":[{"id":1,"name":"Daily"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(playlists[0].name, "Daily");
+        let songs = parse_songs(
+            r#"{"code":200,"playlist":{"tracks":[{"id":2,"name":"Track"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(songs[0].name, "Track");
     }
 
     #[test]
@@ -418,6 +526,10 @@ mod tests {
         assert_eq!(
             parse_qr_key(r#"{"code":200,"data":{"unikey":"key-1"}}"#).unwrap(),
             "key-1"
+        );
+        assert_eq!(
+            parse_qr_key(r#"{"code":200,"unikey":"key-2"}"#).unwrap(),
+            "key-2"
         );
         assert_eq!(
             parse_song_url(r#"{"code":200,"data":[{"url":"https://a/song.mp3"}]}"#).unwrap(),

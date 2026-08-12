@@ -90,6 +90,7 @@ pub enum Action {
     ApiResponse {
         kind: RequestKind,
         body: String,
+        cookie: Option<String>,
         now_ms: u64,
     },
     ApiFailed {
@@ -278,8 +279,13 @@ impl LyraApp {
                 }
             }
             Action::SongUrlReady(url) => effects.push(Effect::StreamAudio { url }),
-            Action::ApiResponse { kind, body, now_ms } => {
-                self.handle_api(kind, &body, now_ms, &mut effects);
+            Action::ApiResponse {
+                kind,
+                body,
+                cookie,
+                now_ms,
+            } => {
+                self.handle_api(kind, &body, cookie.as_deref(), now_ms, &mut effects);
             }
             Action::ApiFailed { kind: _, message } => {
                 self.loading = false;
@@ -310,6 +316,7 @@ impl LyraApp {
         &mut self,
         kind: RequestKind,
         body: &str,
+        response_cookie: Option<&str>,
         now_ms: u64,
         effects: &mut Vec<Effect>,
     ) {
@@ -318,7 +325,8 @@ impl LyraApp {
         let result: Result<(), api::ApiError> = match kind {
             RequestKind::QrKey => api::parse_qr_key(body).map(|key| {
                 self.qr.key = key.clone();
-                effects.push(fetch(RequestKind::QrCreate, api::qr_create(&key)));
+                self.qr.url = api::qr_url(&key);
+                self.qr.status = QrStatus::WaitingScan;
             }),
             RequestKind::QrCreate => api::parse_qr_url(body).map(|url| {
                 self.qr.url = url;
@@ -339,7 +347,10 @@ impl LyraApp {
                 }
                 803 => {
                     self.qr.status = QrStatus::Authorized;
-                    let cookie = check.cookie.ok_or(api::ApiError::Missing)?;
+                    let cookie = check
+                        .cookie
+                        .or_else(|| response_cookie.map(ToOwned::to_owned))
+                        .ok_or(api::ApiError::Missing)?;
                     self.session = Some(Session {
                         cookie: cookie.clone(),
                         saved_at_ms: now_ms,
@@ -492,11 +503,13 @@ mod tests {
         app.update(Action::ApiResponse {
             kind: RequestKind::QrCheck,
             body: r#"{"code":803,"cookie":"MUSIC_U=abc"}"#.into(),
+            cookie: None,
             now_ms: 12,
         });
         let effects = app.update(Action::ApiResponse {
             kind: RequestKind::LoginStatus,
             body: r#"{"data":{"code":200,"profile":{"userId":7,"nickname":"Lyra"}}}"#.into(),
+            cookie: None,
             now_ms: 13,
         });
         assert_eq!(app.profile.as_ref().unwrap().user_id, 7);
@@ -521,11 +534,13 @@ mod tests {
         app.update(Action::ApiResponse {
             kind: RequestKind::PlaylistTracks,
             body: r#"{"code":200,"songs":[{"id":1,"name":"First"}]}"#.into(),
+            cookie: None,
             now_ms: 2,
         });
         app.update(Action::ApiResponse {
             kind: RequestKind::PlaylistDetail,
             body: r#"{"code":200,"playlist":{"id":7,"name":"Mix","trackCount":1}}"#.into(),
+            cookie: None,
             now_ms: 3,
         });
         assert_eq!(app.selected_playlist.as_ref().unwrap().tracks.len(), 1);
@@ -534,11 +549,13 @@ mod tests {
         app.update(Action::ApiResponse {
             kind: RequestKind::ArtistSongs,
             body: r#"{"code":200,"songs":[{"id":2,"name":"Second"}]}"#.into(),
+            cookie: None,
             now_ms: 4,
         });
         app.update(Action::ApiResponse {
             kind: RequestKind::ArtistDetail,
             body: r#"{"code":200,"data":{"artist":{"id":9,"name":"Artist"}}}"#.into(),
+            cookie: None,
             now_ms: 5,
         });
         assert_eq!(app.selected_artist.as_ref().unwrap().songs.len(), 1);

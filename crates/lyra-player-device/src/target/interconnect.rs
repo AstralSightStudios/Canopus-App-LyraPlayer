@@ -3,7 +3,7 @@
 //! Receive callbacks only copy into two fixed slots. Parsing, application
 //! updates, audio writes, and LVX navigation are deferred to the UI-owner timer.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
@@ -51,6 +51,9 @@ static mut SEND_MESSAGE: core::mem::MaybeUninit<InterconnectConnMessage> =
     core::mem::MaybeUninit::uninit();
 
 pub fn register() -> Result<(), i32> {
+    if runtime().connection.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
     let loop_handle = unsafe { interconnect_loop() };
     if loop_handle.is_null() {
         return Err(-1);
@@ -292,14 +295,18 @@ fn process(text: &str) -> Vec<Effect> {
         };
         let mut replies = result.replies;
         let effects = match result.event {
-            BridgeEvent::Response { id, body, .. } => {
+            BridgeEvent::Response {
+                id, body, headers, ..
+            } => {
                 let Some(kind) = core.pending.remove(&id) else {
                     return Vec::new();
                 };
+                let cookie = response_cookie(&headers);
                 match String::from_utf8(body) {
                     Ok(body) => core.app.update(Action::ApiResponse {
                         kind,
                         body,
+                        cookie,
                         now_ms: core.app.generation as u64,
                     }),
                     Err(_) => core.app.update(Action::ApiFailed {
@@ -389,13 +396,32 @@ fn process_control(text: &str) -> Option<Vec<Effect>> {
     }
 }
 
-pub fn enqueue_api(kind: RequestKind, url: String, cookie: Option<String>) {
-    let message = with_core(|core| {
-        let mut options = FetchOptions::default();
-        if let Some(cookie) = cookie {
-            options.headers.push(("Cookie".into(), cookie));
+fn response_cookie(headers: &BTreeMap<String, String>) -> Option<String> {
+    let values = headers.get("set-cookie")?;
+    let mut cookie = String::new();
+    for value in values.split(',') {
+        let pair = value.trim().split(';').next().unwrap_or("").trim();
+        if pair.is_empty() || !pair.contains('=') {
+            continue;
         }
-        let (id, message) = core.bridge.fetch(&url, &options);
+        if !cookie.is_empty() {
+            cookie.push_str("; ");
+        }
+        cookie.push_str(pair);
+    }
+    (!cookie.is_empty()).then_some(cookie)
+}
+
+pub fn enqueue_api(kind: RequestKind, request: lyra_player_core::api::ApiRequest) {
+    let message = with_core(|core| {
+        let mut options = FetchOptions {
+            method: request.method,
+            headers: request.headers,
+            body: request.body,
+            ..FetchOptions::default()
+        };
+        options.headers.push(("Accept".into(), "application/json".into()));
+        let (id, message) = core.bridge.fetch(&request.url, &options);
         core.pending.insert(id, kind);
         message
     });

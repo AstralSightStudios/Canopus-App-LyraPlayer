@@ -156,7 +156,7 @@ chmod 600 "$SIGN_KEY"
 python3 "$CANOPUS/scripts/build-module-installer-receipt.py" \
     --module "$OUT/lyra-player.elf" \
     --module-id "$TOKEN" \
-    --version 1 \
+    --version 2 \
     --lifecycle "$LIFECYCLE" \
     --target-id "$TARGET_ID" \
     --firmware-sha256 "$TARGET_FIRMWARE_SHA256" \

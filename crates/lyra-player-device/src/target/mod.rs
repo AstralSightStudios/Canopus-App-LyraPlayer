@@ -28,22 +28,22 @@ pub fn activate() -> i32 {
         runtime().last_error.store(result, Ordering::Release);
         return result;
     }
-    match interconnect::register() {
-        Ok(()) => {
-            let (session, library) = storage::load();
-            let effects = with_core(|core| {
-                let mut effects = core.app.update(Action::Boot(session));
-                effects.extend(core.app.update(Action::LocalLibrary(library)));
-                effects
-            });
-            execute_effects(effects);
-            0
-        }
-        Err(error) => {
-            runtime().last_error.store(error, Ordering::Release);
-            error
-        }
+    let (session, library) = storage::load();
+    let effects = with_core(|core| {
+        let mut effects = core.app.update(Action::Boot(session));
+        effects.extend(core.app.update(Action::LocalLibrary(library)));
+        effects
+    });
+    execute_effects(effects);
+
+    // The firmware interconnect registry is not guaranteed to exist during
+    // boot activation (for example before the quick-app proxy starts). Keep the
+    // resident module active and retry from the page-owner timer instead of
+    // turning a temporarily unavailable phone bridge into a module failure.
+    if let Err(error) = interconnect::register() {
+        runtime().last_error.store(error, Ordering::Release);
     }
+    0
 }
 
 pub fn query_status() -> [u32; 10] {
@@ -72,7 +72,16 @@ pub fn query_status() -> [u32; 10] {
     ]
 }
 
+fn ensure_interconnect() {
+    if runtime().connection.load(Ordering::Acquire) == 0
+        && let Err(error) = interconnect::register()
+    {
+        runtime().last_error.store(error, Ordering::Release);
+    }
+}
+
 pub fn rebuild(page_index: usize) -> i32 {
+    ensure_interconnect();
     let effects = interconnect::pump();
     execute_effects(effects);
     let snapshot = with_core(|core| lyra_player_core::ui::render(&core.app));
@@ -83,6 +92,7 @@ pub fn rebuild(page_index: usize) -> i32 {
 }
 
 pub fn rebuild_if_changed(page_index: usize, rendered_generation: u32) -> i32 {
+    ensure_interconnect();
     timer_tick();
     let effects = interconnect::pump();
     execute_effects(effects);
@@ -246,8 +256,7 @@ fn execute_effects(effects: alloc::vec::Vec<Effect>) {
     for effect in effects {
         match effect {
             Effect::Fetch { kind, request } => {
-                let base = with_core(|core| core.app.api_base.clone());
-                interconnect::enqueue_api(kind, request.url(&base), request.cookie);
+                interconnect::enqueue_api(kind, request);
             }
             Effect::StreamAudio { url } if url.starts_with('/') => {
                 with_core(|core| {

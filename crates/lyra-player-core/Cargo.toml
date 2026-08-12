@@ -15,4 +15,7 @@ canopus-ui-core = { path = "../../../Canopus/sdk/rust/canopus-ui-core" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+aes = { version = "0.8", default-features = false }
+cipher = { version = "0.4", default-features = false, features = ["block-padding"] }
+md-5 = { version = "0.10", default-features = false }
 qrcodegen-no-heap = "1.8"

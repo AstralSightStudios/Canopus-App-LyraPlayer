@@ -40,6 +40,7 @@ pub enum BridgeEvent {
     Response {
         id: String,
         status: i32,
+        headers: BTreeMap<String, String>,
         body: Vec<u8>,
     },
     StreamOpened {
@@ -245,6 +246,7 @@ impl FetchBridge {
         Ok(result(BridgeEvent::Response {
             id,
             status,
+            headers: response_headers(response),
             body: bytes,
         }))
     }
@@ -289,7 +291,12 @@ impl FetchBridge {
         let status = slot.status;
         self.chunked.remove(&id);
         Ok(IngestResult {
-            event: BridgeEvent::Response { id, status, body },
+            event: BridgeEvent::Response {
+                id,
+                status,
+                headers: BTreeMap::new(),
+                body,
+            },
             replies,
         })
     }
@@ -372,6 +379,21 @@ fn usize_field(value: &Value, key: &str) -> Result<usize, BridgeError> {
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or(BridgeError::Protocol)
+}
+
+fn response_headers(response: &Value) -> BTreeMap<String, String> {
+    response
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.to_ascii_lowercase(), value.into()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn encoding(response: &Value) -> String {
@@ -486,6 +508,7 @@ mod tests {
             BridgeEvent::Response {
                 id: "x".into(),
                 status: 200,
+                headers: BTreeMap::new(),
                 body: b"abc".to_vec()
             }
         );

@@ -15,13 +15,13 @@ extern void canopus_decode_opaque_words(void) __attribute__((weak));
 __attribute__((constructor)) static void canopus_mod_ctor(void)
 {
     extern int canopus_mod_prepare(const void *ctx);
-    extern const void *canopus_module_descriptor_ptr(void);
+    extern int canopus_register_module_descriptor(void);
 
     if (canopus_decode_opaque_words != 0) {
         canopus_decode_opaque_words();
     }
-    (void)canopus_module_descriptor_ptr();
     (void)canopus_mod_prepare(0);
+    (void)canopus_register_module_descriptor();
 }
 
 __attribute__((destructor)) static void canopus_mod_dtor(void)
