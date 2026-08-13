@@ -101,11 +101,13 @@ impl Player {
         Ok(true)
     }
 
-    pub fn stream_ended<S: AudioSink>(&mut self, sink: &mut S) -> Result<(), S::Error> {
-        let _ = self.flush_audio(sink)?;
+    pub fn stream_ended<S: AudioSink>(&mut self, sink: &mut S) -> Result<bool, S::Error> {
+        if !self.flush_audio(sink)? {
+            return Ok(false);
+        }
         sink.drain()?;
         self.state = PlaybackState::Draining;
-        Ok(())
+        Ok(true)
     }
 
     pub fn toggle<S: AudioSink>(&mut self, sink: &mut S) -> Result<(), S::Error> {
@@ -183,6 +185,24 @@ mod tests {
         fn set_volume(&mut self, _: u8) -> Result<(), Self::Error> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn stream_end_waits_for_pending_short_writes() {
+        let mut player = Player {
+            state: PlaybackState::Buffering,
+            ..Player::default()
+        };
+        let mut sink = ShortSink {
+            max_write: 2,
+            ..ShortSink::default()
+        };
+        assert!(!player.push_audio(b"abcde".to_vec(), &mut sink).unwrap());
+        assert!(!player.stream_ended(&mut sink).unwrap());
+        assert_eq!(player.state, PlaybackState::Buffering);
+        assert!(player.stream_ended(&mut sink).unwrap());
+        assert_eq!(sink.bytes, b"abcde");
+        assert_eq!(player.state, PlaybackState::Draining);
     }
 
     #[test]

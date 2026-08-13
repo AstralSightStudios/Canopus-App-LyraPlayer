@@ -9,6 +9,7 @@ use lyra_player_core::{Action, Effect, QrStatus, Route, playback::PlaybackState,
 use runtime::{initialized, runtime, try_with_core, with_core};
 
 pub mod audio;
+pub mod image_resource;
 pub mod interconnect;
 pub mod native_app;
 pub mod runtime;
@@ -84,6 +85,26 @@ pub fn rebuild(page_index: usize) -> i32 {
     ensure_interconnect();
     let effects = interconnect::pump();
     execute_effects(effects);
+    // The app model has a single `route` but the firmware keeps one LVX page
+    // per route alive on a stack. Rendering the *current* route's snapshot into
+    // a page that no longer hosts that route corrupts it: after a forward
+    // navigation the paused source page would otherwise show the destination's
+    // content. A pushed destination renders itself in `page_create`; a popped
+    // page re-renders in `page_resume`, so skipping here is always correct.
+    if page_is_current(page_index) != 0 {
+        return 0;
+    }
+    let qr_result = with_core(|core| {
+        if core.app.route == Route::Login {
+            image_resource::ensure_qr(&core.app.qr.url)
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = qr_result {
+        runtime().last_error.store(error, Ordering::Release);
+        return error;
+    }
     let snapshot = with_core(|core| lyra_player_core::ui::render(&core.app));
     match snapshot {
         Ok(snapshot) => ui_backend::apply_snapshot(page_index, &snapshot),
@@ -96,6 +117,23 @@ pub fn rebuild_if_changed(page_index: usize, rendered_generation: u32) -> i32 {
     timer_tick();
     let effects = interconnect::pump();
     execute_effects(effects);
+    // A paused (or otherwise off-route) page still owns a refresh timer; its
+    // tick must keep advancing the global player/lyrics clock but must never
+    // paint the current route into a stale page.
+    if page_is_current(page_index) != 0 {
+        return 0;
+    }
+    let qr_result = with_core(|core| {
+        if core.app.route == Route::Login {
+            image_resource::ensure_qr(&core.app.qr.url)
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = qr_result {
+        runtime().last_error.store(error, Ordering::Release);
+        return error;
+    }
     let snapshot = match try_with_core(|core| {
         if core.app.generation == rendered_generation {
             None
@@ -113,6 +151,47 @@ pub fn rebuild_if_changed(page_index: usize, rendered_generation: u32) -> i32 {
     }
 }
 
+/// Returns 0 when `page_index` is the page hosting the app's current route.
+/// A page whose index differs from `app.route` is stale (paused on the stack).
+fn page_is_current(page_index: usize) -> i32 {
+    let current = with_core(|core| core.app.route.page_index());
+    if current == page_index { 0 } else { 1 }
+}
+
+pub fn sync_resumed_page(page_index: usize) -> i32 {
+    let Some(route) = Route::from_page_index(page_index) else {
+        return -1;
+    };
+    with_core(|core| {
+        if core.app.route != route {
+            if core.app.history.last().copied() == Some(route) {
+                core.app.history.pop();
+            } else if let Some(position) = core.app.history.iter().rposition(|item| *item == route)
+            {
+                core.app.history.truncate(position);
+            } else {
+                core.app.history.clear();
+            }
+            core.app.route = route;
+            core.app.generation = core.app.generation.wrapping_add(1).max(1);
+        }
+    });
+    0
+}
+
+pub fn handle_back(page_index: usize) {
+    let should_finish = with_core(|core| {
+        if core.app.route.page_index() != page_index {
+            return false;
+        }
+        let _ = core.app.update(Action::Back);
+        true
+    });
+    if should_finish {
+        ui_backend::back(page_index);
+    }
+}
+
 pub fn handle_ui_event(page_index: usize, generation: u32, key: u32, event_id: u32) {
     if event_id == ui::EVENT_PHONE_SEARCH {
         interconnect::enqueue(alloc::string::String::from(
@@ -121,15 +200,9 @@ pub fn handle_ui_event(page_index: usize, generation: u32, key: u32, event_id: u
         return;
     }
     if event_id == ui::EVENT_BACK {
-        let valid = with_core(|core| {
-            if core.app.generation != generation {
-                return false;
-            }
-            let _ = core.app.update(Action::Back);
-            true
-        });
+        let valid = with_core(|core| core.app.generation == generation);
         if valid {
-            ui_backend::back(page_index);
+            handle_back(page_index);
         }
         return;
     }
@@ -155,17 +228,14 @@ pub fn handle_ui_event(page_index: usize, generation: u32, key: u32, event_id: u
 
 fn action_for_event(app: &lyra_player_core::LyraApp, _key: u32, event_id: u32) -> Option<Action> {
     match event_id {
-        ui::EVENT_BACK => Some(Action::Back),
         ui::EVENT_LOGIN | ui::EVENT_RETRY_LOGIN => Some(Action::StartLogin),
         ui::EVENT_REFRESH => Some(Action::RefreshHome(app.generation as u64)),
         ui::EVENT_LIBRARY => Some(Action::Open(Route::Library)),
         ui::EVENT_SEARCH => Some(Action::Open(Route::Search)),
         ui::EVENT_LOGOUT => Some(Action::Logout),
-        ui::EVENT_TOGGLE => Some(Action::TogglePlayback),
         ui::EVENT_NEXT => Some(Action::Next),
         ui::EVENT_LYRICS => Some(Action::ShowLyrics),
         ui::EVENT_NOW_PLAYING => Some(Action::Open(Route::Player)),
-        ui::EVENT_PHONE_SEARCH => None,
         event if (ui::EVENT_PLAYLIST_BASE..ui::EVENT_PLAYLIST_BASE + 8).contains(&event) => {
             let index = (event - ui::EVENT_PLAYLIST_BASE) as usize;
             app.daily_playlists
@@ -256,15 +326,34 @@ fn execute_effects(effects: alloc::vec::Vec<Effect>) {
     for effect in effects {
         match effect {
             Effect::Fetch { kind, request } => {
+                let request =
+                    with_core(|core| lyra_player_core::api::with_base(request, &core.app.api_base));
                 interconnect::enqueue_api(kind, request);
             }
             Effect::StreamAudio { url } if url.starts_with('/') => {
-                with_core(|core| {
+                let cancellations = with_core(|core| {
+                    let mut cancellations = alloc::vec::Vec::new();
+                    if let Some(previous) = core.audio_request.take() {
+                        cancellations.push(core.bridge.cancel_stream(&previous, "local playback"));
+                    }
+                    core.audio_ending = false;
+                    core.deferred_stream_reply = None;
+                    if !lyra_player_core::persistence::is_safe_local_path(&url) {
+                        core.app.error =
+                            Some(alloc::string::String::from("invalid local audio path"));
+                        core.app.player.state = PlaybackState::Failed;
+                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                        return cancellations;
+                    }
                     if let Err(error) = core.audio.start_local(&url, &mut core.app.player) {
                         core.app.error = Some(alloc::format!("local audio failed: {error}"));
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                     }
+                    cancellations
                 });
+                for message in cancellations {
+                    interconnect::enqueue(message);
+                }
             }
             Effect::StreamAudio { url } => interconnect::enqueue_audio(url),
             Effect::Navigate(route) => ui_backend::navigate(route_page(route)),

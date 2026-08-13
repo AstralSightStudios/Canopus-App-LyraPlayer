@@ -1,5 +1,5 @@
-use alloc::{format, string::String, vec, vec::Vec};
 use aes::Aes128;
+use alloc::{format, string::String, vec, vec::Vec};
 use cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use md5::{Digest, Md5};
 use serde::Deserialize;
@@ -10,8 +10,7 @@ use crate::{AlbumRef, Artist, Playlist, Profile, Song};
 pub const DEFAULT_API_BASE: &str = "https://interfacepc.music.163.com";
 const EAPI_KEY: &[u8; 16] = b"e82ckenh8dichen8";
 const EAPI_DELIMITER: &str = "-36cd479b6b5-";
-const USER_AGENT: &str =
-    "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
+const USER_AGENT: &str = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -161,12 +160,8 @@ fn eapi(path: &str, mut data: Value, cookie: Option<&str>, nonce: u64) -> ApiReq
         fields.insert("e_r".into(), Value::Bool(false));
     }
     let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
-    let digest = Md5::digest(
-        format!("nobody{path}use{text}md5forencrypt").as_bytes(),
-    );
-    let signed = format!(
-        "{path}{EAPI_DELIMITER}{text}{EAPI_DELIMITER}{digest:x}"
-    );
+    let digest = Md5::digest(format!("nobody{path}use{text}md5forencrypt").as_bytes());
+    let signed = format!("{path}{EAPI_DELIMITER}{text}{EAPI_DELIMITER}{digest:x}");
     let mut bytes = signed.into_bytes();
     let message_len = bytes.len();
     bytes.resize(message_len + 16, 0);
@@ -178,18 +173,33 @@ fn eapi(path: &str, mut data: Value, cookie: Option<&str>, nonce: u64) -> ApiReq
         params.push_str(&format!("{byte:02X}"));
     }
     let mut headers = vec![
-        ("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+        (
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        ),
         ("User-Agent".into(), USER_AGENT.into()),
     ];
     if let Some(cookie) = cookie.filter(|value| !value.is_empty()) {
         headers.push(("Cookie".into(), cookie.into()));
     }
     ApiRequest {
-        url: format!("{DEFAULT_API_BASE}/eapi/{}", path.trim_start_matches("/api/")),
+        url: format!(
+            "{DEFAULT_API_BASE}/eapi/{}",
+            path.trim_start_matches("/api/")
+        ),
         method: "POST",
         headers,
         body: Some(format!("params={params}")),
     }
+}
+
+pub fn with_base(mut request: ApiRequest, base: &str) -> ApiRequest {
+    if base != DEFAULT_API_BASE
+        && let Some(suffix) = request.url.strip_prefix(DEFAULT_API_BASE)
+    {
+        request.url = format!("{}{}", base.trim_end_matches('/'), suffix);
+    }
+    request
 }
 
 fn encode(input: &str) -> String {
@@ -291,7 +301,12 @@ pub fn parse_qr_check(json: &str) -> Result<QrCheck, ApiError> {
 
 #[derive(Deserialize)]
 struct LoginStatusEnvelope {
-    data: LoginStatusData,
+    #[serde(default)]
+    code: i32,
+    #[serde(default)]
+    profile: Option<Profile>,
+    #[serde(default)]
+    data: Option<LoginStatusData>,
 }
 #[derive(Deserialize)]
 struct LoginStatusData {
@@ -301,10 +316,14 @@ struct LoginStatusData {
 
 pub fn parse_profile(json: &str) -> Result<Profile, ApiError> {
     let value: LoginStatusEnvelope = serde_json::from_str(json).map_err(|_| ApiError::Json)?;
-    if value.data.code != 200 {
-        return Err(ApiError::Server(value.data.code));
+    let (code, profile) = match value.data {
+        Some(data) => (data.code, data.profile),
+        None => (value.code, value.profile),
+    };
+    if code != 200 {
+        return Err(ApiError::Server(code));
     }
-    value.data.profile.ok_or(ApiError::Missing)
+    profile.ok_or(ApiError::Missing)
 }
 
 #[derive(Deserialize)]
@@ -363,7 +382,10 @@ pub fn parse_songs(json: &str) -> Result<Vec<Song>, ApiError> {
         return Err(ApiError::Server(value.code));
     }
     if value.songs.is_empty() {
-        Ok(value.playlist.map(|playlist| playlist.tracks).unwrap_or_default())
+        Ok(value
+            .playlist
+            .map(|playlist| playlist.tracks)
+            .unwrap_or_default())
     } else {
         Ok(value.songs)
     }
@@ -488,36 +510,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_status_accepts_top_level_and_nested_profiles() {
+        assert_eq!(
+            parse_profile(r#"{"code":200,"profile":{"userId":7,"nickname":"Top"}}"#)
+                .unwrap()
+                .user_id,
+            7
+        );
+        assert_eq!(
+            parse_profile(r#"{"data":{"code":200,"profile":{"userId":8,"nickname":"Nested"}}}"#)
+                .unwrap()
+                .user_id,
+            8
+        );
+    }
+
+    #[test]
+    fn custom_api_base_rewrites_eapi_origin() {
+        let request = with_base(search_songs("test", 0, None), "http://127.0.0.1:3000/");
+        assert!(request.url.starts_with("http://127.0.0.1:3000/eapi/"));
+    }
+
+    #[test]
     fn endpoints_encrypt_posts_and_attach_cookie() {
         let request = search_songs("宇多田 ヒカル", 20, Some("MUSIC_U=abc"));
         assert_eq!(request.method, "POST");
-        assert_eq!(request.url, "https://interfacepc.music.163.com/eapi/search/get");
+        assert_eq!(
+            request.url,
+            "https://interfacepc.music.163.com/eapi/search/get"
+        );
         assert!(request.body.as_deref().unwrap_or("").starts_with("params="));
-        assert!(request.headers.iter().any(|(key, value)| {
-            key == "Cookie" && value == "MUSIC_U=abc"
-        }));
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(key, value)| { key == "Cookie" && value == "MUSIC_U=abc" })
+        );
         assert!(!request.body.as_deref().unwrap_or("").contains("宇多田"));
     }
 
     #[test]
     fn qr_url_is_local_and_encoded() {
-        assert_eq!(
-            qr_url("a+b"),
-            "https://music.163.com/login?codekey=a%2Bb"
-        );
+        assert_eq!(qr_url("a+b"), "https://music.163.com/login?codekey=a%2Bb");
     }
 
     #[test]
     fn direct_shapes_parse_without_node_envelopes() {
-        let playlists = parse_playlists(
-            r#"{"code":200,"recommend":[{"id":1,"name":"Daily"}]}"#,
-        )
-        .unwrap();
+        let playlists =
+            parse_playlists(r#"{"code":200,"recommend":[{"id":1,"name":"Daily"}]}"#).unwrap();
         assert_eq!(playlists[0].name, "Daily");
-        let songs = parse_songs(
-            r#"{"code":200,"playlist":{"tracks":[{"id":2,"name":"Track"}]}}"#,
-        )
-        .unwrap();
+        let songs =
+            parse_songs(r#"{"code":200,"playlist":{"tracks":[{"id":2,"name":"Track"}]}}"#).unwrap();
         assert_eq!(songs[0].name, "Track");
     }
 

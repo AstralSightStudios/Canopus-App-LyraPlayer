@@ -29,6 +29,10 @@ struct PageBackend {
     refresh_timer: *mut core::ffi::c_void,
     rows: [*mut core::ffi::c_void; UI_MAX_ROWS],
     labels: [*mut core::ffi::c_void; UI_MAX_LABELS],
+    images: [*mut core::ffi::c_void; 2],
+    bars: [*mut core::ffi::c_void; 4],
+    image_hashes: [u32; 2],
+    bar_hashes: [u32; 4],
     row_kinds: [u8; UI_MAX_ROWS],
     row_keys: [u32; UI_MAX_ROWS],
     row_hashes: [u32; UI_MAX_ROWS],
@@ -54,6 +58,10 @@ const fn empty_backend() -> PageBackend {
         refresh_timer: core::ptr::null_mut(),
         rows: [core::ptr::null_mut(); UI_MAX_ROWS],
         labels: [core::ptr::null_mut(); UI_MAX_LABELS],
+        images: [core::ptr::null_mut(); 2],
+        bars: [core::ptr::null_mut(); 4],
+        image_hashes: [0; 2],
+        bar_hashes: [0; 4],
         row_kinds: [0; UI_MAX_ROWS],
         row_keys: [0; UI_MAX_ROWS],
         row_hashes: [0; UI_MAX_ROWS],
@@ -155,6 +163,9 @@ pub fn page_resume(page_index: usize) -> i32 {
     }
     backend.interactive = true;
     backend.refresh_failed = false;
+    if super::sync_resumed_page(page_index) != 0 {
+        return -1;
+    }
     super::rebuild(page_index)
 }
 
@@ -256,7 +267,7 @@ extern "C" fn page_title_back(event: *mut core::ffi::c_void) {
         return;
     }
     backend.interactive = false;
-    back(page_index);
+    super::handle_back(page_index);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,10 +299,17 @@ fn layout_fingerprint(snapshot: &Snapshot) -> (u32, u32) {
             Some(NodeKind::Button) => 3,
             Some(NodeKind::ActionRow) => 4,
             Some(NodeKind::SwitchRow) => 5,
+            Some(NodeKind::Image) => 6,
+            Some(NodeKind::Progress) => 7,
             _ => continue,
         };
         hash = hash_word(hash, marker);
         hash = hash_word(hash, node.key);
+        if matches!(node.kind(), Some(NodeKind::Image | NodeKind::Progress)) {
+            let layout = &snapshot.layouts[index];
+            hash = hash_word(hash, layout.width as u16 as u32);
+            hash = hash_word(hash, layout.height as u16 as u32);
+        }
         count += 1;
     }
     (hash, count)
@@ -401,6 +419,8 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
     // and rows are bounded.
     let mut visible_rows = 0u32;
     let mut visible_labels = 0u32;
+    let mut visible_images = 0u32;
+    let mut visible_bars = 0u32;
     for index in 0..snapshot.node_count as usize {
         let node = &snapshot.nodes[index];
         match node.kind() {
@@ -410,10 +430,16 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             | Some(NodeKind::Button)
             | Some(NodeKind::ActionRow)
             | Some(NodeKind::SwitchRow) => visible_rows += 1,
+            Some(NodeKind::Image) => visible_images += 1,
+            Some(NodeKind::Progress) => visible_bars += 1,
             _ => return -1,
         }
     }
-    if visible_labels > UI_MAX_LABELS as u32 || visible_rows > UI_MAX_ROWS as u32 {
+    if visible_labels > UI_MAX_LABELS as u32
+        || visible_rows > UI_MAX_ROWS as u32
+        || visible_images > 2
+        || visible_bars > 4
+    {
         return -1;
     }
 
@@ -423,6 +449,8 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
         || backend.layout_count != next_layout_count;
     let mut used_mask = 0u32;
     let mut label_used = 0u32;
+    let mut image_used = 0usize;
+    let mut bar_used = 0usize;
     let mut previous: *mut core::ffi::c_void = core::ptr::null_mut();
 
     for index in 0..snapshot.node_count as usize {
@@ -513,6 +541,87 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             }
             previous = object;
             label_used += 1;
+            continue;
+        }
+        if kind == NodeKind::Image {
+            let layout = &snapshot.layouts[index];
+            if primary.is_empty() || layout.width <= 0 || layout.height <= 0 {
+                return -1;
+            }
+            let mut object = backend.images[image_used];
+            let created_now = object.is_null();
+            if created_now {
+                object = unsafe { lvx_image_create(backend.content_root) };
+                if object.is_null() {
+                    return -1;
+                }
+                backend.images[image_used] = object;
+            }
+            let image_hash = hash_word(
+                hash_text(0x811C_9DC5, primary),
+                snapshot.values[index].resource_id,
+            );
+            if created_now || backend.image_hashes[image_used] != image_hash {
+                unsafe { lvx_image_set_src(object, primary.as_ptr().cast()) };
+                backend.image_hashes[image_used] = image_hash;
+            }
+            unsafe {
+                lvx_object_set_size(object, i32::from(layout.width), i32::from(layout.height));
+                lvx_set_hidden(object, 0);
+            }
+            if layout_changed {
+                if previous.is_null() {
+                    unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
+                } else {
+                    unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, 8) };
+                }
+            }
+            previous = object;
+            image_used += 1;
+            continue;
+        }
+        if kind == NodeKind::Progress {
+            let layout = &snapshot.layouts[index];
+            let value = &snapshot.values[index];
+            if layout.width <= 0 || layout.height <= 0 || value.minimum >= value.maximum {
+                return -1;
+            }
+            let mut object = backend.bars[bar_used];
+            let created_now = object.is_null();
+            if created_now {
+                object = unsafe { lvx_bar_create(backend.content_root) };
+                if object.is_null() {
+                    return -1;
+                }
+                backend.bars[bar_used] = object;
+            }
+            let bar_hash = hash_word(
+                hash_word(
+                    hash_word(0x811C_9DC5, value.minimum as u32),
+                    value.maximum as u32,
+                ),
+                value.value as u32,
+            );
+            if created_now || backend.bar_hashes[bar_used] != bar_hash {
+                unsafe {
+                    lvx_bar_set_range(object, value.minimum, value.maximum);
+                    lvx_bar_set_value(object, value.value);
+                }
+                backend.bar_hashes[bar_used] = bar_hash;
+            }
+            unsafe {
+                lvx_object_set_size(object, i32::from(layout.width), i32::from(layout.height));
+                lvx_set_hidden(object, 0);
+            }
+            if layout_changed {
+                if previous.is_null() {
+                    unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
+                } else {
+                    unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, 8) };
+                }
+            }
+            previous = object;
+            bar_used += 1;
             continue;
         }
         if !matches!(
@@ -644,6 +753,16 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
     for i in label_used as usize..UI_MAX_LABELS {
         if !backend.labels[i].is_null() {
             unsafe { lvx_set_hidden(backend.labels[i], 1) };
+        }
+    }
+    for i in image_used..backend.images.len() {
+        if !backend.images[i].is_null() {
+            unsafe { lvx_set_hidden(backend.images[i], 1) };
+        }
+    }
+    for i in bar_used..backend.bars.len() {
+        if !backend.bars[i].is_null() {
+            unsafe { lvx_set_hidden(backend.bars[i], 1) };
         }
     }
     backend.layout_hash = next_layout_hash;

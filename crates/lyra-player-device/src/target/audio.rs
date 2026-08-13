@@ -64,6 +64,10 @@ impl AudioDevice {
         self.ioctl_value(command, 0)
     }
 
+    pub fn stop_local(&mut self) {
+        self.close_local();
+    }
+
     pub fn start_local(&mut self, path: &str, player: &mut Player) -> Result<(), i32> {
         self.close_local();
         let mut c_path = Vec::with_capacity(path.len() + 1);
@@ -98,8 +102,9 @@ impl AudioDevice {
             return Err(count);
         }
         if count == 0 {
-            self.close_local();
-            player.stream_ended(self)?;
+            if player.stream_ended(self)? {
+                self.close_local();
+            }
             return Ok(());
         }
         let _ = player.push_audio(Vec::from(&chunk[..count as usize]), self)?;

@@ -15,6 +15,10 @@ const O_TRUNC: i32 = 32;
 const MODE_USER_RW: u32 = 0o600;
 const MAX_JSON_BYTES: usize = 128 * 1024;
 
+pub fn write_atomic_bytes(path: &str, bytes: &[u8]) -> Result<(), i32> {
+    FsStore.write_atomic(path, bytes)
+}
+
 pub struct FsStore;
 
 fn c_path(path: &str) -> Result<Vec<u8>, i32> {
@@ -103,8 +107,8 @@ impl Store for FsStore {
 
     fn remove(&mut self, path: &str) -> Result<(), Self::Error> {
         let path = c_path(path)?;
-        let _ = unsafe { nuttx_unlink(path.as_ptr()) };
-        Ok(())
+        let result = unsafe { nuttx_unlink(path.as_ptr()) };
+        if result < 0 { Err(result) } else { Ok(()) }
     }
 }
 

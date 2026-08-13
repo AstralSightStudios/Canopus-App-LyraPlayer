@@ -1,7 +1,7 @@
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec, vec::Vec};
 use canopus_ui_core::{
-    ActionRow, NavigationPage, Section, Snapshot, StatusRow, Text, TextStyle, Tree, UiError, View,
-    view,
+    ActionRow, Layout, NavigationPage, Progress, Section, Snapshot, StatusRow, Text, TextStyle,
+    Tree, UiError, View, view,
 };
 use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 
@@ -23,6 +23,9 @@ pub const EVENT_PLAYLIST_BASE: u32 = 1_000;
 pub const EVENT_SONG_BASE: u32 = 2_000;
 pub const EVENT_ARTIST_BASE: u32 = 3_000;
 pub const EVENT_LOCAL_SONG_BASE: u32 = 4_000;
+pub const QR_IMAGE_PATH_A: &str = "/data/canopus/lyra-qr-a.bin";
+pub const QR_IMAGE_PATH_B: &str = "/data/canopus/lyra-qr-b.bin";
+pub const QR_RENDER_SIZE: i16 = 180;
 
 #[derive(Clone, Copy)]
 pub struct UiEvent(pub u32);
@@ -140,7 +143,6 @@ fn login(app: &LyraApp) -> Result<Snapshot, UiError> {
         QrStatus::Expired => "二维码已过期",
         QrStatus::Failed => "二维码加载失败",
     };
-    let qr = qr_text(&app.qr.url).unwrap_or_else(|| app.qr.url.clone());
     let view = view!(NavigationPage {
         key: 1,
         title: "登录网易云音乐",
@@ -150,11 +152,7 @@ fn login(app: &LyraApp) -> Result<Snapshot, UiError> {
                 text: status,
                 style: TextStyle::Title
             },
-            Text {
-                key: 3,
-                text: qr.as_str(),
-                style: TextStyle::Description
-            },
+            QrImage { url: &app.qr.url },
             ActionRow {
                 key: 4,
                 label: "刷新二维码",
@@ -395,11 +393,28 @@ fn player(app: &LyraApp) -> Result<Snapshot, UiError> {
                 text: lyric,
                 style: TextStyle::Warning
             },
-            StatusRow {
-                key: 5,
-                label: progress.as_str(),
-                value: playback_label(app.player.state)
-            },
+            (
+                StatusRow {
+                    key: 5,
+                    label: progress.as_str(),
+                    value: playback_label(app.player.state)
+                },
+                Progress {
+                    key: 50,
+                    value: app
+                        .player
+                        .position_ms
+                        .min(app.player.duration_ms)
+                        .min(i32::MAX as u32) as i32,
+                    minimum: 0,
+                    maximum: app.player.duration_ms.max(1).min(i32::MAX as u32) as i32,
+                    layout: Layout {
+                        width: 280,
+                        height: 14,
+                        ..Layout::default()
+                    }
+                },
+            ),
             ActionRow {
                 key: 6,
                 label: toggle,
@@ -471,6 +486,33 @@ fn lyrics(app: &LyraApp) -> Result<Snapshot, UiError> {
     tree.action_row(3, "返回播放页", "继续播放", EVENT_BACK, true)?;
     tree.end()?;
     commit(tree, app.generation)
+}
+
+struct QrImage<'a> {
+    url: &'a str,
+}
+
+impl View<UiEvent> for QrImage<'_> {
+    fn render(&self, tree: &mut Tree) -> Result<(), UiError> {
+        if self.url.is_empty() {
+            return Ok(());
+        }
+        let generation = qr_resource_generation(self.url);
+        tree.image(
+            3,
+            generation,
+            if generation & 1 == 0 {
+                QR_IMAGE_PATH_A
+            } else {
+                QR_IMAGE_PATH_B
+            },
+            Layout {
+                width: QR_RENDER_SIZE,
+                height: QR_RENDER_SIZE,
+                ..Layout::default()
+            },
+        )
+    }
 }
 
 struct PlaylistRows<'a> {
@@ -558,17 +600,38 @@ fn playback_label(state: PlaybackState) -> &'static str {
     }
 }
 
-fn progress_text(position_ms: u32, duration_ms: u32) -> String {
-    format!(
-        "{:02}:{:02}  ━━━  {:02}:{:02}",
-        position_ms / 60_000,
-        position_ms / 1_000 % 60,
-        duration_ms / 60_000,
-        duration_ms / 1_000 % 60,
-    )
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QrModules {
+    pub width: u16,
+    pub quiet_zone: u8,
+    pub bits: Vec<u8>,
 }
 
-fn qr_text(url: &str) -> Option<String> {
+impl QrModules {
+    pub fn dark(&self, x: usize, y: usize) -> bool {
+        let quiet = self.quiet_zone as usize;
+        let width = self.width as usize;
+        if x < quiet || y < quiet || x >= width + quiet || y >= width + quiet {
+            return false;
+        }
+        let index = (y - quiet) * width + (x - quiet);
+        self.bits[index / 8] & (1 << (index % 8)) != 0
+    }
+
+    pub fn size(&self) -> usize {
+        self.width as usize + self.quiet_zone as usize * 2
+    }
+}
+
+pub fn qr_resource_generation(url: &str) -> u32 {
+    let mut hash = 0x811C_9DC5u32;
+    for byte in url.as_bytes() {
+        hash = (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
+    }
+    hash.max(1)
+}
+
+pub fn qr_modules(url: &str) -> Option<QrModules> {
     if url.is_empty() {
         return None;
     }
@@ -588,30 +651,30 @@ fn qr_text(url: &str) -> Option<String> {
     )
     .ok()?;
     let width = code.size() as usize;
-    let quiet = 2usize;
-    let mut output = String::new();
-    for y in (0..width + quiet * 2).step_by(2) {
-        for x in 0..width + quiet * 2 {
-            let top = qr_dark(&code, x, y, quiet);
-            let bottom = qr_dark(&code, x, y + 1, quiet);
-            output.push(match (top, bottom) {
-                (true, true) => '█',
-                (true, false) => '▀',
-                (false, true) => '▄',
-                (false, false) => ' ',
-            });
+    let mut bits = vec![0u8; (width * width).div_ceil(8)];
+    for y in 0..width {
+        for x in 0..width {
+            if code.get_module(x as i32, y as i32) {
+                let index = y * width + x;
+                bits[index / 8] |= 1 << (index % 8);
+            }
         }
-        output.push('\n');
     }
-    Some(output)
+    Some(QrModules {
+        width: width as u16,
+        quiet_zone: 4,
+        bits,
+    })
 }
 
-fn qr_dark(code: &QrCode<'_>, x: usize, y: usize, quiet: usize) -> bool {
-    let width = code.size() as usize;
-    if x < quiet || y < quiet || x >= width + quiet || y >= width + quiet {
-        return false;
-    }
-    code.get_module((x - quiet) as i32, (y - quiet) as i32)
+fn progress_text(position_ms: u32, duration_ms: u32) -> String {
+    format!(
+        "{:02}:{:02} / {:02}:{:02}",
+        position_ms / 60_000,
+        position_ms / 1_000 % 60,
+        duration_ms / 60_000,
+        duration_ms / 1_000 % 60,
+    )
 }
 
 #[cfg(test)]
@@ -642,9 +705,53 @@ mod tests {
     }
 
     #[test]
-    fn qr_fallback_is_scannable_shape() {
-        let qr = qr_text("https://music.163.com/login?codekey=test").unwrap();
-        assert!(qr.lines().count() > 10);
-        assert!(qr.contains('█'));
+    fn login_uses_native_image_and_player_uses_progress() {
+        let mut app = LyraApp {
+            route: Route::Login,
+            ..LyraApp::default()
+        };
+        app.qr.url = "https://music.163.com/login?codekey=test".into();
+        let login = render(&app).unwrap();
+        let image = login
+            .nodes
+            .iter()
+            .take(login.node_count as usize)
+            .position(|node| node.kind() == Some(NodeKind::Image))
+            .unwrap();
+        let expected_path = if qr_resource_generation(&app.qr.url) & 1 == 0 {
+            QR_IMAGE_PATH_A
+        } else {
+            QR_IMAGE_PATH_B
+        };
+        assert_eq!(login.primary(&login.nodes[image]), expected_path);
+        assert_eq!(login.layouts[image].width, QR_RENDER_SIZE);
+
+        app.route = Route::Player;
+        app.player.current = Some(Song {
+            id: 1,
+            name: "Test".into(),
+            ..Song::default()
+        });
+        app.player.position_ms = 2_000;
+        app.player.duration_ms = 1_000;
+        let player = render(&app).unwrap();
+        let progress = player
+            .nodes
+            .iter()
+            .take(player.node_count as usize)
+            .position(|node| node.kind() == Some(NodeKind::Progress))
+            .unwrap();
+        assert_eq!(player.values[progress].value, 1_000);
+        assert_eq!(player.values[progress].maximum, 1_000);
+    }
+
+    #[test]
+    fn qr_modules_include_scanner_quiet_zone() {
+        let qr = qr_modules("https://music.163.com/login?codekey=test").unwrap();
+        assert!(qr.width > 20);
+        assert_eq!(qr.quiet_zone, 4);
+        assert!(!qr.dark(0, 0));
+        assert!(qr.size() > qr.width as usize);
+        assert!(qr.bits.iter().any(|byte| *byte != 0));
     }
 }

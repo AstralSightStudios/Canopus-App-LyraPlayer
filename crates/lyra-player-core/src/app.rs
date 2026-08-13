@@ -4,7 +4,7 @@ use crate::{
     Artist, Playlist, Profile, QrLogin, QrStatus, SearchResults, Session, Song,
     api::{self, ApiRequest},
     lyrics,
-    playback::{PlaybackState, Player},
+    playback::Player,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,6 +31,20 @@ impl Route {
             Self::Artist => 5,
             Self::Player => 6,
             Self::Lyrics => 7,
+        }
+    }
+
+    pub const fn from_page_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Home),
+            1 => Some(Self::Login),
+            2 => Some(Self::Library),
+            3 => Some(Self::Playlist),
+            4 => Some(Self::Search),
+            5 => Some(Self::Artist),
+            6 => Some(Self::Player),
+            7 => Some(Self::Lyrics),
+            _ => None,
         }
     }
 }
@@ -97,7 +111,6 @@ pub enum Action {
         kind: RequestKind,
         message: String,
     },
-    TogglePlayback,
     Next,
     ShowLyrics,
     Tick(u32),
@@ -166,9 +179,11 @@ impl LyraApp {
             }
             Action::Open(route) => self.navigate(route, &mut effects),
             Action::Back => {
+                // Pop the semantic route only. The firmware page is popped by
+                // the device glue (activity_finish) and re-renders on resume;
+                // emitting Navigate here would push a duplicate page instead.
                 if let Some(route) = self.history.pop() {
                     self.route = route;
-                    effects.push(Effect::Navigate(route));
                 }
             }
             Action::StartLogin => {
@@ -267,14 +282,15 @@ impl LyraApp {
                 self.navigate(Route::Player, &mut effects);
                 if let Some(path) = song.local_path {
                     effects.push(Effect::StreamAudio { url: path });
-                } else if let Some(cookie) = self.cookie() {
+                } else {
+                    let cookie = self.cookie();
                     effects.push(fetch(
                         RequestKind::SongUrl,
-                        api::song_url(song.id, cookie, self.generation as u64),
+                        api::song_url(song.id, cookie.unwrap_or(""), self.generation as u64),
                     ));
                     effects.push(fetch(
                         RequestKind::Lyrics,
-                        api::lyric(song.id, cookie, self.generation as u64),
+                        api::lyric(song.id, cookie.unwrap_or(""), self.generation as u64),
                     ));
                 }
             }
@@ -290,14 +306,6 @@ impl LyraApp {
             Action::ApiFailed { kind: _, message } => {
                 self.loading = false;
                 self.error = Some(message);
-            }
-            Action::TogglePlayback => {
-                // Device glue performs the synchronous audio ioctl then mirrors the state.
-                self.player.state = match self.player.state {
-                    PlaybackState::Playing | PlaybackState::Buffering => PlaybackState::Paused,
-                    PlaybackState::Paused => PlaybackState::Playing,
-                    state => state,
-                };
             }
             Action::Next => {
                 if let Some(song) = self.player.take_next() {
@@ -372,7 +380,8 @@ impl LyraApp {
                     effects.push(Effect::PersistSession(session.clone()));
                 }
                 effects.extend(self.home_effects(now_ms));
-                self.navigate(Route::Home, effects);
+                self.history.clear();
+                self.route = Route::Home;
             }),
             RequestKind::UserPlaylists => {
                 api::parse_playlists(body).map(|items| self.playlists = items)
@@ -470,10 +479,11 @@ impl LyraApp {
     }
 
     fn navigate(&mut self, route: Route, effects: &mut Vec<Effect>) {
-        if self.route != route {
-            self.history.push(self.route);
-            self.route = route;
+        if self.route == route {
+            return;
         }
+        self.history.push(self.route);
+        self.route = route;
         effects.push(Effect::Navigate(route));
     }
 
@@ -559,6 +569,14 @@ mod tests {
             now_ms: 5,
         });
         assert_eq!(app.selected_artist.as_ref().unwrap().songs.len(), 1);
+    }
+
+    #[test]
+    fn navigating_to_the_current_route_is_a_noop() {
+        let mut app = LyraApp::default();
+        let effects = app.update(Action::Open(Route::Home));
+        assert!(effects.is_empty(), "same-route open must not push a page");
+        assert!(app.history.is_empty());
     }
 
     #[test]

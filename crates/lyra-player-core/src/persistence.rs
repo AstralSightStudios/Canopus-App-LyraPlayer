@@ -99,10 +99,18 @@ pub fn save_library<S: Store>(
         .map_err(PersistenceError::Storage)
 }
 
+pub fn is_safe_local_path(path: &str) -> bool {
+    let Some(file_name) = path.strip_prefix(&alloc::format!("{IMPORT_DIR}/")) else {
+        return false;
+    };
+    safe_import_path(file_name).as_deref() == Some(path)
+}
+
 pub fn safe_import_path(file_name: &str) -> Option<String> {
     if file_name.is_empty()
         || file_name.len() > 96
         || file_name.starts_with('.')
+        || file_name.contains("..")
         || !file_name.ends_with(".mp3")
         || file_name
             .bytes()
@@ -150,6 +158,9 @@ mod tests {
     fn import_paths_reject_traversal() {
         assert!(safe_import_path("track.mp3").is_some());
         assert!(safe_import_path("../track.mp3").is_none());
+        assert!(safe_import_path("track..backup.mp3").is_none());
         assert!(safe_import_path("cover.png").is_none());
+        assert!(is_safe_local_path("/data/canopus/track.mp3"));
+        assert!(!is_safe_local_path("/etc/passwd"));
     }
 }

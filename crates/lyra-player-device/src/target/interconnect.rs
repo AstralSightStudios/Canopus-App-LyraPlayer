@@ -17,11 +17,16 @@ use lyra_player_core::{
 };
 use serde_json::Value;
 
-use super::runtime::{runtime, try_with_core, with_core};
+use super::runtime::{PendingRequest, runtime, try_with_core, with_core};
 
 const FRAME_CAPACITY: usize = 8192;
 #[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
 const SERVER_NAME: &[u8] = b"miwear-server\0";
+/// Interconnect routing key: this module's own package name, matching the
+/// native-app descriptor. The phone routes interconnect messages to/from a
+/// connection by this name only, so it must be `com.canopus.lyra-player`, not
+/// the Mi Fitness APK's own `com.xiaomi.miwear.interconnect`.
+const ROUTE_NAME: &[u8] = super::native_app::PACKAGE_NAME;
 
 #[repr(C, align(4))]
 struct ConnectionStorage([u32; 3]);
@@ -64,20 +69,14 @@ pub fn register() -> Result<(), i32> {
         interconnect_connect(
             loop_handle,
             connection,
-            INTERCONNECT_APK_PACKAGE.as_ptr(),
+            ROUTE_NAME.as_ptr(),
             SERVER_NAME.as_ptr(),
             receive,
         )
     };
     #[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
-    let result = unsafe {
-        interconnect_connect(
-            loop_handle,
-            connection,
-            INTERCONNECT_APK_PACKAGE.as_ptr(),
-            receive,
-        )
-    };
+    let result =
+        unsafe { interconnect_connect(loop_handle, connection, ROUTE_NAME.as_ptr(), receive) };
     if result < 0 {
         return Err(result);
     }
@@ -89,35 +88,41 @@ pub fn register() -> Result<(), i32> {
 
 extern "C" fn receive(
     _context: *mut c_void,
-    status: i32,
+    callback_status: i32,
     message: *const InterconnectConnMessage,
     _name: *const u8,
 ) {
-    if status == CONN_STATUS_CONNECTED {
-        runtime().connected.store(true, Ordering::Release);
-        HANDSHAKE_PENDING.store(true, Ordering::Release);
-        send_next();
-    } else if matches!(
-        status,
-        CONN_STATUS_DISCONNECTED
-            | CONN_STATUS_UNINSTALLED
-            | CONN_STATUS_FAILED
-            | CONN_STATUS_CLOSED
-    ) {
-        runtime().connected.store(false, Ordering::Release);
+    if callback_status < 0 {
+        runtime()
+            .last_error
+            .store(callback_status, Ordering::Release);
     }
-
     if message.is_null() {
         return;
     }
     let message_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*message).r#type)) };
-    if message_type != CONN_MSG_TYPE_DATA {
-        return;
-    }
     let length =
         unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*message).length)) } as usize;
     let value =
         unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*message).value)) }.cast::<u8>();
+
+    if message_type == CONN_MSG_TYPE_EVENT {
+        if value.is_null() || length < core::mem::size_of::<i32>() {
+            runtime().last_error.store(-20, Ordering::Release);
+            return;
+        }
+        let event_code = unsafe { core::ptr::read_unaligned(value.cast::<i32>()) };
+        let detail = if length >= 2 * core::mem::size_of::<i32>() {
+            unsafe { core::ptr::read_unaligned(value.cast::<i32>().add(1)) }
+        } else {
+            0
+        };
+        handle_connection_event(event_code, detail);
+        return;
+    }
+    if message_type != CONN_MSG_TYPE_DATA {
+        return;
+    }
     if value.is_null() || length == 0 || length > FRAME_CAPACITY {
         runtime().last_error.store(-20, Ordering::Release);
         return;
@@ -146,6 +151,28 @@ extern "C" fn receive(
         return;
     }
     runtime().last_error.store(-21, Ordering::Release);
+}
+
+fn handle_connection_event(code: i32, detail: i32) {
+    if matches!(code, 1 | CONN_STATUS_CONNECTED) {
+        runtime().connected.store(true, Ordering::Release);
+        HANDSHAKE_PENDING.store(true, Ordering::Release);
+        send_next();
+    } else if matches!(
+        code,
+        CONN_STATUS_DISCONNECTED
+            | CONN_STATUS_UNINSTALLED
+            | CONN_STATUS_FAILED
+            | CONN_STATUS_CLOSED
+    ) {
+        if code == CONN_STATUS_FAILED && detail < 0 {
+            runtime().last_error.store(detail, Ordering::Release);
+        }
+        runtime().connected.store(false, Ordering::Release);
+        runtime().connection.store(0, Ordering::Release);
+        HANDSHAKE_PENDING.store(false, Ordering::Release);
+        SEND_BUSY.store(false, Ordering::Release);
+    }
 }
 
 extern "C" fn send_done(
@@ -257,6 +284,21 @@ pub fn pump() -> Vec<Effect> {
     }
 
     let deferred = with_core(|core| {
+        if core.audio_ending {
+            match core.app.player.stream_ended(&mut core.audio) {
+                Ok(true) => {
+                    core.audio_ending = false;
+                    core.audio_request = None;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    core.app.error = Some(alloc::format!("audio drain failed: {error}"));
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                    core.audio_ending = false;
+                    core.audio_request = None;
+                }
+            }
+        }
         if core.deferred_stream_reply.is_some() {
             match core.app.player.flush_audio(&mut core.audio) {
                 Ok(true) => core.deferred_stream_reply.take(),
@@ -298,9 +340,13 @@ fn process(text: &str) -> Vec<Effect> {
             BridgeEvent::Response {
                 id, body, headers, ..
             } => {
-                let Some(kind) = core.pending.remove(&id) else {
+                let Some(pending) = core.pending.remove(&id) else {
                     return Vec::new();
                 };
+                if !request_is_current(&core.app, pending.kind, pending.token) {
+                    return Vec::new();
+                }
+                let kind = pending.kind;
                 let cookie = response_cookie(&headers);
                 match String::from_utf8(body) {
                     Ok(body) => core.app.update(Action::ApiResponse {
@@ -336,12 +382,34 @@ fn process(text: &str) -> Vec<Effect> {
                 }
                 Vec::new()
             }
-            BridgeEvent::StreamEnded { id, .. } if core.audio_request.as_deref() == Some(&id) => {
-                if let Err(error) = core.app.player.stream_ended(&mut core.audio) {
-                    core.app.error = Some(alloc::format!("audio drain failed: {error}"));
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+            BridgeEvent::StreamEnded { id, bytes, .. }
+                if core.audio_request.as_deref() == Some(&id) =>
+            {
+                let final_queued = if bytes.is_empty() {
+                    true
+                } else {
+                    match core.app.player.push_audio(bytes, &mut core.audio) {
+                        Ok(queued) => queued,
+                        Err(error) => {
+                            core.app.error = Some(alloc::format!("audio write failed: {error}"));
+                            core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                            false
+                        }
+                    }
+                };
+                if final_queued {
+                    match core.app.player.stream_ended(&mut core.audio) {
+                        Ok(true) => core.audio_request = None,
+                        Ok(false) => core.audio_ending = true,
+                        Err(error) => {
+                            core.app.error = Some(alloc::format!("audio drain failed: {error}"));
+                            core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                            core.audio_request = None;
+                        }
+                    }
+                } else {
+                    core.audio_ending = true;
                 }
-                core.audio_request = None;
                 Vec::new()
             }
             BridgeEvent::Failed { id, message } => {
@@ -350,8 +418,15 @@ fn process(text: &str) -> Vec<Effect> {
                     core.app.error = Some(message);
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
                     Vec::new()
-                } else if let Some(kind) = core.pending.remove(&id) {
-                    core.app.update(Action::ApiFailed { kind, message })
+                } else if let Some(pending) = core.pending.remove(&id) {
+                    if request_is_current(&core.app, pending.kind, pending.token) {
+                        core.app.update(Action::ApiFailed {
+                            kind: pending.kind,
+                            message,
+                        })
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
                 }
@@ -396,10 +471,39 @@ fn process_control(text: &str) -> Option<Vec<Effect>> {
     }
 }
 
+fn request_token(app: &lyra_player_core::LyraApp, kind: RequestKind) -> u64 {
+    match kind {
+        RequestKind::QrKey | RequestKind::QrCreate | RequestKind::QrCheck => {
+            app.qr.key.as_bytes().iter().fold(0u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01B3)
+            })
+        }
+        RequestKind::PlaylistDetail | RequestKind::PlaylistTracks => {
+            app.selected_playlist.as_ref().map_or(0, |item| item.id)
+        }
+        RequestKind::ArtistDetail | RequestKind::ArtistSongs | RequestKind::ArtistAlbums => {
+            app.selected_artist.as_ref().map_or(0, |item| item.id)
+        }
+        RequestKind::SearchSongs | RequestKind::SearchArtists => {
+            app.search.query.as_bytes().iter().fold(0u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01B3)
+            })
+        }
+        RequestKind::SongUrl | RequestKind::Lyrics => {
+            app.player.current.as_ref().map_or(0, |song| song.id)
+        }
+        _ => 0,
+    }
+}
+
+fn request_is_current(app: &lyra_player_core::LyraApp, kind: RequestKind, token: u64) -> bool {
+    request_token(app, kind) == token
+}
+
 fn response_cookie(headers: &BTreeMap<String, String>) -> Option<String> {
     let values = headers.get("set-cookie")?;
     let mut cookie = String::new();
-    for value in values.split(',') {
+    for value in values.split('\n') {
         let pair = value.trim().split(';').next().unwrap_or("").trim();
         if pair.is_empty() || !pair.contains('=') {
             continue;
@@ -420,9 +524,12 @@ pub fn enqueue_api(kind: RequestKind, request: lyra_player_core::api::ApiRequest
             body: request.body,
             ..FetchOptions::default()
         };
-        options.headers.push(("Accept".into(), "application/json".into()));
+        options
+            .headers
+            .push(("Accept".into(), "application/json".into()));
         let (id, message) = core.bridge.fetch(&request.url, &options);
-        core.pending.insert(id, kind);
+        let token = request_token(&core.app, kind);
+        core.pending.insert(id, PendingRequest { kind, token });
         message
     });
     enqueue(message);
@@ -430,6 +537,8 @@ pub fn enqueue_api(kind: RequestKind, request: lyra_player_core::api::ApiRequest
 
 pub fn enqueue_audio(url: String) {
     let messages = with_core(|core| {
+        core.audio.stop_local();
+        core.audio_ending = false;
         let mut messages = Vec::new();
         if let Some(previous) = core.audio_request.take() {
             messages.push(core.bridge.cancel_stream(&previous, "replaced"));

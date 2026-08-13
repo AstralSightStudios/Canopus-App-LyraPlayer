@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: u8 = 4;
 pub const MAX_CHUNK_SIZE: usize = 2048;
-pub const ACK_WINDOW: u8 = 2;
+pub const ACK_WINDOW: u8 = 1;
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESPONSE_CHUNKS: usize = MAX_RESPONSE_BYTES.div_ceil(MAX_CHUNK_SIZE);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchOptions {
@@ -54,6 +56,7 @@ pub enum BridgeEvent {
     StreamEnded {
         id: String,
         total_bytes: u64,
+        bytes: Vec<u8>,
     },
     Failed {
         id: String,
@@ -71,6 +74,7 @@ pub struct IngestResult {
 #[derive(Clone, Debug)]
 struct ChunkedResponse {
     status: i32,
+    headers: BTreeMap<String, String>,
     encoding: String,
     compression: String,
     total_bytes: usize,
@@ -224,10 +228,18 @@ impl FetchBridge {
         if response.get("chunked").and_then(Value::as_bool) == Some(true) {
             let count = usize_field(response, "chunkCount")?;
             let total_bytes = usize_field(response, "totalBytes")?;
+            if count == 0
+                || count > MAX_RESPONSE_CHUNKS
+                || total_bytes > MAX_RESPONSE_BYTES
+                || count.saturating_mul(MAX_CHUNK_SIZE) < total_bytes
+            {
+                return Err(BridgeError::Length);
+            }
             self.chunked.insert(
                 id,
                 ChunkedResponse {
                     status,
+                    headers: response_headers(response),
                     encoding: encoding(response),
                     compression: compression(response),
                     total_bytes,
@@ -289,12 +301,13 @@ impl FetchBridge {
             return Err(BridgeError::Length);
         }
         let status = slot.status;
+        let headers = core::mem::take(&mut slot.headers);
         self.chunked.remove(&id);
         Ok(IngestResult {
             event: BridgeEvent::Response {
                 id,
                 status,
-                headers: BTreeMap::new(),
+                headers,
                 body,
             },
             replies,
@@ -311,6 +324,16 @@ impl FetchBridge {
             .streams
             .get_mut(&id)
             .ok_or(BridgeError::UnknownRequest)?;
+        if seq < stream.next {
+            let reply = json!({"tag":"fetch-stream-ack", "id":id, "ack":stream.next}).to_string();
+            return Ok(IngestResult {
+                event: BridgeEvent::Ignored,
+                replies: vec![reply],
+            });
+        }
+        if seq >= stream.next + u64::from(ACK_WINDOW) {
+            return Err(BridgeError::Protocol);
+        }
         let bytes = decode(
             message.get("data").and_then(Value::as_str).unwrap_or(""),
             &stream.encoding,
@@ -334,6 +357,7 @@ impl FetchBridge {
         };
         stream.next += 1;
         let ack = stream.next;
+        stream.received_bytes += frame.bytes.len() as u64;
         if frame.final_frame {
             let total = frame.total_bytes.unwrap_or(stream.received_bytes);
             if total != stream.received_bytes {
@@ -344,11 +368,11 @@ impl FetchBridge {
                 event: BridgeEvent::StreamEnded {
                     id: id.clone(),
                     total_bytes: total,
+                    bytes: frame.bytes,
                 },
                 replies: vec![json!({"tag":"fetch-stream-ack", "id":id, "ack":ack}).to_string()],
             });
         }
-        stream.received_bytes += frame.bytes.len() as u64;
         Ok(IngestResult {
             event: BridgeEvent::StreamChunk {
                 id: id.clone(),
@@ -389,7 +413,9 @@ fn response_headers(response: &Value) -> BTreeMap<String, String> {
             headers
                 .iter()
                 .filter_map(|(key, value)| {
-                    value.as_str().map(|value| (key.to_ascii_lowercase(), value.into()))
+                    value
+                        .as_str()
+                        .map(|value| (key.to_ascii_lowercase(), value.into()))
                 })
                 .collect()
         })
@@ -486,7 +512,7 @@ mod tests {
         let value: Value = serde_json::from_str(&FetchBridge::new().handshake(0)).unwrap();
         assert_eq!(value["caps"]["version"], 4);
         assert_eq!(value["caps"]["ack"], true);
-        assert_eq!(value["caps"]["ackWindow"], 2);
+        assert_eq!(value["caps"]["ackWindow"], 1);
         assert_eq!(value["caps"]["compressions"][0], "none");
     }
 
@@ -511,6 +537,45 @@ mod tests {
                 headers: BTreeMap::new(),
                 body: b"abc".to_vec()
             }
+        );
+    }
+
+    #[test]
+    fn final_stream_frame_preserves_payload() {
+        let mut bridge = FetchBridge::new();
+        bridge
+            .ingest(r#"{"tag":"fetch","id":"s","resp":{"ok":true,"status":200,"stream":true,"raw":true,"bodyEncoding":"base64","contentLength":3}}"#)
+            .unwrap();
+        let event = bridge
+            .ingest(r#"{"tag":"fetch-stream","id":"s","seq":0,"data":"YWJj","crc32":"352441c2","final":true,"totalBytes":3}"#)
+            .unwrap()
+            .event;
+        assert_eq!(
+            event,
+            BridgeEvent::StreamEnded {
+                id: "s".into(),
+                total_bytes: 3,
+                bytes: b"abc".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn chunked_response_preserves_headers_and_rejects_huge_allocations() {
+        let mut bridge = FetchBridge::new();
+        bridge
+            .ingest(r#"{"tag":"fetch","id":"x","resp":{"ok":true,"status":200,"headers":{"Set-Cookie":"sid=x; Expires=Wed, 21 Oct 2015 07:28:00 GMT"},"raw":true,"chunked":true,"totalBytes":3,"chunkCount":1,"bodyEncoding":"base64","compression":"none"}}"#)
+            .unwrap();
+        let result = bridge
+            .ingest(r#"{"tag":"fetch-chunk","id":"x","seq":0,"data":"YWJj"}"#)
+            .unwrap();
+        let BridgeEvent::Response { headers, .. } = result.event else {
+            panic!("expected response");
+        };
+        assert!(headers["set-cookie"].starts_with("sid=x"));
+        assert_eq!(
+            bridge.ingest(r#"{"tag":"fetch","id":"huge","resp":{"ok":true,"status":200,"chunked":true,"totalBytes":999999999,"chunkCount":999999999}}"#),
+            Err(BridgeError::Length)
         );
     }
 

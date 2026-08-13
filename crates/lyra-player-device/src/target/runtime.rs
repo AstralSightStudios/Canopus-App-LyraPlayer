@@ -7,6 +7,12 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering
 use canopus_target_private::bt_alloc;
 use lyra_player_core::{LyraApp, app::RequestKind, bridge::FetchBridge};
 
+#[derive(Clone, Copy)]
+pub struct PendingRequest {
+    pub kind: RequestKind,
+    pub token: u64,
+}
+
 pub const APP_NONE: u32 = 0;
 pub const APP_REGISTERED: u32 = 1;
 pub const APP_OK: u32 = 2;
@@ -16,11 +22,12 @@ pub struct Core {
     pub app: LyraApp,
     pub audio: super::audio::AudioDevice,
     pub bridge: FetchBridge,
-    pub pending: BTreeMap<String, RequestKind>,
+    pub pending: BTreeMap<String, PendingRequest>,
     pub outbound: VecDeque<String>,
     pub sending: Option<String>,
     pub audio_request: Option<String>,
     pub deferred_stream_reply: Option<String>,
+    pub audio_ending: bool,
 }
 
 impl Core {
@@ -34,6 +41,7 @@ impl Core {
             sending: None,
             audio_request: None,
             deferred_stream_reply: None,
+            audio_ending: false,
         }
     }
 }
