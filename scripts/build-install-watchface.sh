@@ -134,11 +134,13 @@ link_module "$FINAL" "$FIXUP_O"
 python3 "$ROOT/scripts/encode-opaque-words.py" patch \
     --elf "$FINAL" --metadata "$FIXUP_JSON"
 OBJCOPY=${RUST_OBJCOPY:-$(command -v rust-objcopy || find "$HOME/.rustup" -name rust-objcopy 2>/dev/null | head -1)}
-if [ -n "$OBJCOPY" ]; then
-    "$OBJCOPY" --remove-section=.llvmbc --strip-debug --strip-unneeded \
-        "$FINAL" "$OUT/lyra-player.elf.strip"
-    mv "$OUT/lyra-player.elf.strip" "$FINAL"
-fi
+[ -n "$OBJCOPY" ] && [ -x "$OBJCOPY" ] || {
+    echo "error: rust-objcopy is required to produce a bounded installer artifact" >&2
+    exit 1
+}
+"$OBJCOPY" --remove-section=.llvmbc --strip-debug --strip-unneeded \
+    "$FINAL" "$OUT/lyra-player.elf.strip"
+mv "$OUT/lyra-player.elf.strip" "$FINAL"
 "$CANOPUS_CLI" verify "$FINAL" \
     --target "$TARGET_ID" --targets-dir "$CANOPUS/targets"
 "$ROOT/scripts/verify-device.sh" "$FINAL" "$MODULE_MAX_SIZE"
@@ -208,7 +210,7 @@ import hashlib, pathlib, struct, sys
 watchface = pathlib.Path(sys.argv[1])
 module = (watchface / "module.bin").read_bytes()
 receipt = (watchface / "receipt.bin").read_bytes()
-if not module.startswith(b"\x7fELF") or not 512 <= len(module) <= 262144:
+if not module.startswith(b"\x7fELF") or not 512 <= len(module) <= 393216:
     raise SystemExit(f"invalid staged module size: {len(module)}")
 if len(receipt) != 256 or receipt[:4] != b"CMI1":
     raise SystemExit("invalid CMI1 receipt")

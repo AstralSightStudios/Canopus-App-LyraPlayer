@@ -1,30 +1,23 @@
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::{Session, Song};
+use crate::Song;
 
-pub const DATA_DIR: &str = "/data/canopus";
-pub const SESSION_PATH: &str = "/data/canopus/lyra-player-session.json";
-pub const LIBRARY_PATH: &str = "/data/canopus/lyra-player-library.json";
-pub const IMPORT_DIR: &str = "/data/canopus";
+pub const QUICKAPP_PACKAGE: &str = "com.canopus.lyraimport";
+pub const IMPORT_ROOT: &str = "/data/files/com.canopus.lyraimport/lyra";
+pub const LIBRARY_PATH: &str = "/data/files/com.canopus.lyraimport/lyra/library.json";
+const LEGACY_IMPORT_ROOT: &str = "/data/quickapp/files/com.canopus.lyraimport/lyra";
 
 pub trait Store {
     type Error;
 
     fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, Self::Error>;
-    fn write_atomic(&mut self, path: &str, bytes: &[u8]) -> Result<(), Self::Error>;
-    fn remove(&mut self, path: &str) -> Result<(), Self::Error>;
-}
-
-#[derive(Serialize, Deserialize)]
-struct SessionFile {
-    version: u8,
-    session: Session,
 }
 
 #[derive(Serialize, Deserialize)]
 struct LibraryFile {
     version: u8,
+    #[serde(default)]
     tracks: Vec<Song>,
 }
 
@@ -33,42 +26,7 @@ pub enum PersistenceError<E> {
     Storage(E),
     Json,
     Version,
-}
-
-pub fn load_session<S: Store>(
-    store: &mut S,
-) -> Result<Option<Session>, PersistenceError<S::Error>> {
-    let Some(bytes) = store
-        .read(SESSION_PATH)
-        .map_err(PersistenceError::Storage)?
-    else {
-        return Ok(None);
-    };
-    let file: SessionFile = serde_json::from_slice(&bytes).map_err(|_| PersistenceError::Json)?;
-    if file.version != 1 {
-        return Err(PersistenceError::Version);
-    }
-    Ok(Some(file.session))
-}
-
-pub fn save_session<S: Store>(
-    store: &mut S,
-    session: &Session,
-) -> Result<(), PersistenceError<S::Error>> {
-    let bytes = serde_json::to_vec(&SessionFile {
-        version: 1,
-        session: session.clone(),
-    })
-    .map_err(|_| PersistenceError::Json)?;
-    store
-        .write_atomic(SESSION_PATH, &bytes)
-        .map_err(PersistenceError::Storage)
-}
-
-pub fn clear_session<S: Store>(store: &mut S) -> Result<(), PersistenceError<S::Error>> {
-    store
-        .remove(SESSION_PATH)
-        .map_err(PersistenceError::Storage)
+    UnsafePath,
 }
 
 pub fn load_library<S: Store>(store: &mut S) -> Result<Vec<Song>, PersistenceError<S::Error>> {
@@ -78,47 +36,83 @@ pub fn load_library<S: Store>(store: &mut S) -> Result<Vec<Song>, PersistenceErr
     else {
         return Ok(Vec::new());
     };
-    let file: LibraryFile = serde_json::from_slice(&bytes).map_err(|_| PersistenceError::Json)?;
+    let mut file: LibraryFile =
+        serde_json::from_slice(&bytes).map_err(|_| PersistenceError::Json)?;
     if file.version != 1 {
         return Err(PersistenceError::Version);
+    }
+    for track in &mut file.tracks {
+        if let Some(path) = &mut track.local_path {
+            normalize_legacy_path(path);
+        }
+        if !track.album.cover_url.is_empty() {
+            normalize_legacy_path(&mut track.album.cover_url);
+        }
+        if let Some(path) = &mut track.lyrics_path {
+            normalize_legacy_path(path);
+        }
+    }
+    if file.tracks.iter().any(|track| {
+        !track.local_path.as_deref().is_some_and(is_safe_audio_path)
+            || !track.album.cover_url.is_empty() && !is_safe_cover_path(&track.album.cover_url)
+            || track
+                .lyrics_path
+                .as_deref()
+                .is_some_and(|path| !is_safe_lyrics_path(path))
+    }) {
+        return Err(PersistenceError::UnsafePath);
     }
     Ok(file.tracks)
 }
 
-pub fn save_library<S: Store>(
-    store: &mut S,
-    tracks: &[Song],
-) -> Result<(), PersistenceError<S::Error>> {
-    let bytes = serde_json::to_vec(&LibraryFile {
-        version: 1,
-        tracks: tracks.to_vec(),
-    })
-    .map_err(|_| PersistenceError::Json)?;
-    store
-        .write_atomic(LIBRARY_PATH, &bytes)
-        .map_err(PersistenceError::Storage)
+fn normalize_legacy_path(path: &mut String) {
+    let Some(relative) = path
+        .strip_prefix(LEGACY_IMPORT_ROOT)
+        .and_then(|path| path.strip_prefix('/'))
+    else {
+        return;
+    };
+    *path = alloc::format!("{IMPORT_ROOT}/{relative}");
 }
 
-pub fn is_safe_local_path(path: &str) -> bool {
-    let Some(file_name) = path.strip_prefix(&alloc::format!("{IMPORT_DIR}/")) else {
+pub fn is_safe_audio_path(path: &str) -> bool {
+    is_safe_import_path(path, &[".mp3"])
+}
+
+pub fn is_safe_cover_path(path: &str) -> bool {
+    is_safe_import_path(path, &[".jpg", ".jpeg", ".png", ".bin"])
+}
+
+pub fn is_safe_lyrics_path(path: &str) -> bool {
+    is_safe_import_path(path, &[".lrc", ".json", ".txt"])
+}
+
+fn is_safe_import_path(path: &str, extensions: &[&str]) -> bool {
+    let Some(relative) = path.strip_prefix(IMPORT_ROOT).and_then(|path| path.strip_prefix('/')) else {
         return false;
     };
-    safe_import_path(file_name).as_deref() == Some(path)
+    !relative.is_empty()
+        && relative.len() <= 240
+        && !relative.starts_with('.')
+        && !relative.contains("..")
+        && !relative
+            .bytes()
+            .any(|byte| matches!(byte, b'\\' | 0) || byte.is_ascii_control())
+        && extensions.iter().any(|extension| relative.to_ascii_lowercase().ends_with(extension))
 }
 
-pub fn safe_import_path(file_name: &str) -> Option<String> {
-    if file_name.is_empty()
-        || file_name.len() > 96
-        || file_name.starts_with('.')
-        || file_name.contains("..")
-        || !file_name.ends_with(".mp3")
-        || file_name
+pub fn physical_path(relative: &str) -> Option<String> {
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative.starts_with('.')
+        || relative.contains("..")
+        || relative
             .bytes()
-            .any(|byte| matches!(byte, b'/' | b'\\' | 0) || byte.is_ascii_control())
+            .any(|byte| matches!(byte, b'\\' | 0) || byte.is_ascii_control())
     {
         return None;
     }
-    Some(alloc::format!("{IMPORT_DIR}/{file_name}"))
+    Some(alloc::format!("{IMPORT_ROOT}/{relative}"))
 }
 
 #[cfg(test)]
@@ -133,34 +127,70 @@ mod tests {
         fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, Self::Error> {
             Ok(self.0.get(path).cloned())
         }
-        fn write_atomic(&mut self, path: &str, bytes: &[u8]) -> Result<(), Self::Error> {
-            self.0.insert(path.into(), bytes.to_vec());
-            Ok(())
-        }
-        fn remove(&mut self, path: &str) -> Result<(), Self::Error> {
-            self.0.remove(path);
-            Ok(())
-        }
     }
 
     #[test]
-    fn session_round_trips() {
-        let mut store = MemoryStore::default();
-        let session = Session {
-            cookie: "MUSIC_U=secret".into(),
-            ..Session::default()
+    fn quickapp_library_round_trips() {
+        let song = Song {
+            id: 7,
+            name: "Local".into(),
+            local_path: Some(alloc::format!("{IMPORT_ROOT}/tracks/7/audio.mp3")),
+            lyrics_path: Some(alloc::format!("{IMPORT_ROOT}/tracks/7/lyrics.lrc")),
+            ..Song::default()
         };
-        save_session(&mut store, &session).unwrap();
-        assert_eq!(load_session(&mut store).unwrap(), Some(session));
+        let bytes = serde_json::to_vec(&LibraryFile {
+            version: 1,
+            tracks: alloc::vec![song.clone()],
+        })
+        .unwrap();
+        let mut store = MemoryStore::default();
+        store.0.insert(LIBRARY_PATH.into(), bytes);
+        assert_eq!(load_library(&mut store).unwrap(), alloc::vec![song]);
     }
 
     #[test]
-    fn import_paths_reject_traversal() {
-        assert!(safe_import_path("track.mp3").is_some());
-        assert!(safe_import_path("../track.mp3").is_none());
-        assert!(safe_import_path("track..backup.mp3").is_none());
-        assert!(safe_import_path("cover.png").is_none());
-        assert!(is_safe_local_path("/data/canopus/track.mp3"));
-        assert!(!is_safe_local_path("/etc/passwd"));
+    fn legacy_manifest_paths_are_normalized_to_real_storage_root() {
+        let legacy_audio = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/audio.mp3");
+        let legacy_cover = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/cover.jpg");
+        let legacy_lyrics = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/lyrics.json");
+        let song = Song {
+            id: 7,
+            name: "Legacy".into(),
+            local_path: Some(legacy_audio),
+            lyrics_path: Some(legacy_lyrics),
+            album: crate::AlbumRef {
+                cover_url: legacy_cover,
+                ..crate::AlbumRef::default()
+            },
+            ..Song::default()
+        };
+        let bytes = serde_json::to_vec(&LibraryFile {
+            version: 1,
+            tracks: alloc::vec![song],
+        })
+        .unwrap();
+        let mut store = MemoryStore::default();
+        store.0.insert(LIBRARY_PATH.into(), bytes);
+        let loaded = load_library(&mut store).unwrap();
+        assert_eq!(
+            loaded[0].local_path.as_deref(),
+            Some("/data/files/com.canopus.lyraimport/lyra/tracks/7/audio.mp3")
+        );
+        assert_eq!(
+            loaded[0].album.cover_url,
+            "/data/files/com.canopus.lyraimport/lyra/tracks/7/cover.jpg"
+        );
+        assert_eq!(
+            loaded[0].lyrics_path.as_deref(),
+            Some("/data/files/com.canopus.lyraimport/lyra/tracks/7/lyrics.json")
+        );
+    }
+
+    #[test]
+    fn rejects_paths_outside_quickapp_sandbox() {
+        assert!(is_safe_audio_path(&alloc::format!("{IMPORT_ROOT}/tracks/1/audio.mp3")));
+        assert!(!is_safe_audio_path("/data/canopus/audio.mp3"));
+        assert!(!is_safe_audio_path(&alloc::format!("{IMPORT_ROOT}/../escape.mp3")));
+        assert!(!is_safe_cover_path(&alloc::format!("{IMPORT_ROOT}/tracks/1/audio.mp3")));
     }
 }

@@ -1,5 +1,5 @@
-//! Native app registration: fixed 8-bit app id, stock launcher entry, eight page
-//! descriptors for the complete player flow, and the page lifecycle callbacks. App/page
+//! Native app registration: fixed 8-bit app id, stock launcher entry, four page
+//! descriptors for the local player flow, and page lifecycle callbacks. App/page
 //! registration and Launcher publication are intentionally separate invocations
 //! so miwear can process the app-registry event before Launcher persistence.
 
@@ -11,26 +11,18 @@ use super::runtime::*;
 use super::ui_backend;
 
 pub const APP_ID: u16 = 0x00CC;
-pub const PAGE_COUNT: usize = 8;
+pub const PAGE_COUNT: usize = 4;
 pub const PAGE_OVERVIEW: usize = 0;
-pub const PAGE_LOGIN: usize = 1;
-pub const PAGE_LIBRARY: usize = 2;
-pub const PAGE_PLAYLIST: usize = 3;
-pub const PAGE_SEARCH: usize = 4;
-pub const PAGE_ARTIST: usize = 5;
-pub const PAGE_PLAYER: usize = 6;
-pub const PAGE_LYRICS: usize = 7;
+pub const PAGE_LIBRARY: usize = 1;
+pub const PAGE_PLAYER: usize = 2;
+pub const PAGE_LYRICS: usize = 3;
 
 pub const PACKAGE_NAME: &[u8] = b"com.canopus.lyra-player\0";
 pub const DISPLAY_NAME: &[u8] = b"Lyra\0";
 pub const LAUNCHER_ICON: &[u8] = b"/resource/app/launcher/flashlight.bin\0";
 const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [
     b"lyra_home\0",
-    b"lyra_login\0",
     b"lyra_library\0",
-    b"lyra_playlist\0",
-    b"lyra_search\0",
-    b"lyra_artist\0",
     b"lyra_player\0",
     b"lyra_lyrics\0",
 ];

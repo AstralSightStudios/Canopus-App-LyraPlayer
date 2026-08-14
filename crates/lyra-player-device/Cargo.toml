@@ -1,6 +1,6 @@
 [package]
 name = "lyra-player-device"
-description = "Canopus native device module for Lyra Player"
+description = "Canopus native local music player for Lyra"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,4 +22,3 @@ canopus-abi = { path = "../../../Canopus/sdk/rust/canopus-abi" }
 canopus-runtime = { path = "../../../Canopus/sdk/rust/canopus-runtime" }
 canopus-ui-core = { path = "../../../Canopus/sdk/rust/canopus-ui-core" }
 canopus-target-private = { path = "../../../Canopus/sdk/rust/canopus-target-private", optional = true, default-features = false }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }

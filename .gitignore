@@ -1,6 +1,13 @@
 /target/
 /build/
+/.claude/worktrees/
+/plugins/*/target/
+/plugins/*/dist/
+/quickapps/*/node_modules/
+/quickapps/*/build/
+/quickapps/*/dist/
 __pycache__/
 /watchfaces/lyra-player/module.bin
 /watchfaces/lyra-player/receipt.bin
+/watchfaces/lyra-player-*/
 .DS_Store

@@ -107,11 +107,12 @@ extern "C" fn refresh_timer(timer: *mut core::ffi::c_void) {
         if backend.refresh_timer != timer {
             continue;
         }
-        if backend.active && backend.interactive && !backend.refresh_failed {
+        if backend.active && backend.interactive {
             let rendered_generation = backend.rendered_generation;
             if super::rebuild_if_changed(page_index, rendered_generation) != 0 {
-                // A transient or capacity/LVX failure must not create a 4 Hz
-                // rebuild loop. Resume or an explicit Refresh retries it.
+                // Rendering may fail transiently, but this timer also owns local
+                // audio pumping and library refresh work. Never disable it because
+                // one snapshot could not be painted; retry on a later tick.
                 backend.refresh_failed = true;
             }
         }

@@ -1,0 +1,10 @@
+<script>
+export default {
+  onCreate() {
+    console.log('Lyra Import created')
+  },
+  onDestroy() {
+    console.log('Lyra Import destroyed')
+  }
+}
+</script>

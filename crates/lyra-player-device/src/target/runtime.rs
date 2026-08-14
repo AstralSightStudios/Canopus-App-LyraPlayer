@@ -1,17 +1,7 @@
-use alloc::{
-    collections::{BTreeMap, VecDeque},
-    string::String,
-};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 use canopus_target_private::bt_alloc;
-use lyra_player_core::{LyraApp, app::RequestKind, bridge::FetchBridge};
-
-#[derive(Clone, Copy)]
-pub struct PendingRequest {
-    pub kind: RequestKind,
-    pub token: u64,
-}
+use lyra_player_core::LyraApp;
 
 pub const APP_NONE: u32 = 0;
 pub const APP_REGISTERED: u32 = 1;
@@ -21,13 +11,6 @@ pub const APP_FAILED: u32 = 3;
 pub struct Core {
     pub app: LyraApp,
     pub audio: super::audio::AudioDevice,
-    pub bridge: FetchBridge,
-    pub pending: BTreeMap<String, PendingRequest>,
-    pub outbound: VecDeque<String>,
-    pub sending: Option<String>,
-    pub audio_request: Option<String>,
-    pub deferred_stream_reply: Option<String>,
-    pub audio_ending: bool,
 }
 
 impl Core {
@@ -35,13 +18,6 @@ impl Core {
         Self {
             app: LyraApp::default(),
             audio: super::audio::AudioDevice::new(),
-            bridge: FetchBridge::new(),
-            pending: BTreeMap::new(),
-            outbound: VecDeque::new(),
-            sending: None,
-            audio_request: None,
-            deferred_stream_reply: None,
-            audio_ending: false,
         }
     }
 }
@@ -52,8 +28,6 @@ pub struct Runtime {
     pub app_install_result: AtomicI32,
     pub launcher_add_result: AtomicI32,
     pub last_error: AtomicI32,
-    pub connection: AtomicUsize,
-    pub connected: AtomicBool,
     pub active_page: AtomicU32,
     pub timer_ticks: AtomicU32,
 }
@@ -66,8 +40,6 @@ impl Runtime {
             app_install_result: AtomicI32::new(0),
             launcher_add_result: AtomicI32::new(0),
             last_error: AtomicI32::new(0),
-            connection: AtomicUsize::new(0),
-            connected: AtomicBool::new(false),
             active_page: AtomicU32::new(0),
             timer_ticks: AtomicU32::new(0),
         }
@@ -90,9 +62,7 @@ pub fn prepare() {
         CORE_PTR.store(pointer as usize, Ordering::Release);
     }
     unsafe {
-        core::ptr::addr_of_mut!(RUNTIME)
-            .cast::<Runtime>()
-            .write(Runtime::new());
+        core::ptr::addr_of_mut!(RUNTIME).cast::<Runtime>().write(Runtime::new());
         pointer.write(Core::new());
     }
     CORE_LOCK.store(false, Ordering::Release);

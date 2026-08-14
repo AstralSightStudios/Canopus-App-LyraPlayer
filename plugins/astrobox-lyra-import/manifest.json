@@ -1,0 +1,17 @@
+{
+  "name": "Lyra Import",
+  "icon": "",
+  "version": "0.2.0",
+  "description": "将本地 MP3 或网易云音乐（含封面、歌词）导入 Lyra Import 快应用。",
+  "author": "Searchstars",
+  "website": "",
+  "entry": "astrobox_plugin_lyra_import.wasm",
+  "wasi_version": 2,
+  "api_level": 3,
+  "permissions": [
+    "interconnect",
+    "register_interconnect_recv",
+    "device"
+  ],
+  "additional_files": []
+}

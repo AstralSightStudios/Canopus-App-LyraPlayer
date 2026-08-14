@@ -2,9 +2,7 @@
 
 extern crate alloc;
 
-pub mod api;
 pub mod app;
-pub mod bridge;
 pub mod lyrics;
 pub mod model;
 pub mod persistence;
