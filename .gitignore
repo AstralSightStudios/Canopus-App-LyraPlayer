@@ -2,7 +2,6 @@
 /build/
 /.claude/worktrees/
 /plugins/*/target/
-/plugins/*/dist/
 /quickapps/*/node_modules/
 /quickapps/*/build/
 /quickapps/*/dist/

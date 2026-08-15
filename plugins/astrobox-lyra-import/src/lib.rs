@@ -2,8 +2,10 @@ use wit_bindgen::FutureReader;
 
 use crate::exports::astrobox::psys_plugin::{event_v3 as event, event_v3::EventType, lifecycle};
 
+mod artwork;
 mod import;
 mod interconnect;
+mod library;
 mod netease;
 mod state;
 mod ui;
@@ -21,11 +23,13 @@ impl event::Guest for LyraImportPlugin {
         match event_type {
             EventType::InterconnectMessage => {
                 if let Some(message) = interconnect::parse_event(&event_payload) {
-                    wit_bindgen::block_on(import::handle(
-                        &message.addr,
-                        &message.package,
-                        &message.payload,
-                    ));
+                    if !library::handle(&message.addr, &message.package, &message.payload) {
+                        wit_bindgen::block_on(import::handle(
+                            &message.addr,
+                            &message.package,
+                            &message.payload,
+                        ));
+                    }
                     ui::rerender();
                 }
             }
@@ -69,11 +73,18 @@ impl lifecycle::Guest for LyraImportPlugin {
             .compact()
             .init();
         interconnect::refresh_devices();
+        let restored = state::load_netease_session();
         state::with_state(|state| {
-            state.status = if state.devices.is_empty() {
-                "未发现已连接设备。".to_string()
-            } else {
-                "请打开手表上的 Lyra Import，然后选择本地或网易云音乐。".to_string()
+            state.netease_audio_bitrate =
+                netease::normalized_audio_bitrate(state.netease_audio_bitrate);
+            if let Ok(Some(cookie)) = &restored {
+                state.netease_cookie = cookie.clone();
+            }
+            state.status = match &restored {
+                Err(error) => error.clone(),
+                Ok(Some(_)) => "已恢复网易云登录状态。".to_string(),
+                Ok(None) if state.devices.is_empty() => "未发现已连接设备。".to_string(),
+                Ok(None) => "请打开手表上的 Lyra Import，然后选择本地或网易云音乐。".to_string(),
             };
         });
     }

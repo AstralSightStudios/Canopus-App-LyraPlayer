@@ -1,7 +1,7 @@
-use alloc::{format, string::String};
+use alloc::format;
 use canopus_ui_core::{
-    ActionRow, Layout, NavigationPage, Progress, Snapshot, StatusRow, Text, TextStyle, Tree,
-    UiError, View, view,
+    ActionRow, Layout, NavigationPage, Snapshot, StatusRow, Text, TextStyle, Tree, UiError, View,
+    view,
 };
 
 use crate::{LyraApp, Route, Song, playback::PlaybackState};
@@ -10,9 +10,13 @@ pub const EVENT_BACK: u32 = 1;
 pub const EVENT_LIBRARY: u32 = 2;
 pub const EVENT_TOGGLE: u32 = 3;
 pub const EVENT_NEXT: u32 = 4;
-pub const EVENT_LYRICS: u32 = 5;
+pub const EVENT_PREVIOUS: u32 = 5;
 pub const EVENT_NOW_PLAYING: u32 = 6;
+pub const EVENT_VOLUME_DOWN: u32 = 7;
+pub const EVENT_VOLUME_UP: u32 = 8;
 pub const EVENT_LOCAL_SONG_BASE: u32 = 1_000;
+pub const PLAYER_BACKGROUND_KEY: u32 = 39;
+pub const PLAYER_COVER_KEY: u32 = 40;
 
 #[derive(Clone, Copy)]
 pub struct UiEvent(pub u32);
@@ -27,7 +31,6 @@ pub fn render(app: &LyraApp) -> Result<Snapshot, UiError> {
         Route::Home => home(app),
         Route::Library => library(app),
         Route::Player => player(app),
-        Route::Lyrics => lyrics(app),
     }
 }
 
@@ -85,7 +88,7 @@ fn library(app: &LyraApp) -> Result<Snapshot, UiError> {
     let hint = if app.local_tracks.is_empty() {
         "暂无音乐，请先打开 Lyra Import"
     } else {
-        "来自 Lyra Import 的音频、封面与歌词"
+        "来自 Lyra Import 的音频与封面"
     };
     let view = view!(NavigationPage {
         key: 1,
@@ -96,7 +99,9 @@ fn library(app: &LyraApp) -> Result<Snapshot, UiError> {
                 text: hint,
                 style: TextStyle::Description
             },
-            SongRows { songs: &app.local_tracks },
+            SongRows {
+                songs: &app.local_tracks
+            },
             ActionRow {
                 key: 3,
                 label: "返回",
@@ -137,23 +142,17 @@ fn player(app: &LyraApp) -> Result<Snapshot, UiError> {
         return commit(tree, app.generation);
     };
     let artist = song.artist_line();
-    let progress = progress_text(app.player.position_ms, app.player.duration_ms);
-    let lyric = app
-        .player
-        .lyrics
-        .active_index(app.player.position_ms)
-        .and_then(|index| app.player.lyrics.lines.get(index))
-        .map(|line| line.text.as_str())
-        .unwrap_or("暂无歌词");
     let toggle = if app.player.state == PlaybackState::Paused {
         "继续播放"
     } else {
         "暂停"
     };
+    let volume = format!("{}%", app.player.volume_percent);
     let view = view!(NavigationPage {
         key: 1,
         title: "正在播放",
         children: (
+            BackgroundImage { song },
             CoverImage { song },
             Text {
                 key: 2,
@@ -165,23 +164,30 @@ fn player(app: &LyraApp) -> Result<Snapshot, UiError> {
                 text: artist.as_str(),
                 style: TextStyle::Description
             },
-            Text {
-                key: 4,
-                text: lyric,
-                style: TextStyle::Warning
+            StatusRow {
+                key: 5,
+                label: "状态",
+                value: playback_label(app.player.state)
             },
             (
                 StatusRow {
-                    key: 5,
-                    label: progress.as_str(),
-                    value: playback_label(app.player.state)
+                    key: 10,
+                    label: "音量",
+                    value: volume.as_str()
                 },
-                Progress {
-                    key: 50,
-                    value: app.player.position_ms.min(app.player.duration_ms).min(i32::MAX as u32) as i32,
-                    minimum: 0,
-                    maximum: app.player.duration_ms.max(1).min(i32::MAX as u32) as i32,
-                    layout: Layout { width: 280, height: 14, ..Layout::default() }
+                ActionRow {
+                    key: 11,
+                    label: "降低音量",
+                    detail: "降低 10%",
+                    event: UiEvent(EVENT_VOLUME_DOWN),
+                    enabled: app.player.volume_percent > 0
+                },
+                ActionRow {
+                    key: 12,
+                    label: "提高音量",
+                    detail: "提高 10%",
+                    event: UiEvent(EVENT_VOLUME_UP),
+                    enabled: app.player.volume_percent < 100
                 },
             ),
             (
@@ -190,21 +196,24 @@ fn player(app: &LyraApp) -> Result<Snapshot, UiError> {
                     label: toggle,
                     detail: "播放控制",
                     event: UiEvent(EVENT_TOGGLE),
-                    enabled: matches!(app.player.state, PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering)
+                    enabled: matches!(
+                        app.player.state,
+                        PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
+                    )
                 },
                 ActionRow {
                     key: 7,
-                    label: "下一首",
-                    detail: "播放队列中的下一首",
-                    event: UiEvent(EVENT_NEXT),
-                    enabled: !app.player.queue.is_empty()
+                    label: "上一首",
+                    detail: "本地音乐列表中的上一首",
+                    event: UiEvent(EVENT_PREVIOUS),
+                    enabled: app.has_previous()
                 },
                 ActionRow {
                     key: 8,
-                    label: "歌词",
-                    detail: "跟随播放进度",
-                    event: UiEvent(EVENT_LYRICS),
-                    enabled: !app.player.lyrics.lines.is_empty()
+                    label: "下一首",
+                    detail: "本地音乐列表中的下一首",
+                    event: UiEvent(EVENT_NEXT),
+                    enabled: app.has_next()
                 },
                 ActionRow {
                     key: 9,
@@ -222,28 +231,25 @@ fn player(app: &LyraApp) -> Result<Snapshot, UiError> {
     commit(tree, app.generation)
 }
 
-fn lyrics(app: &LyraApp) -> Result<Snapshot, UiError> {
-    let active = app.player.lyrics.active_index(app.player.position_ms);
-    let mut tree = Tree::begin();
-    tree.navigation_page(1, "歌词")?;
-    if app.player.lyrics.lines.is_empty() {
-        tree.text(2, "这首歌没有可用歌词", TextStyle::Description)?;
-    } else {
-        let start = active.unwrap_or(0).saturating_sub(4);
-        for (offset, line) in app.player.lyrics.lines.iter().skip(start).take(10).enumerate() {
-            tree.text(
-                100 + offset as u32,
-                &line.text,
-                if Some(start + offset) == active { TextStyle::Title } else { TextStyle::Description },
-            )?;
-            if let Some(translation) = &line.translation {
-                tree.text(200 + offset as u32, translation, TextStyle::Description)?;
-            }
+struct BackgroundImage<'a> {
+    song: &'a Song,
+}
+impl View<UiEvent> for BackgroundImage<'_> {
+    fn render(&self, tree: &mut Tree) -> Result<(), UiError> {
+        if self.song.album.background_url.is_empty() {
+            return Ok(());
         }
+        tree.image(
+            PLAYER_BACKGROUND_KEY,
+            image_resource_id(&self.song.album.background_url, 0xBACC_600D),
+            &self.song.album.background_url,
+            Layout {
+                width: 336,
+                height: 480,
+                ..Layout::default()
+            },
+        )
     }
-    tree.action_row(3, "返回播放页", "继续播放", EVENT_BACK, true)?;
-    tree.end()?;
-    commit(tree, app.generation)
 }
 
 struct CoverImage<'a> {
@@ -255,12 +261,24 @@ impl View<UiEvent> for CoverImage<'_> {
             return Ok(());
         }
         tree.image(
-            40,
-            self.song.id as u32,
+            PLAYER_COVER_KEY,
+            image_resource_id(&self.song.album.cover_url, 0xC0DE_1234),
             &self.song.album.cover_url,
-            Layout { width: 180, height: 180, ..Layout::default() },
+            Layout {
+                width: 180,
+                height: 180,
+                ..Layout::default()
+            },
         )
     }
+}
+
+fn image_resource_id(path: &str, seed: u32) -> u32 {
+    let mut hash = seed;
+    for byte in path.as_bytes() {
+        hash = (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
+    }
+    if hash == 0 { 1 } else { hash }
 }
 
 struct SongRows<'a> {
@@ -307,16 +325,6 @@ fn playback_label(state: PlaybackState) -> &'static str {
     }
 }
 
-fn progress_text(position_ms: u32, duration_ms: u32) -> String {
-    format!(
-        "{:02}:{:02} / {:02}:{:02}",
-        position_ms / 60_000,
-        position_ms / 1_000 % 60,
-        duration_ms / 60_000,
-        duration_ms / 1_000 % 60,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,7 +333,7 @@ mod tests {
     #[test]
     fn every_local_route_renders() {
         let mut app = LyraApp::default();
-        for route in [Route::Home, Route::Library, Route::Player, Route::Lyrics] {
+        for route in [Route::Home, Route::Library, Route::Player] {
             app.route = route;
             let snapshot = render(&app).unwrap();
             assert_eq!(snapshot.nodes[0].kind(), Some(NodeKind::NavigationPage));
@@ -334,17 +342,41 @@ mod tests {
 
     #[test]
     fn imported_cover_is_rendered_on_player() {
-        let mut app = LyraApp { route: Route::Player, ..LyraApp::default() };
+        let mut app = LyraApp {
+            route: Route::Player,
+            ..LyraApp::default()
+        };
         app.player.current = Some(Song {
             id: 1,
             name: "Test".into(),
             album: crate::AlbumRef {
                 cover_url: alloc::format!("{}/tracks/1/cover.jpg", crate::persistence::IMPORT_ROOT),
+                background_url: alloc::format!(
+                    "{}/tracks/1/background.bin",
+                    crate::persistence::IMPORT_ROOT
+                ),
                 ..crate::AlbumRef::default()
             },
             ..Song::default()
         });
         let snapshot = render(&app).unwrap();
-        assert!(snapshot.nodes.iter().take(snapshot.node_count as usize).any(|node| node.kind() == Some(NodeKind::Image)));
+        assert!(
+            snapshot
+                .nodes
+                .iter()
+                .take(snapshot.node_count as usize)
+                .any(|node| node.kind() == Some(NodeKind::Image))
+        );
+        let image_keys: alloc::vec::Vec<u32> = snapshot
+            .nodes
+            .iter()
+            .take(snapshot.node_count as usize)
+            .filter(|node| node.kind() == Some(NodeKind::Image))
+            .map(|node| node.key)
+            .collect();
+        assert_eq!(
+            image_keys,
+            alloc::vec![PLAYER_BACKGROUND_KEY, PLAYER_COVER_KEY]
+        );
     }
 }

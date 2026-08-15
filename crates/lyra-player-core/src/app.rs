@@ -1,6 +1,6 @@
 use alloc::{string::String, vec::Vec};
 
-use crate::{Song, lyrics, playback::Player};
+use crate::{Song, playback::Player};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Route {
@@ -8,7 +8,6 @@ pub enum Route {
     Home,
     Library,
     Player,
-    Lyrics,
 }
 
 impl Route {
@@ -17,7 +16,6 @@ impl Route {
             Self::Home => 0,
             Self::Library => 1,
             Self::Player => 2,
-            Self::Lyrics => 3,
         }
     }
 
@@ -26,7 +24,6 @@ impl Route {
             0 => Some(Self::Home),
             1 => Some(Self::Library),
             2 => Some(Self::Player),
-            3 => Some(Self::Lyrics),
             _ => None,
         }
     }
@@ -35,7 +32,6 @@ impl Route {
 #[derive(Clone, Debug)]
 pub enum Effect {
     StreamAudio { path: String },
-    LoadLyrics { path: Option<String> },
     Navigate(Route),
 }
 
@@ -46,8 +42,8 @@ pub enum Action {
     Back,
     ReloadLibrary(Vec<Song>),
     SelectSong(Song),
+    Previous,
     Next,
-    ShowLyrics,
     Tick(u32),
 }
 
@@ -91,12 +87,9 @@ impl LyraApp {
                 }
             }
             Action::SelectSong(song) => {
-                let queue = self.local_tracks.iter().cloned();
-                self.player.select(song.clone(), queue);
+                self.player.select(song.clone(), core::iter::empty());
+                self.error = None;
                 self.navigate(Route::Player, &mut effects);
-                effects.push(Effect::LoadLyrics {
-                    path: song.lyrics_path.clone(),
-                });
                 match song.local_path {
                     Some(path) => effects.push(Effect::StreamAudio { path }),
                     None => {
@@ -105,28 +98,41 @@ impl LyraApp {
                     }
                 }
             }
-            Action::Next => {
-                if let Some(song) = self.player.take_next() {
+            Action::Previous => {
+                if let Some(song) = self.adjacent_song(false) {
                     effects.extend(self.update(Action::SelectSong(song)));
                     return effects;
                 }
             }
-            Action::ShowLyrics => self.navigate(Route::Lyrics, &mut effects),
+            Action::Next => {
+                if let Some(song) = self.adjacent_song(true) {
+                    effects.extend(self.update(Action::SelectSong(song)));
+                    return effects;
+                }
+            }
             Action::Tick(ms) => self.player.tick(ms),
         }
         self.touch();
         effects
     }
 
-    pub fn set_lyrics_text(&mut self, text: Option<&str>) {
-        self.player.lyrics = match text {
-            Some(text) if text.trim_start().starts_with('{') => {
-                lyrics::parse_api_lyrics(text).unwrap_or_default()
-            }
-            Some(text) => lyrics::parse_lrc(text),
-            None => Default::default(),
+    pub fn has_previous(&self) -> bool {
+        self.adjacent_song(false).is_some()
+    }
+
+    pub fn has_next(&self) -> bool {
+        self.adjacent_song(true).is_some()
+    }
+
+    fn adjacent_song(&self, next: bool) -> Option<Song> {
+        let id = self.player.current.as_ref()?.id;
+        let index = self.local_tracks.iter().position(|song| song.id == id)?;
+        let adjacent = if next {
+            index.checked_add(1)?
+        } else {
+            index.checked_sub(1)?
         };
-        self.touch();
+        self.local_tracks.get(adjacent).cloned()
     }
 
     fn navigate(&mut self, route: Route, effects: &mut Vec<Effect>) {
@@ -163,8 +169,64 @@ mod tests {
         let mut app = LyraApp::default();
         app.update(Action::Boot(alloc::vec![local_song(1), local_song(2)]));
         let effects = app.update(Action::SelectSong(local_song(1)));
-        assert!(effects.iter().any(|effect| matches!(effect, Effect::StreamAudio { .. })));
-        assert!(!effects.iter().any(|effect| matches!(effect, Effect::StreamAudio { path } if path.starts_with("http"))));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
+        );
+        assert!(!effects.iter().any(
+            |effect| matches!(effect, Effect::StreamAudio { path } if path.starts_with("http"))
+        ));
+    }
+
+    #[test]
+    fn previous_and_next_follow_local_library_order_without_wrapping() {
+        let mut app = LyraApp::default();
+        let tracks = alloc::vec![local_song(10), local_song(20), local_song(30)];
+        app.update(Action::Boot(tracks.clone()));
+
+        app.update(Action::SelectSong(tracks[0].clone()));
+        assert!(!app.has_previous());
+        assert!(app.has_next());
+        assert!(app.update(Action::Previous).is_empty());
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(10));
+
+        let effects = app.update(Action::Next);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
+        );
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(20));
+        assert!(app.has_previous());
+        assert!(app.has_next());
+
+        app.update(Action::Next);
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(30));
+        assert!(app.has_previous());
+        assert!(!app.has_next());
+        assert!(app.update(Action::Next).is_empty());
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(30));
+    }
+
+    #[test]
+    fn completed_track_can_still_select_previous_library_track() {
+        let mut app = LyraApp::default();
+        let tracks = alloc::vec![local_song(1), local_song(2), local_song(3)];
+        app.update(Action::Boot(tracks.clone()));
+        app.update(Action::SelectSong(tracks[2].clone()));
+        app.player.state = crate::playback::PlaybackState::Draining;
+
+        let effects = app.update(Action::Previous);
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
+        );
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(2));
+        assert_eq!(app.player.position_ms, 0);
+        assert_eq!(app.player.state, crate::playback::PlaybackState::Resolving);
     }
 
     #[test]

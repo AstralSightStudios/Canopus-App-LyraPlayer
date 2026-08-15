@@ -4,7 +4,8 @@ use crate::astrobox::psys_host::{device, interconnect, register};
 use crate::state::{self, DeviceInfo};
 
 pub const ROUTE_PACKAGE: &str = "com.canopus.lyraimport";
-const FRAME_CAPACITY: usize = 8192;
+pub const OUTGOING_FRAME_CAPACITY: usize = 48 * 1024;
+pub const INCOMING_FRAME_CAPACITY: usize = 8192;
 
 pub struct IncomingMessage {
     pub addr: String,
@@ -32,6 +33,10 @@ pub fn refresh_devices() {
                 .first()
                 .map(|item| item.addr.clone())
                 .unwrap_or_default();
+            state.device_library.clear();
+            state.library_request_id.clear();
+            state.library_revision.clear();
+            state.library_total = 0;
         }
     });
     register_receivers();
@@ -51,8 +56,8 @@ pub fn register_receivers() {
 
 pub async fn send(addr: &str, value: &Value) -> Result<(), String> {
     let frame = value.to_string();
-    if frame.len() > FRAME_CAPACITY {
-        return Err("interconnect frame exceeds 8192 bytes".to_string());
+    if frame.len() > OUTGOING_FRAME_CAPACITY {
+        return Err("outgoing interconnect frame exceeds 49152 bytes".to_string());
     }
     interconnect::send_qaic_message(addr, ROUTE_PACKAGE, &frame)
         .into_future()
@@ -61,7 +66,7 @@ pub async fn send(addr: &str, value: &Value) -> Result<(), String> {
 }
 
 pub fn parse_event(raw: &str) -> Option<IncomingMessage> {
-    if raw.len() > FRAME_CAPACITY * 2 {
+    if raw.len() > INCOMING_FRAME_CAPACITY * 2 {
         return None;
     }
     let value: Value = serde_json::from_str(raw).ok()?;
@@ -78,7 +83,7 @@ pub fn parse_event(raw: &str) -> Option<IncomingMessage> {
                 .map(str::to_string)
         })
         .or_else(|| value.get("payload").map(Value::to_string))?;
-    if payload.len() > FRAME_CAPACITY {
+    if payload.len() > INCOMING_FRAME_CAPACITY {
         return None;
     }
     Some(IncomingMessage {

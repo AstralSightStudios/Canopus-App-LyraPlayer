@@ -1,6 +1,6 @@
 use alloc::{collections::VecDeque, string::String, vec::Vec};
 
-use crate::{Song, lyrics::Lyrics};
+use crate::Song;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PlaybackState {
@@ -14,18 +14,35 @@ pub enum PlaybackState {
     Failed,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Player {
     pub state: PlaybackState,
     pub current: Option<Song>,
     pub queue: VecDeque<Song>,
-    pub lyrics: Lyrics,
     pub position_ms: u32,
     pub duration_ms: u32,
+    pub volume_percent: u8,
     pub stream_id: Option<String>,
     pub error: Option<String>,
     pending_audio: VecDeque<Vec<u8>>,
     pending_offset: usize,
+}
+
+impl Default for Player {
+    fn default() -> Self {
+        Self {
+            state: PlaybackState::Idle,
+            current: None,
+            queue: VecDeque::new(),
+            position_ms: 0,
+            duration_ms: 0,
+            volume_percent: 100,
+            stream_id: None,
+            error: None,
+            pending_audio: VecDeque::new(),
+            pending_offset: 0,
+        }
+    }
 }
 
 pub trait AudioSink {
@@ -49,7 +66,6 @@ impl Player {
         self.queue.clear();
         self.queue
             .extend(queue.into_iter().filter(|item| item.id != song.id));
-        self.lyrics = Lyrics::default();
         self.stream_id = None;
         self.pending_audio.clear();
         self.pending_offset = 0;
@@ -65,9 +81,20 @@ impl Player {
         sink.stop()?;
         sink.configure_mp3()?;
         sink.start()?;
-        self.stream_id = Some(id);
-        self.state = PlaybackState::Buffering;
+        self.prebuffered_stream_started(id);
         Ok(())
+    }
+
+    pub fn prebuffered_stream_started(&mut self, id: String) {
+        self.prebuffered_stream_started_at(id, 0);
+    }
+
+    pub fn prebuffered_stream_started_at(&mut self, id: String, position_ms: u32) {
+        self.stream_id = Some(id);
+        self.pending_audio.clear();
+        self.pending_offset = 0;
+        self.position_ms = position_ms;
+        self.state = PlaybackState::Buffering;
     }
 
     pub fn push_audio<S: AudioSink>(
@@ -136,11 +163,49 @@ impl Player {
 
     pub fn tick(&mut self, elapsed_ms: u32) {
         if self.state == PlaybackState::Playing {
-            self.position_ms = self
-                .position_ms
-                .saturating_add(elapsed_ms)
-                .min(self.duration_ms);
+            self.position_ms = if self.duration_ms == 0 {
+                self.position_ms.saturating_add(elapsed_ms)
+            } else {
+                self.position_ms
+                    .saturating_add(elapsed_ms)
+                    .min(self.duration_ms)
+            };
         }
+    }
+
+    pub fn sync_position(&mut self, position_ms: u32) -> bool {
+        let position_ms = if self.duration_ms == 0 {
+            position_ms
+        } else {
+            position_ms.min(self.duration_ms)
+        };
+        let visible_changed = self.position_ms / 500 != position_ms / 500;
+        self.position_ms = position_ms;
+        visible_changed
+    }
+
+    pub fn set_duration(&mut self, duration_ms: u32) {
+        self.duration_ms = duration_ms;
+        if let Some(current) = &mut self.current {
+            current.duration_ms = duration_ms;
+        }
+        self.position_ms = self.position_ms.min(duration_ms);
+    }
+
+    pub fn sync_volume(&mut self, percent: u8) -> bool {
+        let percent = percent.min(100);
+        if self.volume_percent == percent {
+            return false;
+        }
+        self.volume_percent = percent;
+        true
+    }
+
+    pub fn set_volume<S: AudioSink>(&mut self, percent: u8, sink: &mut S) -> Result<(), S::Error> {
+        let percent = percent.min(100);
+        sink.set_volume(percent)?;
+        self.volume_percent = percent;
+        Ok(())
     }
 
     pub fn take_next(&mut self) -> Option<Song> {
@@ -156,6 +221,7 @@ mod tests {
     struct ShortSink {
         bytes: Vec<u8>,
         max_write: usize,
+        volume_percent: u8,
     }
     impl AudioSink for ShortSink {
         type Error = ();
@@ -182,7 +248,8 @@ mod tests {
         fn drain(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn set_volume(&mut self, _: u8) -> Result<(), Self::Error> {
+        fn set_volume(&mut self, percent: u8) -> Result<(), Self::Error> {
+            self.volume_percent = percent;
             Ok(())
         }
     }
@@ -220,5 +287,55 @@ mod tests {
         assert!(player.flush_audio(&mut sink).unwrap());
         assert_eq!(sink.bytes, b"abcde");
         assert_eq!(player.state, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn volume_is_clamped_and_sent_to_sink() {
+        let mut player = Player::default();
+        let mut sink = ShortSink::default();
+        player.set_volume(110, &mut sink).unwrap();
+        assert_eq!(player.volume_percent, 100);
+        assert_eq!(sink.volume_percent, 100);
+        player.set_volume(40, &mut sink).unwrap();
+        assert_eq!(player.volume_percent, 40);
+        assert_eq!(sink.volume_percent, 40);
+    }
+
+    #[test]
+    fn discovered_duration_updates_current_song_and_clamps_position() {
+        let mut player = Player {
+            current: Some(Song {
+                duration_ms: 0,
+                ..Song::default()
+            }),
+            position_ms: 9_000,
+            ..Player::default()
+        };
+        player.set_duration(5_000);
+        assert_eq!(player.duration_ms, 5_000);
+        assert_eq!(player.current.as_ref().unwrap().duration_ms, 5_000);
+        assert_eq!(player.position_ms, 5_000);
+    }
+
+    #[test]
+    fn external_volume_sync_only_reports_real_changes() {
+        let mut player = Player::default();
+        assert!(!player.sync_volume(100));
+        assert!(player.sync_volume(41));
+        assert_eq!(player.volume_percent, 41);
+        assert!(!player.sync_volume(41));
+    }
+
+    #[test]
+    fn driver_position_advances_when_duration_is_unknown() {
+        let mut player = Player {
+            state: PlaybackState::Playing,
+            duration_ms: 0,
+            ..Player::default()
+        };
+        assert!(player.sync_position(1_250));
+        assert_eq!(player.position_ms, 1_250);
+        player.tick(500);
+        assert_eq!(player.position_ms, 1_750);
     }
 }

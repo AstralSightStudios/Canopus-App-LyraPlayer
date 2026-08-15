@@ -16,6 +16,8 @@ pub struct AlbumRef {
     pub name: String,
     #[serde(default, alias = "coverUrl")]
     pub cover_url: String,
+    #[serde(default, alias = "backgroundUrl")]
+    pub background_url: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

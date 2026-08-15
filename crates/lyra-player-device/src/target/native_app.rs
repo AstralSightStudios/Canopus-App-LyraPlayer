@@ -15,7 +15,6 @@ pub const PAGE_COUNT: usize = 4;
 pub const PAGE_OVERVIEW: usize = 0;
 pub const PAGE_LIBRARY: usize = 1;
 pub const PAGE_PLAYER: usize = 2;
-pub const PAGE_LYRICS: usize = 3;
 
 pub const PACKAGE_NAME: &[u8] = b"com.canopus.lyra-player\0";
 pub const DISPLAY_NAME: &[u8] = b"Lyra\0";

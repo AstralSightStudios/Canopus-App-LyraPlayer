@@ -48,6 +48,9 @@ pub fn load_library<S: Store>(store: &mut S) -> Result<Vec<Song>, PersistenceErr
         if !track.album.cover_url.is_empty() {
             normalize_legacy_path(&mut track.album.cover_url);
         }
+        if !track.album.background_url.is_empty() {
+            normalize_legacy_path(&mut track.album.background_url);
+        }
         if let Some(path) = &mut track.lyrics_path {
             normalize_legacy_path(path);
         }
@@ -55,6 +58,8 @@ pub fn load_library<S: Store>(store: &mut S) -> Result<Vec<Song>, PersistenceErr
     if file.tracks.iter().any(|track| {
         !track.local_path.as_deref().is_some_and(is_safe_audio_path)
             || !track.album.cover_url.is_empty() && !is_safe_cover_path(&track.album.cover_url)
+            || !track.album.background_url.is_empty()
+                && !is_safe_background_path(&track.album.background_url)
             || track
                 .lyrics_path
                 .as_deref()
@@ -83,12 +88,19 @@ pub fn is_safe_cover_path(path: &str) -> bool {
     is_safe_import_path(path, &[".jpg", ".jpeg", ".png", ".bin"])
 }
 
+pub fn is_safe_background_path(path: &str) -> bool {
+    is_safe_import_path(path, &[".bin"])
+}
+
 pub fn is_safe_lyrics_path(path: &str) -> bool {
     is_safe_import_path(path, &[".lrc", ".json", ".txt"])
 }
 
 fn is_safe_import_path(path: &str, extensions: &[&str]) -> bool {
-    let Some(relative) = path.strip_prefix(IMPORT_ROOT).and_then(|path| path.strip_prefix('/')) else {
+    let Some(relative) = path
+        .strip_prefix(IMPORT_ROOT)
+        .and_then(|path| path.strip_prefix('/'))
+    else {
         return false;
     };
     !relative.is_empty()
@@ -98,7 +110,9 @@ fn is_safe_import_path(path: &str, extensions: &[&str]) -> bool {
         && !relative
             .bytes()
             .any(|byte| matches!(byte, b'\\' | 0) || byte.is_ascii_control())
-        && extensions.iter().any(|extension| relative.to_ascii_lowercase().ends_with(extension))
+        && extensions
+            .iter()
+            .any(|extension| relative.to_ascii_lowercase().ends_with(extension))
 }
 
 pub fn physical_path(relative: &str) -> Option<String> {
@@ -136,6 +150,10 @@ mod tests {
             name: "Local".into(),
             local_path: Some(alloc::format!("{IMPORT_ROOT}/tracks/7/audio.mp3")),
             lyrics_path: Some(alloc::format!("{IMPORT_ROOT}/tracks/7/lyrics.lrc")),
+            album: crate::AlbumRef {
+                background_url: alloc::format!("{IMPORT_ROOT}/tracks/7/background.bin"),
+                ..crate::AlbumRef::default()
+            },
             ..Song::default()
         };
         let bytes = serde_json::to_vec(&LibraryFile {
@@ -152,6 +170,7 @@ mod tests {
     fn legacy_manifest_paths_are_normalized_to_real_storage_root() {
         let legacy_audio = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/audio.mp3");
         let legacy_cover = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/cover.jpg");
+        let legacy_background = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/background.bin");
         let legacy_lyrics = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/lyrics.json");
         let song = Song {
             id: 7,
@@ -160,6 +179,7 @@ mod tests {
             lyrics_path: Some(legacy_lyrics),
             album: crate::AlbumRef {
                 cover_url: legacy_cover,
+                background_url: legacy_background,
                 ..crate::AlbumRef::default()
             },
             ..Song::default()
@@ -181,6 +201,10 @@ mod tests {
             "/data/files/com.canopus.lyraimport/lyra/tracks/7/cover.jpg"
         );
         assert_eq!(
+            loaded[0].album.background_url,
+            "/data/files/com.canopus.lyraimport/lyra/tracks/7/background.bin"
+        );
+        assert_eq!(
             loaded[0].lyrics_path.as_deref(),
             Some("/data/files/com.canopus.lyraimport/lyra/tracks/7/lyrics.json")
         );
@@ -188,9 +212,21 @@ mod tests {
 
     #[test]
     fn rejects_paths_outside_quickapp_sandbox() {
-        assert!(is_safe_audio_path(&alloc::format!("{IMPORT_ROOT}/tracks/1/audio.mp3")));
+        assert!(is_safe_audio_path(&alloc::format!(
+            "{IMPORT_ROOT}/tracks/1/audio.mp3"
+        )));
         assert!(!is_safe_audio_path("/data/canopus/audio.mp3"));
-        assert!(!is_safe_audio_path(&alloc::format!("{IMPORT_ROOT}/../escape.mp3")));
-        assert!(!is_safe_cover_path(&alloc::format!("{IMPORT_ROOT}/tracks/1/audio.mp3")));
+        assert!(!is_safe_audio_path(&alloc::format!(
+            "{IMPORT_ROOT}/../escape.mp3"
+        )));
+        assert!(!is_safe_cover_path(&alloc::format!(
+            "{IMPORT_ROOT}/tracks/1/audio.mp3"
+        )));
+        assert!(is_safe_background_path(&alloc::format!(
+            "{IMPORT_ROOT}/tracks/1/background.bin"
+        )));
+        assert!(!is_safe_background_path(&alloc::format!(
+            "{IMPORT_ROOT}/tracks/1/background.jpg"
+        )));
     }
 }

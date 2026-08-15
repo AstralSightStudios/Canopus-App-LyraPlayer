@@ -40,15 +40,19 @@ pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
     ACTIVE.store(false, Ordering::Release);
     RESIDENT.store(false, Ordering::Release);
     LAST_ERROR.store(0, Ordering::Release);
-    #[cfg(feature = "device")]
-    crate::target::prepare();
+    // The stock `insmod` task invokes this constructor on a 7.9 KiB stack.
+    // It must remain allocation-free; initialization is deferred until the
+    // Manager dispatches `activate` after registration has completed.
     0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn canopus_mod_activate(_ctx: *const ContextV1) -> i32 {
     #[cfg(feature = "device")]
-    let result = crate::target::activate();
+    let result = {
+        crate::target::prepare();
+        crate::target::activate()
+    };
     #[cfg(not(feature = "device"))]
     let result = 0;
     if result == 0 {

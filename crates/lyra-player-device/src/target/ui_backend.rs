@@ -4,13 +4,17 @@
 //! cleared on page destruction. LVX is never touched from Bluetooth or timer
 //! callbacks — only from the page owner thread (create/resume/row events).
 
-use canopus_target_private::*;
-use canopus_ui_core::{NodeKind, Snapshot, TextStyle};
+use alloc::vec::Vec;
 
-use super::native_app::{APP_ID, PAGE_COUNT, PAGE_OVERVIEW, page_descriptor_ptr};
+use canopus_target_private::*;
+use canopus_ui_core::{NodeKind, Snapshot};
+use lyra_player_core::ui::PLAYER_BACKGROUND_KEY;
+
+use super::native_app::{APP_ID, PAGE_COUNT, PAGE_OVERVIEW, PAGE_PLAYER, page_descriptor_ptr};
+use super::storage;
 
 static EMPTY_TEXT: [u8; 1] = [0];
-const REFRESH_PERIOD_MS: u32 = 500;
+const REFRESH_PERIOD_MS: u32 = 100;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -21,7 +25,6 @@ struct Binding {
     enabled: bool,
 }
 
-#[derive(Copy, Clone)]
 struct PageBackend {
     root: *mut core::ffi::c_void,
     content_root: *mut core::ffi::c_void,
@@ -30,8 +33,12 @@ struct PageBackend {
     rows: [*mut core::ffi::c_void; UI_MAX_ROWS],
     labels: [*mut core::ffi::c_void; UI_MAX_LABELS],
     images: [*mut core::ffi::c_void; 2],
+    image_paths: [Option<Vec<u8>>; 2],
+    background: *mut core::ffi::c_void,
+    background_path: Option<Vec<u8>>,
     bars: [*mut core::ffi::c_void; 4],
     image_hashes: [u32; 2],
+    background_hash: u32,
     bar_hashes: [u32; 4],
     row_kinds: [u8; UI_MAX_ROWS],
     row_keys: [u32; UI_MAX_ROWS],
@@ -59,8 +66,12 @@ const fn empty_backend() -> PageBackend {
         rows: [core::ptr::null_mut(); UI_MAX_ROWS],
         labels: [core::ptr::null_mut(); UI_MAX_LABELS],
         images: [core::ptr::null_mut(); 2],
+        image_paths: [None, None],
+        background: core::ptr::null_mut(),
+        background_path: None,
         bars: [core::ptr::null_mut(); 4],
         image_hashes: [0; 2],
+        background_hash: 0,
         bar_hashes: [0; 4],
         row_kinds: [0; UI_MAX_ROWS],
         row_keys: [0; UI_MAX_ROWS],
@@ -85,7 +96,42 @@ const fn empty_backend() -> PageBackend {
     }
 }
 
-static mut PAGES: [PageBackend; PAGE_COUNT] = [empty_backend(); PAGE_COUNT];
+static mut PAGES: [PageBackend; PAGE_COUNT] = [const { empty_backend() }; PAGE_COUNT];
+
+unsafe fn apply_misans(object: *mut core::ffi::c_void) {
+    if !object.is_null() {
+        let _ = unsafe {
+            lvx_style_apply(
+                object,
+                STYLE_MISANS_DEMIBOLD_32 as *const core::ffi::c_void,
+                255,
+                0,
+            )
+        };
+    }
+}
+
+fn wrapped_label_height(text: &str) -> i32 {
+    const HALF_WIDTH_UNITS_PER_LINE: u32 = 20;
+    const LINE_HEIGHT: i32 = 44;
+
+    let mut lines = 1u32;
+    let mut units = 0u32;
+    for character in text.chars() {
+        if character == '\n' {
+            lines = lines.saturating_add(1);
+            units = 0;
+            continue;
+        }
+        let width = if character.is_ascii() { 1 } else { 2 };
+        if units != 0 && units.saturating_add(width) > HALF_WIDTH_UNITS_PER_LINE {
+            lines = lines.saturating_add(1);
+            units = 0;
+        }
+        units = units.saturating_add(width);
+    }
+    (lines.min(6) as i32).saturating_mul(LINE_HEIGHT)
+}
 
 fn page_backend(index: usize) -> &'static mut PageBackend {
     // SAFETY: page indices are validated by every caller against PAGE_COUNT;
@@ -108,11 +154,9 @@ extern "C" fn refresh_timer(timer: *mut core::ffi::c_void) {
             continue;
         }
         if backend.active && backend.interactive {
+            super::ui_maintenance_tick();
             let rendered_generation = backend.rendered_generation;
             if super::rebuild_if_changed(page_index, rendered_generation) != 0 {
-                // Rendering may fail transiently, but this timer also owns local
-                // audio pumping and library refresh work. Never disable it because
-                // one snapshot could not be painted; retry on a later tick.
                 backend.refresh_failed = true;
             }
         }
@@ -289,6 +333,101 @@ fn hash_text(mut hash: u32, text: &str) -> u32 {
     hash_word(hash, text.len() as u32)
 }
 
+#[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
+fn skip_image(_key: u32) -> bool {
+    true
+}
+
+#[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
+fn skip_image(key: u32) -> bool {
+    key == PLAYER_BACKGROUND_KEY
+}
+
+#[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
+unsafe fn apply_player_surface(object: *mut core::ffi::c_void, transparent: bool) {
+    if object.is_null() {
+        return;
+    }
+    unsafe {
+        lvx_object_set_background_opacity(object, if transparent { 0 } else { 255 }, 0);
+        if transparent {
+            lvx_object_set_local_style_u32(object, LV_STYLE_BORDER_WIDTH, 0, 0);
+            lvx_object_set_local_style_u32(object, LV_STYLE_BORDER_OPA, 0, 0);
+        }
+    }
+}
+
+#[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
+unsafe fn apply_player_surface(_object: *mut core::ffi::c_void, _transparent: bool) {}
+
+#[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
+fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snapshot) -> bool {
+    if page_index != PAGE_PLAYER {
+        return false;
+    }
+    let mut source = None;
+    for index in 0..snapshot.node_count as usize {
+        let node = &snapshot.nodes[index];
+        if node.kind() == Some(NodeKind::Image) && node.key == PLAYER_BACKGROUND_KEY {
+            source = Some((snapshot.primary(node), snapshot.values[index].resource_id));
+            break;
+        }
+    }
+    let Some((path, resource_id)) = source else {
+        if !backend.background.is_null() {
+            unsafe { lvx_set_hidden(backend.background, 1) };
+        }
+        backend.background_hash = 0;
+        return false;
+    };
+    let Some(resolved_path) = storage::resolve_path(path) else {
+        if !backend.background.is_null() {
+            unsafe { lvx_set_hidden(backend.background, 1) };
+        }
+        backend.background_hash = 0;
+        return false;
+    };
+    if !storage::validate_lvgl_v9_image(&resolved_path, 336, 480) {
+        if !backend.background.is_null() {
+            unsafe { lvx_set_hidden(backend.background, 1) };
+        }
+        backend.background_hash = 0;
+        return false;
+    }
+    let image_hash = hash_word(hash_text(0x811C_9DC5, &resolved_path), resource_id);
+    let mut source_path = resolved_path.into_bytes();
+    source_path.push(0);
+    let created_now = backend.background.is_null();
+    if created_now {
+        backend.background = unsafe { lvx_image_create(backend.root) };
+        if backend.background.is_null() {
+            return false;
+        }
+    }
+    let path_changed = backend.background_path.as_deref() != Some(source_path.as_slice());
+    if created_now || backend.background_hash != image_hash || path_changed {
+        backend.background_path = Some(source_path);
+        let source = backend
+            .background_path
+            .as_ref()
+            .map_or(core::ptr::null(), |path| path.as_ptr());
+        unsafe { lvx_image_set_src(backend.background, source.cast()) };
+        backend.background_hash = image_hash;
+    }
+    unsafe {
+        lvx_object_set_size(backend.background, 336, 480);
+        lvx_object_align(backend.background, ALIGN_TOP_MID, 0, 0);
+        lvx_object_move_to_index(backend.background, 0);
+        lvx_set_hidden(backend.background, 0);
+    }
+    true
+}
+
+#[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
+fn sync_background(_backend: &mut PageBackend, _page_index: usize, _snapshot: &Snapshot) -> bool {
+    false
+}
+
 fn layout_fingerprint(snapshot: &Snapshot) -> (u32, u32) {
     let mut hash = 0x811C_9DC5u32;
     let mut count = 0u32;
@@ -300,12 +439,16 @@ fn layout_fingerprint(snapshot: &Snapshot) -> (u32, u32) {
             Some(NodeKind::Button) => 3,
             Some(NodeKind::ActionRow) => 4,
             Some(NodeKind::SwitchRow) => 5,
+            Some(NodeKind::Image) if skip_image(node.key) => continue,
             Some(NodeKind::Image) => 6,
             Some(NodeKind::Progress) => 7,
             _ => continue,
         };
         hash = hash_word(hash, marker);
         hash = hash_word(hash, node.key);
+        if node.kind() == Some(NodeKind::Text) {
+            hash = hash_text(hash, snapshot.primary(node));
+        }
         if matches!(node.kind(), Some(NodeKind::Image | NodeKind::Progress)) {
             let layout = &snapshot.layouts[index];
             hash = hash_word(hash, layout.width as u16 as u32);
@@ -416,6 +559,11 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
         }
     }
 
+    let background_visible = sync_background(backend, page_index, snapshot);
+    if page_index == PAGE_PLAYER {
+        unsafe { apply_player_surface(backend.content_root, background_visible) };
+    }
+
     // Capacity check mirrors the C backend: sections/pages are free, labels
     // and rows are bounded.
     let mut visible_rows = 0u32;
@@ -431,6 +579,7 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             | Some(NodeKind::Button)
             | Some(NodeKind::ActionRow)
             | Some(NodeKind::SwitchRow) => visible_rows += 1,
+            Some(NodeKind::Image) if skip_image(node.key) => {}
             Some(NodeKind::Image) => visible_images += 1,
             Some(NodeKind::Progress) => visible_bars += 1,
             _ => return -1,
@@ -497,8 +646,17 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 if backend.page_title.is_null() {
                     return -1;
                 }
+                unsafe {
+                    apply_misans(backend.page_title);
+                    if page_index == PAGE_PLAYER {
+                        apply_player_surface(backend.page_title, background_visible);
+                    }
+                }
             }
             unsafe { lvx_set_hidden(backend.page_title, 0) };
+            if page_index == PAGE_PLAYER {
+                unsafe { apply_player_surface(backend.page_title, background_visible) };
+            }
             previous = backend.page_title;
             continue;
         }
@@ -519,16 +677,10 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 snapshot.styles[index].text_style as u32,
             );
             if created_now || backend.label_hashes[label_used as usize] != label_hash {
-                unsafe { lvx_label_set_text(object, primary.as_ptr()) };
-                if snapshot.styles[index].text_style == TextStyle::Title as u16 {
-                    unsafe {
-                        lvx_style_apply(
-                            object,
-                            STYLE_MISANS_DEMIBOLD_32 as *const core::ffi::c_void,
-                            255,
-                            0,
-                        );
-                    }
+                unsafe {
+                    lvx_label_set_text(object, primary.as_ptr());
+                    apply_misans(object);
+                    lvx_object_set_size(object, CONTENT_WIDTH, wrapped_label_height(primary));
                 }
                 backend.label_hashes[label_used as usize] = label_hash;
             }
@@ -545,40 +697,74 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             continue;
         }
         if kind == NodeKind::Image {
-            let layout = &snapshot.layouts[index];
-            if primary.is_empty() || layout.width <= 0 || layout.height <= 0 {
-                return -1;
+            #[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
+            {
+                continue;
             }
-            let mut object = backend.images[image_used];
-            let created_now = object.is_null();
-            if created_now {
-                object = unsafe { lvx_image_create(backend.content_root) };
-                if object.is_null() {
+            #[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
+            {
+                if skip_image(node.key) {
+                    continue;
+                }
+                let layout = &snapshot.layouts[index];
+                if primary.is_empty() || layout.width <= 0 || layout.height <= 0 {
                     return -1;
                 }
-                backend.images[image_used] = object;
-            }
-            let image_hash = hash_word(
-                hash_text(0x811C_9DC5, primary),
-                snapshot.values[index].resource_id,
-            );
-            if created_now || backend.image_hashes[image_used] != image_hash {
-                unsafe { lvx_image_set_src(object, primary.as_ptr().cast()) };
-                backend.image_hashes[image_used] = image_hash;
-            }
-            unsafe {
-                lvx_object_set_size(object, i32::from(layout.width), i32::from(layout.height));
-                lvx_set_hidden(object, 0);
-            }
-            if layout_changed {
-                if previous.is_null() {
-                    unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
-                } else {
-                    unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, 8) };
+                let Some(resolved_path) = storage::resolve_path(primary) else {
+                    if !backend.images[image_used].is_null() {
+                        unsafe { lvx_set_hidden(backend.images[image_used], 1) };
+                    }
+                    image_used += 1;
+                    continue;
+                };
+                if resolved_path.ends_with(".bin")
+                    && !storage::validate_lvgl_v9_image(&resolved_path, 180, 180)
+                {
+                    if !backend.images[image_used].is_null() {
+                        unsafe { lvx_set_hidden(backend.images[image_used], 1) };
+                    }
+                    image_used += 1;
+                    continue;
                 }
+                let mut object = backend.images[image_used];
+                let created_now = object.is_null();
+                if created_now {
+                    object = unsafe { lvx_image_create(backend.content_root) };
+                    if object.is_null() {
+                        return -1;
+                    }
+                    backend.images[image_used] = object;
+                }
+                let image_hash = hash_word(
+                    hash_text(0x811C_9DC5, &resolved_path),
+                    snapshot.values[index].resource_id,
+                );
+                let mut source_path = resolved_path.into_bytes();
+                source_path.push(0);
+                let path_changed =
+                    backend.image_paths[image_used].as_deref() != Some(source_path.as_slice());
+                if created_now || backend.image_hashes[image_used] != image_hash || path_changed {
+                    backend.image_paths[image_used] = Some(source_path);
+                    let source = backend.image_paths[image_used]
+                        .as_ref()
+                        .map_or(core::ptr::null(), |path| path.as_ptr());
+                    unsafe { lvx_image_set_src(object, source.cast()) };
+                    backend.image_hashes[image_used] = image_hash;
+                }
+                unsafe {
+                    lvx_object_set_size(object, i32::from(layout.width), i32::from(layout.height));
+                    lvx_set_hidden(object, 0);
+                }
+                if layout_changed {
+                    if previous.is_null() {
+                        unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
+                    } else {
+                        unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, 8) };
+                    }
+                }
+                previous = object;
+                image_used += 1;
             }
-            previous = object;
-            image_used += 1;
             continue;
         }
         if kind == NodeKind::Progress {
@@ -679,6 +865,7 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             backend.rows[slot] = created;
             backend.row_kinds[slot] = row_kind;
             object = created;
+            unsafe { apply_misans(object) };
             let event_object = if row_kind == ROW_SWITCH {
                 unsafe { lvx_list_row_trailing(created) }
             } else {
@@ -718,10 +905,14 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     0,
                     selected,
                 );
+                apply_misans(object);
             }
             backend.row_hashes[slot] = content_hash;
         }
         unsafe { lvx_set_hidden(object, 0) };
+        if page_index == PAGE_PLAYER {
+            unsafe { apply_player_surface(object, background_visible) };
+        }
         if layout_changed {
             if previous.is_null() {
                 unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };

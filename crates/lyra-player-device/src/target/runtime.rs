@@ -14,10 +14,10 @@ pub struct Core {
 }
 
 impl Core {
-    fn new() -> Self {
-        Self {
-            app: LyraApp::default(),
-            audio: super::audio::AudioDevice::new(),
+    unsafe fn initialize_at(pointer: *mut Self) {
+        unsafe {
+            core::ptr::addr_of_mut!((*pointer).app).write(LyraApp::default());
+            core::ptr::addr_of_mut!((*pointer).audio).write(super::audio::AudioDevice::new());
         }
     }
 }
@@ -30,6 +30,7 @@ pub struct Runtime {
     pub last_error: AtomicI32,
     pub active_page: AtomicU32,
     pub timer_ticks: AtomicU32,
+    pub library_poll_tick: AtomicU32,
 }
 
 impl Runtime {
@@ -42,6 +43,7 @@ impl Runtime {
             last_error: AtomicI32::new(0),
             active_page: AtomicU32::new(0),
             timer_ticks: AtomicU32::new(0),
+            library_poll_tick: AtomicU32::new(0),
         }
     }
 }
@@ -62,8 +64,10 @@ pub fn prepare() {
         CORE_PTR.store(pointer as usize, Ordering::Release);
     }
     unsafe {
-        core::ptr::addr_of_mut!(RUNTIME).cast::<Runtime>().write(Runtime::new());
-        pointer.write(Core::new());
+        core::ptr::addr_of_mut!(RUNTIME)
+            .cast::<Runtime>()
+            .write(Runtime::new());
+        Core::initialize_at(pointer);
     }
     CORE_LOCK.store(false, Ordering::Release);
     READY.store(true, Ordering::Release);

@@ -1,5 +1,5 @@
-//! Target-selected local player integration. UI callbacks, filesystem polling,
-//! and audio pumping run on the page-owner thread.
+//! Target-selected local player integration. Audio feeding runs on the resident
+//! Bluetooth owner timer; LVGL page callbacks only manage rendering and input.
 
 use core::sync::atomic::Ordering;
 
@@ -8,6 +8,7 @@ use lyra_player_core::{Action, Effect, Route, playback::PlaybackState, ui};
 use runtime::{initialized, runtime, try_with_core, with_core};
 
 pub mod audio;
+mod audio_service;
 pub mod native_app;
 pub mod runtime;
 pub mod storage;
@@ -26,15 +27,15 @@ pub fn activate() -> i32 {
         runtime().last_error.store(result, Ordering::Release);
         return result;
     }
-    let library = match storage::load_library() {
-        Ok(library) => library,
-        Err(error) => {
-            runtime().last_error.store(error, Ordering::Release);
-            alloc::vec::Vec::new()
-        }
-    };
-    let effects = with_core(|core| core.app.update(Action::Boot(library)));
+    // Module activation runs in the loader's 7.9 KiB `insmod` task. JSON
+    // deserialization belongs on the page-owner timer, which has a larger stack;
+    // it performs the initial `ReloadLibrary` on its first active page tick.
+    let effects = with_core(|core| core.app.update(Action::Boot(alloc::vec::Vec::new())));
     execute_effects(effects);
+    let result = audio_service::start();
+    if result != 0 {
+        runtime().last_error.store(result, Ordering::Release);
+    }
     0
 }
 
@@ -71,7 +72,6 @@ pub fn rebuild(page_index: usize) -> i32 {
 }
 
 pub fn rebuild_if_changed(page_index: usize, rendered_generation: u32) -> i32 {
-    timer_tick();
     if page_is_current(page_index) != 0 {
         return 0;
     }
@@ -105,7 +105,8 @@ pub fn sync_resumed_page(page_index: usize) -> i32 {
         if core.app.route != route {
             if core.app.history.last().copied() == Some(route) {
                 core.app.history.pop();
-            } else if let Some(position) = core.app.history.iter().rposition(|item| *item == route) {
+            } else if let Some(position) = core.app.history.iter().rposition(|item| *item == route)
+            {
                 core.app.history.truncate(position);
             } else {
                 core.app.history.clear();
@@ -149,6 +150,22 @@ pub fn handle_ui_event(page_index: usize, generation: u32, _key: u32, event_id: 
             }
             return Some(alloc::vec::Vec::new());
         }
+        if matches!(event_id, ui::EVENT_VOLUME_DOWN | ui::EVENT_VOLUME_UP) {
+            let current = core.app.player.volume_percent;
+            let volume = if event_id == ui::EVENT_VOLUME_DOWN {
+                current.saturating_sub(10)
+            } else {
+                current.saturating_add(10).min(100)
+            };
+            match core.app.player.set_volume(volume, &mut core.audio) {
+                Ok(()) => core.app.generation = core.app.generation.wrapping_add(1).max(1),
+                Err(error) => {
+                    core.app.error = Some(alloc::format!("volume ioctl failed: {error}"));
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                }
+            }
+            return Some(alloc::vec::Vec::new());
+        }
         action_for_event(&core.app, event_id).map(|action| core.app.update(action))
     });
     let Some(effects) = effects else {
@@ -161,8 +178,8 @@ pub fn handle_ui_event(page_index: usize, generation: u32, _key: u32, event_id: 
 fn action_for_event(app: &lyra_player_core::LyraApp, event_id: u32) -> Option<Action> {
     match event_id {
         ui::EVENT_LIBRARY => Some(Action::Open(Route::Library)),
+        ui::EVENT_PREVIOUS => Some(Action::Previous),
         ui::EVENT_NEXT => Some(Action::Next),
-        ui::EVENT_LYRICS => Some(Action::ShowLyrics),
         ui::EVENT_NOW_PLAYING => Some(Action::Open(Route::Player)),
         event if (ui::EVENT_LOCAL_SONG_BASE..ui::EVENT_LOCAL_SONG_BASE + 20).contains(&event) => {
             app.local_tracks
@@ -179,36 +196,66 @@ fn route_page(route: Route) -> usize {
         Route::Home => native_app::PAGE_OVERVIEW,
         Route::Library => native_app::PAGE_LIBRARY,
         Route::Player => native_app::PAGE_PLAYER,
-        Route::Lyrics => native_app::PAGE_LYRICS,
     }
 }
 
-fn timer_tick() {
+pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
-    let effects = with_core(|core| {
-        let mut effects = alloc::vec::Vec::new();
+    let _ = try_with_core(|core| {
         if let Err(error) = core.audio.pump_local(&mut core.app.player) {
-            core.app.error = Some(alloc::format!("local audio failed: {error}"));
+            core.audio.abort_local();
+            core.app.player.state = PlaybackState::Failed;
+            core.app.error = Some(alloc::format!("local audio pump failed: {error}"));
             core.app.generation = core.app.generation.wrapping_add(1).max(1);
+            runtime().last_error.store(error, Ordering::Release);
+            return;
         }
-        if core.app.player.state == PlaybackState::Playing {
-            effects.extend(core.app.update(Action::Tick(500)));
-        }
-        effects
-    });
-    execute_effects(effects);
-
-    // The quick app publishes library.json only after an import transaction is
-    // complete. Polling it every two seconds makes imports appear without
-    // introducing a phone transport into the native player.
-    if tick.is_multiple_of(4) {
-        match storage::load_library() {
-            Ok(library) => {
-                let effects = with_core(|core| core.app.update(Action::ReloadLibrary(library)));
-                execute_effects(effects);
+        if tick % 5 == 0 {
+            if let Some(position_ms) = core.audio.playback_position_ms() {
+                if core.app.player.sync_position(position_ms) {
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                }
+            } else if core.app.player.state == PlaybackState::Playing {
+                let _ = core.app.update(Action::Tick(250));
             }
-            Err(error) => runtime().last_error.store(error, Ordering::Release),
         }
+        if tick % 20 == 0 {
+            match core.audio.volume_percent() {
+                Ok(volume) if core.app.player.sync_volume(volume) => {
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                }
+                Ok(_) => {}
+                Err(error) => runtime().last_error.store(error, Ordering::Release),
+            }
+        }
+    });
+}
+
+pub fn ui_maintenance_tick() {
+    let service_result = audio_service::start();
+    if service_result != 0 {
+        runtime()
+            .last_error
+            .store(service_result, Ordering::Release);
+    }
+    let tick = runtime().timer_ticks.load(Ordering::Acquire);
+    let previous = runtime().library_poll_tick.load(Ordering::Acquire);
+    if previous != 0 && tick.wrapping_sub(previous) < 40 {
+        return;
+    }
+    if runtime()
+        .library_poll_tick
+        .compare_exchange(previous, tick.max(1), Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    match storage::load_library() {
+        Ok(library) => {
+            let effects = with_core(|core| core.app.update(Action::ReloadLibrary(library)));
+            execute_effects(effects);
+        }
+        Err(error) => runtime().last_error.store(error, Ordering::Release),
     }
 }
 
@@ -223,22 +270,14 @@ fn execute_effects(effects: alloc::vec::Vec<Effect>) {
                     return;
                 }
                 if let Err(error) = core.audio.start_local(&path, &mut core.app.player) {
-                    core.app.error = Some(alloc::format!("local audio failed: {error}"));
+                    core.app.error = Some(alloc::format!("local audio start failed: {error}"));
                     core.app.player.state = PlaybackState::Failed;
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                } else {
+                    core.app.error = None;
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
                 }
             }),
-            Effect::LoadLyrics { path } => {
-                let result = path.as_deref().map(storage::load_lyrics).transpose();
-                with_core(|core| match result {
-                    Ok(Some(Some(text))) => core.app.set_lyrics_text(Some(&text)),
-                    Ok(_) => core.app.set_lyrics_text(None),
-                    Err(error) => {
-                        runtime().last_error.store(error, Ordering::Release);
-                        core.app.set_lyrics_text(None);
-                    }
-                });
-            }
             Effect::Navigate(route) => ui_backend::navigate(route_page(route)),
         }
     }
