@@ -245,7 +245,7 @@ impl View<UiEvent> for BackgroundImage<'_> {
             &self.song.album.background_url,
             Layout {
                 width: 336,
-                height: 480,
+                height: 520,
                 ..Layout::default()
             },
         )

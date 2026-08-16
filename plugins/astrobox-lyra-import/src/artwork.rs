@@ -12,8 +12,11 @@ use image::{
 
 pub const COVER_WIDTH: u32 = 180;
 pub const COVER_HEIGHT: u32 = 180;
+pub const COVER_CORNER_RADIUS: u32 = 24;
 pub const BACKGROUND_WIDTH: u32 = 336;
-pub const BACKGROUND_HEIGHT: u32 = 480;
+pub const BACKGROUND_HEIGHT: u32 = 520;
+pub const BACKGROUND_FADE_START: u32 = 480;
+pub const BACKGROUND_FADE_SPAN: u32 = 40;
 pub const LVGL_V9_FORMAT: &str = "lvgl-v9-argb8888-bin";
 pub const COVER_BIN_BYTES: u64 = 12 + COVER_WIDTH as u64 * COVER_HEIGHT as u64 * 4;
 pub const BACKGROUND_BIN_BYTES: u64 = 12 + BACKGROUND_WIDTH as u64 * BACKGROUND_HEIGHT as u64 * 4;
@@ -126,7 +129,35 @@ fn square_cover(image: &DynamicImage) -> RgbaImage {
     let x = (source.width() - side) / 2;
     let y = (source.height() - side) / 2;
     let crop = imageops::crop_imm(&source, x, y, side, side).to_image();
-    imageops::resize(&crop, COVER_WIDTH, COVER_HEIGHT, FilterType::Lanczos3)
+    let mut cover = imageops::resize(&crop, COVER_WIDTH, COVER_HEIGHT, FilterType::Lanczos3);
+    apply_rounded_corner_alpha(&mut cover);
+    cover
+}
+
+fn apply_rounded_corner_alpha(image: &mut RgbaImage) {
+    let width = image.width() as f32;
+    let height = image.height() as f32;
+    let radius = COVER_CORNER_RADIUS.min(image.width().min(image.height()) / 2) as f32;
+    let half_width = width / 2.0;
+    let half_height = height / 2.0;
+    let corner_x = half_width - radius;
+    let corner_y = half_height - radius;
+    const AA_WIDTH: f32 = 2.0;
+
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let px = x as f32 + 0.5;
+        let py = y as f32 + 0.5;
+        let dx = (px - half_width).abs() - corner_x;
+        let dy = (py - half_height).abs() - corner_y;
+        let outside_x = dx.max(0.0);
+        let outside_y = dy.max(0.0);
+        let outside_distance = (outside_x * outside_x + outside_y * outside_y).sqrt();
+        let inside_distance = dx.max(dy).min(0.0);
+        let signed_distance = outside_distance + inside_distance - radius;
+        let t = (-signed_distance / AA_WIDTH).clamp(0.0, 1.0);
+        let smooth = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+        pixel[3] = (f32::from(pixel[3]) * smooth).round() as u8;
+    }
 }
 
 fn background(image: &DynamicImage) -> Result<RgbaImage, String> {
@@ -172,11 +203,17 @@ fn background(image: &DynamicImage) -> Result<RgbaImage, String> {
     for (_, y, pixel) in output.enumerate_pixels_mut() {
         let edge = y.abs_diff(BACKGROUND_HEIGHT / 2);
         let vignette = edge.saturating_mul(20) / (BACKGROUND_HEIGHT / 2).max(1);
-        let keep = 55u32.saturating_sub(vignette.min(20));
+        let keep = 40u32.saturating_sub(vignette.min(20));
         for channel in 0..3 {
             pixel[channel] = ((u32::from(pixel[channel]) * keep) / 100) as u8;
         }
-        pixel[3] = 255;
+        pixel[3] = if y < BACKGROUND_FADE_START {
+            255
+        } else {
+            let fade_rows = BACKGROUND_FADE_SPAN.saturating_sub(1).max(1);
+            let remaining = BACKGROUND_HEIGHT.saturating_sub(y + 1);
+            (remaining.min(fade_rows) * 255 / fade_rows) as u8
+        };
     }
     Ok(output)
 }
@@ -286,8 +323,8 @@ mod tests {
 
     #[test]
     fn aspect_fill_uses_center_crop() {
-        assert_eq!(aspect_fill_crop(800, 400, 336, 480), Ok((280, 400)));
-        assert_eq!(aspect_fill_crop(400, 800, 336, 480), Ok((400, 571)));
+        assert_eq!(aspect_fill_crop(800, 400, 336, 520), Ok((258, 400)));
+        assert_eq!(aspect_fill_crop(400, 800, 336, 520), Ok((400, 619)));
     }
 
     #[test]
@@ -318,6 +355,43 @@ mod tests {
             background.dimensions(),
             (BACKGROUND_WIDTH, BACKGROUND_HEIGHT)
         );
-        assert!(background.pixels().all(|pixel| pixel[3] == 255));
+        assert!(background
+            .enumerate_pixels()
+            .filter(|(_, y, _)| *y < BACKGROUND_FADE_START)
+            .all(|(_, _, pixel)| pixel[3] == 255));
+        assert_eq!(background.get_pixel(0, BACKGROUND_FADE_START)[3], 255);
+        assert_eq!(background.get_pixel(0, BACKGROUND_HEIGHT - 1)[3], 0);
+    }
+
+    #[test]
+    fn rounded_cover_has_transparent_corners_and_opaque_center() {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            240,
+            240,
+            Rgba([220, 80, 40, 255]),
+        ));
+        let cover = square_cover(&image);
+        assert_eq!(cover.get_pixel(0, 0)[3], 0);
+        assert_eq!(cover.get_pixel(COVER_WIDTH - 1, 0)[3], 0);
+        assert_eq!(cover.get_pixel(COVER_WIDTH / 2, COVER_HEIGHT / 2)[3], 255);
+        assert_eq!(cover.get_pixel(COVER_WIDTH / 2, 2)[3], 255);
+    }
+
+    #[test]
+    fn background_alpha_fades_monotonically_after_480() {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            640,
+            320,
+            Rgba([220, 80, 40, 100]),
+        ));
+        let background = background(&image).unwrap();
+        let mut previous = 255;
+        for y in BACKGROUND_FADE_START..BACKGROUND_HEIGHT {
+            let alpha = background.get_pixel(0, y)[3];
+            assert!(alpha <= previous);
+            previous = alpha;
+        }
+        assert_eq!(background.get_pixel(0, BACKGROUND_FADE_START)[3], 255);
+        assert_eq!(background.get_pixel(0, BACKGROUND_HEIGHT - 1)[3], 0);
     }
 }

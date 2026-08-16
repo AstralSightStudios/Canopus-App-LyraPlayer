@@ -78,7 +78,7 @@ manifest schema 中 `cover_url` 与 `background_url` 都可以为空；旧版 ma
 - 分片校验：默认 IEEE CRC-32，小写 8 位十六进制；用户显式选择无校验时省略 `crc32` 字段以减少开销，但仍保留 Base64、长度、资源、seq、offset、ACK 和 staging 校验
 - 音频上限：64 MiB
 - 封面上限：4 MiB；新插件会把 JPEG/PNG 预处理为未压缩 LVGL v9 ARGB8888 BIN，固定为 180×180（129612 字节）
-- 背景上限：645132 字节；新插件从封面生成混色模糊 LVGL v9 ARGB8888 BIN，固定为 336×480
+- 背景上限：698892 字节；新插件从封面生成混色模糊 LVGL v9 ARGB8888 BIN，固定为 336×520，底部 40px 透明渐隐
 - 歌词上限：2 MiB
 - 必须包含一个 `audio` asset；`cover`、`background` 和 `lyrics` 可选且各最多一个；顺序固定为 `audio → cover → background → lyrics`
 
@@ -129,7 +129,7 @@ manifest schema 中 `cover_url` 与 `background_url` 都可以为空；旧版 ma
   "assets":[
     {"kind":"audio","size":1234567},
     {"kind":"cover","size":129612,"extension":"bin","format":"lvgl-v9-argb8888-bin","width":180,"height":180},
-    {"kind":"background","size":645132,"extension":"bin","format":"lvgl-v9-argb8888-bin","width":336,"height":480},
+    {"kind":"background","size":698892,"extension":"bin","format":"lvgl-v9-argb8888-bin","width":336,"height":520},
     {"kind":"lyrics","size":3210,"format":"lrc"}
   ]
 }

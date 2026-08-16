@@ -18,7 +18,7 @@ pub const PAGE_PLAYER: usize = 2;
 
 pub const PACKAGE_NAME: &[u8] = b"com.canopus.lyra-player\0";
 pub const DISPLAY_NAME: &[u8] = b"Lyra\0";
-pub const LAUNCHER_ICON: &[u8] = b"/resource/app/launcher/flashlight.bin\0";
+pub const LAUNCHER_ICON: &[u8] = b"/data/canopus/appicon_lyra.bin\0";
 const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [
     b"lyra_home\0",
     b"lyra_library\0",

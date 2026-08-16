@@ -7,6 +7,8 @@ local TOKEN = "lyra_player"
 local DEVICE_PATH = "/dev/canopus"
 local RECEIPT_RESOURCE = SCRIPT_PATH .. "receipt.bin"
 local MODULE_RESOURCE = SCRIPT_PATH .. "module.bin"
+local APP_ICON_RESOURCE = SCRIPT_PATH .. "appicon_lyra.bin"
+local APP_ICON_PATH = "/data/canopus/appicon_lyra.bin"
 local INBOX = "/data/canopus/inbox/"
 local RECEIPT_PATH = INBOX .. TOKEN .. ".cmi"
 local MODULE_PATH = INBOX .. TOKEN .. ".ko"
@@ -84,6 +86,7 @@ end
 local function stage_files()
     local receipt = read_all(RECEIPT_RESOURCE)
     local module = read_all(MODULE_RESOURCE)
+    local icon = read_all(APP_ICON_RESOURCE)
     if type(receipt) ~= "string" or #receipt ~= 256
         or u32(receipt, 0) ~= 0x31494D43 then
         return false, "Missing or invalid signed receipt"
@@ -91,6 +94,12 @@ local function stage_files()
     if type(module) ~= "string" or #module < 512 or #module > 393216
         or module:sub(1, 4) ~= "\127ELF" then
         return false, "Missing or invalid ARM module"
+    end
+    if type(icon) ~= "string" or #icon ~= 54768
+        or icon:sub(1, 4) ~= "\25\16\0\0"
+        or u16(icon, 4) ~= 117 or u16(icon, 6) ~= 117
+        or u16(icon, 8) ~= 468 then
+        return false, "Missing or invalid Lyra app icon"
     end
 
     local probe = io.open(RECEIPT_PATH, "wb")
@@ -106,7 +115,11 @@ local function stage_files()
     if not write_all(MODULE_PATH, module) then
         return false, "Cannot stage module"
     end
-    if read_all(RECEIPT_PATH) ~= receipt or read_all(MODULE_PATH) ~= module then
+    if not write_all(APP_ICON_PATH, icon) then
+        return false, "Cannot stage app icon"
+    end
+    if read_all(RECEIPT_PATH) ~= receipt or read_all(MODULE_PATH) ~= module
+        or read_all(APP_ICON_PATH) ~= icon then
         return false, "Staged file verification failed"
     end
     return true

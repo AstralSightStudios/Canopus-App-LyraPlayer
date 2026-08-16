@@ -24,6 +24,7 @@ TRIPLE=$RUST_TARGET_TRIPLE
 TOKEN=lyra_player
 KEY_SOURCE=${MODULE_INSTALL_KEY:-"$CANOPUS/.canopus-local/module-installer-ed25519.pem"}
 CANOPUS_CLI=${CANOPUS_CLI:-"$CANOPUS/target/debug/canopus"}
+ICON_SOURCE=${LYRA_PLAYER_ICON:-/Volumes/EXT0/lyra-player-icon.png}
 
 TARGET_FIRMWARE_SHA256=$(python3 - "$CANOPUS/targets/$TARGET_ID/target.toml" "$TARGET_ID" <<'PY'
 import pathlib, sys, tomllib
@@ -199,9 +200,14 @@ rm -rf "$SIGN_DIR"
 trap - EXIT HUP INT TERM
 
 printf '%s\n' "[4/4] validate and stage installer watchface"
+[ -f "$ICON_SOURCE" ] || {
+    echo "error: Lyra app icon source not found: $ICON_SOURCE" >&2
+    exit 1
+}
+python3 "$ROOT/scripts/encode-lvgl-icon.py" "$ICON_SOURCE" "$WATCHFACE/appicon_lyra.bin"
 cp "$OUT/lyra-player.elf" "$WATCHFACE/module.bin"
 cp "$OUT/receipt.bin" "$WATCHFACE/receipt.bin"
-chmod 644 "$WATCHFACE/module.bin" "$WATCHFACE/receipt.bin"
+chmod 644 "$WATCHFACE/module.bin" "$WATCHFACE/receipt.bin" "$WATCHFACE/appicon_lyra.bin"
 if command -v luac >/dev/null 2>&1; then
     luac -p "$WATCHFACE/main.lua"
 fi
@@ -210,8 +216,11 @@ import hashlib, pathlib, struct, sys
 watchface = pathlib.Path(sys.argv[1])
 module = (watchface / "module.bin").read_bytes()
 receipt = (watchface / "receipt.bin").read_bytes()
+icon = (watchface / "appicon_lyra.bin").read_bytes()
 if not module.startswith(b"\x7fELF") or not 512 <= len(module) <= 393216:
     raise SystemExit(f"invalid staged module size: {len(module)}")
+if len(icon) != 54768 or icon[:4] != b"\x19\x10\x00\x00" or icon[4:8] != b"\x75\x00\x75\x00" or icon[8:10] != b"\xd4\x01":
+    raise SystemExit(f"invalid staged app icon: {len(icon)} bytes")
 if len(receipt) != 256 or receipt[:4] != b"CMI1":
     raise SystemExit("invalid CMI1 receipt")
 magic, version, header, flags, lifecycle, module_version, artifact_size, reserved = struct.unpack("<8I", receipt[:32])

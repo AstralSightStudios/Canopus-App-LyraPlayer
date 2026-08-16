@@ -2,7 +2,8 @@
 
 这是一个一次性 Canopus 模块安装表盘。安装并打开表盘后，它会把经过
 CMI1 Ed25519 签名的 Lyra Player ELF 和 receipt 写入
-`/data/canopus/inbox/`，再通过 `/dev/canopus` 请求 supervisor 安装模块。
+`/data/canopus/inbox/`，并把原生应用图标写入
+`/data/canopus/appicon_lyra.bin`，再通过 `/dev/canopus` 请求 supervisor 安装模块。
 模块安装后默认禁用，必须在 Canopus Manager 中审核并启用。
 
 ## 前置条件
@@ -36,7 +37,7 @@ CANOPUS_TARGET=xiaomi-band-9-pro-3.1.175 \
 4. 从 `<CANOPUS_ROOT>/.canopus-local/module-installer-ed25519.pem` 复制一份
    权限为 `0600` 的临时签名密钥，在临时目录中完成 CMI1 receipt 签名，
    随后立即删除临时目录。
-5. 将 `module.bin` 与 `receipt.bin` 放入本目录。
+5. 将 `module.bin`、`receipt.bin` 与 `appicon_lyra.bin` 放入本目录。图标由构建脚本从 `LYRA_PLAYER_ICON` 指定的 PNG 转换，默认读取 `/Volumes/EXT0/lyra-player-icon.png`。
 
 本地私钥不会复制到输出目录、表盘资源或 Git。可通过以下环境变量覆盖：
 
@@ -45,6 +46,7 @@ CANOPUS_TARGET=xiaomi-band-9-pro-3.1.175 \
 - `CANOPUS_TARGET=<target-id>`
 - `CANOPUS_BUILD_OUT=/path/to/build-output`
 - `CANOPUS_WATCHFACE_OUT=/path/to/watchface-output`
+- `LYRA_PLAYER_ICON=/path/to/lyra-player-icon.png`
 
 `module.bin` 和 `receipt.bin` 是按目标固件生成的构建产物，不应跨固件复用。
 

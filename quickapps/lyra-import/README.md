@@ -15,7 +15,7 @@ internal://files/lyra/
 └── tracks/<transaction-id>/
     ├── audio.mp3
     ├── cover.bin                 # 可选，180×180 LVGL v9 ARGB8888
-    ├── background.bin            # 可选，336×480 LVGL v9 ARGB8888
+    ├── background.bin            # 可选，336×520 LVGL v9 ARGB8888（底部 40px 透明渐隐）
     └── lyrics.lrc | lyrics.json  # 可选
 ```
 
@@ -51,8 +51,8 @@ npm run build
 - 分片校验：默认 IEEE CRC32；用户显式选择无校验时省略 `crc32` 字段，但仍严格检查 Base64、长度、asset、seq、offset、ACK 和 staging；旧插件未协商时按 CRC32 兼容处理；
 - ACK 窗口：1
 - 每块默认使用 IEEE CRC-32；无校验模式省略该字段
-- 单次事务：1 个 MP3，可附带 1 张 180×180 BIN 封面、1 张 336×480 BIN 播放页背景和 1 份歌词
+- 单次事务：1 个 MP3，可附带 1 张 180×180 BIN 封面、1 张 336×520 BIN 播放页背景和 1 份歌词
 - 快应用 hello 声明 `background`、`maxAssets:4` 和 `imageFormats:["lvgl-v9-argb8888-bin"]`；旧插件发送的 JPG/PNG 封面仍兼容
-- 最大音频 64 MiB、封面 129612 字节、背景 645132 字节、歌词 2 MiB
+- 最大音频 64 MiB、封面 129612 字节、背景 698892 字节、歌词 2 MiB
 
 完整消息定义见 Lyra Player 仓库的 `docs/LOCAL_IMPORT_PROTOCOL.md`。

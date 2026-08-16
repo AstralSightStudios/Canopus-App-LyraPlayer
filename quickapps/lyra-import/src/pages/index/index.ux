@@ -642,7 +642,7 @@ export default {
   normalizeAssets(assets) {
     if (!Array.isArray(assets) || assets.length === 0 || assets.length > 4) return null
     const seen = {}
-    const limits = { audio: 67108864, cover: 4194304, background: 645132, lyrics: 2097152 }
+    const limits = { audio: 67108864, cover: 4194304, background: 698892, lyrics: 2097152 }
     const names = { audio: 'audio.mp3', cover: 'cover.jpg', background: 'background.bin', lyrics: 'lyrics.lrc' }
     const order = { audio: 0, cover: 1, background: 2, lyrics: 3 }
     const output = []
@@ -663,7 +663,7 @@ export default {
         return null
       }
       if (kind === 'background') {
-        if (source.format !== 'lvgl-v9-argb8888-bin' || source.extension !== 'bin' || source.width !== 336 || source.height !== 480 || size !== 645132) return null
+        if (source.format !== 'lvgl-v9-argb8888-bin' || source.extension !== 'bin' || source.width !== 336 || source.height !== 520 || size !== 698892) return null
       }
       if (kind === 'lyrics' && source.format === 'json') fileName = 'lyrics.json'
       output.push({ kind, size, fileName })

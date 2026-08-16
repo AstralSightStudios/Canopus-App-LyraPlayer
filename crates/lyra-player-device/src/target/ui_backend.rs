@@ -374,7 +374,7 @@ fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snap
         backend.background_hash = 0;
         return false;
     };
-    if !storage::validate_lvgl_v9_image(&resolved_path, 336, 480) {
+    if !storage::validate_lvgl_v9_image(&resolved_path, 336, 520) {
         if !backend.background.is_null() {
             unsafe { lvx_set_hidden(backend.background, 1) };
         }
@@ -402,7 +402,7 @@ fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snap
         backend.background_hash = image_hash;
     }
     unsafe {
-        lvx_object_set_size(backend.background, 336, 480);
+        lvx_object_set_size(backend.background, 336, 520);
         lvx_object_align(backend.background, ALIGN_TOP_MID, 0, 0);
         lvx_object_move_to_index(backend.background, 0);
         lvx_set_hidden(backend.background, 0);
