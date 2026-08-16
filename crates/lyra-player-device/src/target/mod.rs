@@ -144,10 +144,7 @@ pub fn handle_ui_event(page_index: usize, generation: u32, _key: u32, event_id: 
             return None;
         }
         if event_id == ui::EVENT_TOGGLE {
-            if let Err(error) = core.app.player.toggle(&mut core.audio) {
-                core.app.error = Some(alloc::format!("audio ioctl failed: {error}"));
-                core.app.generation = core.app.generation.wrapping_add(1).max(1);
-            }
+            core.pending_audio = Some(runtime::PendingAudioCommand::Toggle);
             return Some(alloc::vec::Vec::new());
         }
         if matches!(event_id, ui::EVENT_VOLUME_DOWN | ui::EVENT_VOLUME_UP) {
@@ -157,13 +154,7 @@ pub fn handle_ui_event(page_index: usize, generation: u32, _key: u32, event_id: 
             } else {
                 current.saturating_add(10).min(100)
             };
-            match core.app.player.set_volume(volume, &mut core.audio) {
-                Ok(()) => core.app.generation = core.app.generation.wrapping_add(1).max(1),
-                Err(error) => {
-                    core.app.error = Some(alloc::format!("volume ioctl failed: {error}"));
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                }
-            }
+            core.pending_audio = Some(runtime::PendingAudioCommand::SetVolume(volume));
             return Some(alloc::vec::Vec::new());
         }
         action_for_event(&core.app, event_id).map(|action| core.app.update(action))
@@ -202,10 +193,49 @@ fn route_page(route: Route) -> usize {
 pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
     let _ = try_with_core(|core| {
+        if let Some(command) = core.pending_audio.take() {
+            match command {
+                runtime::PendingAudioCommand::Stream(path) => {
+                    if let Err(error) = core.audio.start_local(&path, &mut core.app.player) {
+                        core.app.error = Some(alloc::format!(
+                            "local audio start {}: {}",
+                            core.audio.failure_stage(),
+                            error
+                        ));
+                        core.app.player.state = PlaybackState::Failed;
+                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                        runtime().last_error.store(error, Ordering::Release);
+                        return;
+                    }
+                    core.app.error = None;
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                }
+                runtime::PendingAudioCommand::Toggle => {
+                    if let Err(error) = core.app.player.toggle(&mut core.audio) {
+                        core.app.error = Some(alloc::format!("audio ioctl failed: {error}"));
+                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                        runtime().last_error.store(error, Ordering::Release);
+                        return;
+                    }
+                }
+                runtime::PendingAudioCommand::SetVolume(volume) => {
+                    if let Err(error) = core.app.player.set_volume(volume, &mut core.audio) {
+                        core.app.error = Some(alloc::format!("volume ioctl failed: {error}"));
+                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                        runtime().last_error.store(error, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        }
         if let Err(error) = core.audio.pump_local(&mut core.app.player) {
             core.audio.abort_local();
             core.app.player.state = PlaybackState::Failed;
-            core.app.error = Some(alloc::format!("local audio pump failed: {error}"));
+            core.app.error = Some(alloc::format!(
+                "local audio pump {}: {}",
+                core.audio.failure_stage(),
+                error
+            ));
             core.app.generation = core.app.generation.wrapping_add(1).max(1);
             runtime().last_error.store(error, Ordering::Release);
             return;
@@ -219,7 +249,7 @@ pub fn audio_service_tick() {
                 let _ = core.app.update(Action::Tick(250));
             }
         }
-        if tick % 20 == 0 {
+        if tick % 20 == 0 && core.audio.is_open() {
             match core.audio.volume_percent() {
                 Ok(volume) if core.app.player.sync_volume(volume) => {
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
@@ -269,14 +299,7 @@ fn execute_effects(effects: alloc::vec::Vec<Effect>) {
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
                     return;
                 }
-                if let Err(error) = core.audio.start_local(&path, &mut core.app.player) {
-                    core.app.error = Some(alloc::format!("local audio start failed: {error}"));
-                    core.app.player.state = PlaybackState::Failed;
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                } else {
-                    core.app.error = None;
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                }
+                core.pending_audio = Some(runtime::PendingAudioCommand::Stream(path));
             }),
             Effect::Navigate(route) => ui_backend::navigate(route_page(route)),
         }

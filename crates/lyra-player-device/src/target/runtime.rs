@@ -1,7 +1,16 @@
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
+use alloc::string::String;
+
 use canopus_target_private::bt_alloc;
 use lyra_player_core::LyraApp;
+
+#[derive(Clone, Debug)]
+pub enum PendingAudioCommand {
+    Stream(String),
+    Toggle,
+    SetVolume(u8),
+}
 
 pub const APP_NONE: u32 = 0;
 pub const APP_REGISTERED: u32 = 1;
@@ -11,6 +20,7 @@ pub const APP_FAILED: u32 = 3;
 pub struct Core {
     pub app: LyraApp,
     pub audio: super::audio::AudioDevice,
+    pub pending_audio: Option<PendingAudioCommand>,
 }
 
 impl Core {
@@ -18,6 +28,7 @@ impl Core {
         unsafe {
             core::ptr::addr_of_mut!((*pointer).app).write(LyraApp::default());
             core::ptr::addr_of_mut!((*pointer).audio).write(super::audio::AudioDevice::new());
+            core::ptr::addr_of_mut!((*pointer).pending_audio).write(None);
         }
     }
 }

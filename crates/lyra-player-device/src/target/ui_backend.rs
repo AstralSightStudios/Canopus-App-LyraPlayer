@@ -344,23 +344,6 @@ fn skip_image(key: u32) -> bool {
 }
 
 #[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
-unsafe fn apply_player_surface(object: *mut core::ffi::c_void, transparent: bool) {
-    if object.is_null() {
-        return;
-    }
-    unsafe {
-        lvx_object_set_background_opacity(object, if transparent { 0 } else { 255 }, 0);
-        if transparent {
-            lvx_object_set_local_style_u32(object, LV_STYLE_BORDER_WIDTH, 0, 0);
-            lvx_object_set_local_style_u32(object, LV_STYLE_BORDER_OPA, 0, 0);
-        }
-    }
-}
-
-#[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
-unsafe fn apply_player_surface(_object: *mut core::ffi::c_void, _transparent: bool) {}
-
-#[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
 fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snapshot) -> bool {
     if page_index != PAGE_PLAYER {
         return false;
@@ -399,7 +382,7 @@ fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snap
     source_path.push(0);
     let created_now = backend.background.is_null();
     if created_now {
-        backend.background = unsafe { lvx_image_create(backend.root) };
+        backend.background = unsafe { lvx_image_create(backend.content_root) };
         if backend.background.is_null() {
             return false;
         }
@@ -559,10 +542,7 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
         }
     }
 
-    let background_visible = sync_background(backend, page_index, snapshot);
-    if page_index == PAGE_PLAYER {
-        unsafe { apply_player_surface(backend.content_root, background_visible) };
-    }
+    let _ = sync_background(backend, page_index, snapshot);
 
     // Capacity check mirrors the C backend: sections/pages are free, labels
     // and rows are bounded.
@@ -646,17 +626,9 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 if backend.page_title.is_null() {
                     return -1;
                 }
-                unsafe {
-                    apply_misans(backend.page_title);
-                    if page_index == PAGE_PLAYER {
-                        apply_player_surface(backend.page_title, background_visible);
-                    }
-                }
+                unsafe { apply_misans(backend.page_title) };
             }
             unsafe { lvx_set_hidden(backend.page_title, 0) };
-            if page_index == PAGE_PLAYER {
-                unsafe { apply_player_surface(backend.page_title, background_visible) };
-            }
             previous = backend.page_title;
             continue;
         }
@@ -689,7 +661,12 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 if previous.is_null() {
                     unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
                 } else {
-                    unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, 4) };
+                    let gap = if page_index == PAGE_PLAYER && label_used == 0 {
+                        8
+                    } else {
+                        4
+                    };
+                    unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, gap) };
                 }
             }
             previous = object;
@@ -910,9 +887,6 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             backend.row_hashes[slot] = content_hash;
         }
         unsafe { lvx_set_hidden(object, 0) };
-        if page_index == PAGE_PLAYER {
-            unsafe { apply_player_surface(object, background_visible) };
-        }
         if layout_changed {
             if previous.is_null() {
                 unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };

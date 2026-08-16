@@ -5,8 +5,8 @@ use alloc::{string::String, vec::Vec};
 use core::ffi::c_void;
 
 use canopus_target_private::{
-    O_RDONLY, O_RDWR, canopus_fw_clock_gettime, nuttx_close, nuttx_ioctl, nuttx_lseek, nuttx_open,
-    nuttx_read, nuttx_write, stock_timespec_t,
+    O_RDONLY, O_RDWR, canopus_fw_clock_gettime, get_errno, nuttx_close, nuttx_ioctl, nuttx_lseek,
+    nuttx_open, nuttx_read, nuttx_write, stock_timespec_t,
 };
 use lyra_player_core::playback::{AudioSink, Player};
 
@@ -14,15 +14,15 @@ use super::storage;
 
 const DEVICE_PATH: &[u8] = b"/dev/canopus_audio\0";
 const FORMAT_MP3: u32 = 1;
-const IOC_SET_FORMAT: u32 = 0x4341_0002;
-const IOC_START: u32 = 0x4341_0003;
-const IOC_PAUSE: u32 = 0x4341_0004;
-const IOC_RESUME: u32 = 0x4341_0005;
-const IOC_STOP: u32 = 0x4341_0006;
-const IOC_DRAIN: u32 = 0x4341_0007;
-const IOC_GET_STATUS: u32 = 0x4341_0009;
-const IOC_SET_VOLUME: u32 = 0x4341_000A;
-const IOC_GET_VOLUME: u32 = 0x4341_000B;
+const IOC_SET_FORMAT: u32 = 0x305;
+const IOC_START: u32 = 0x306;
+const IOC_PAUSE: u32 = 0x307;
+const IOC_RESUME: u32 = 0x308;
+const IOC_STOP: u32 = 0x309;
+const IOC_DRAIN: u32 = 0x30D;
+const IOC_GET_STATUS: u32 = 0x30F;
+const IOC_SET_VOLUME: u32 = 0x310;
+const IOC_GET_VOLUME: u32 = 0x311;
 const AUDIO_STATE_CONFIGURED: u32 = 2;
 const AUDIO_STATE_BUFFERING: u32 = 3;
 const AUDIO_STATE_PLAYING: u32 = 4;
@@ -37,6 +37,16 @@ const SEEK_SCAN_WINDOW: usize = 8 * 1024;
 const EINVAL: i32 = -22;
 const EIO: i32 = -5;
 const CLOCK_MONOTONIC: u32 = 1;
+
+const STAGE_NONE: u8 = 0;
+const STAGE_AUDIO_OPEN: u8 = 1;
+const STAGE_LOCAL_OPEN: u8 = 2;
+const STAGE_LOCAL_READ: u8 = 3;
+const STAGE_AUDIO_WRITE: u8 = 4;
+const STAGE_IOCTL_STOP: u8 = 5;
+const STAGE_IOCTL_SET_FORMAT: u8 = 6;
+const STAGE_IOCTL_START: u8 = 7;
+const STAGE_IOCTL_OTHER: u8 = 8;
 
 fn monotonic_ms() -> Option<u64> {
     let mut time = stock_timespec_t {
@@ -53,6 +63,20 @@ fn monotonic_ms() -> Option<u64> {
             .saturating_mul(1_000)
             .saturating_add(time.tv_nsec as u64 / 1_000_000),
     )
+}
+
+/// Recovers the real error from a `-1` firmware return. NuttX collapses every
+/// driver error into `-1` and parks the positive errno in the task's errno
+/// slot; read it back so callers retain the actual failure reason instead of
+/// an undifferentiated `-1`.
+fn neg_errno(raw: i32) -> i32 {
+    if raw == -1 {
+        let errno = unsafe { get_errno() };
+        if errno > 0 {
+            return -errno;
+        }
+    }
+    raw
 }
 
 #[repr(C)]
@@ -257,47 +281,10 @@ fn find_mp3_seek_point(fd: i32, target_ms: u32) -> Result<(u64, u32), i32> {
     }
 }
 
-fn mp3_duration_ms(fd: i32) -> Result<u32, i32> {
-    let mut reader = SeekWindow::new(fd);
-    let mut offset = 0u64;
-    let mut elapsed_us = 0u64;
-    let mut locked = false;
-    let mut found_frame = false;
-    loop {
-        let Some(header) = reader.header_at(offset)? else {
-            return if found_frame {
-                Ok((elapsed_us / 1_000).min(u64::from(u32::MAX)) as u32)
-            } else {
-                Err(EINVAL)
-            };
-        };
-        let Some(frame) = parse_mp3_frame(header) else {
-            offset = offset.saturating_add(1);
-            locked = false;
-            continue;
-        };
-        if !locked {
-            let next_offset = offset.saturating_add(u64::from(frame.bytes));
-            let Some(next_header) = reader.header_at(next_offset)? else {
-                return Err(EINVAL);
-            };
-            if parse_mp3_frame(next_header).is_none() {
-                offset = offset.saturating_add(1);
-                continue;
-            }
-            locked = true;
-        }
-        found_frame = true;
-        elapsed_us = elapsed_us.saturating_add(
-            u64::from(frame.samples).saturating_mul(1_000_000) / u64::from(frame.sample_rate),
-        );
-        offset = offset.saturating_add(u64::from(frame.bytes));
-    }
-}
-
 pub struct AudioDevice {
     fd: i32,
     local_fd: i32,
+    last_stage: u8,
     position_base_ms: u32,
     position_started_at_ms: Option<u64>,
 }
@@ -307,6 +294,7 @@ impl AudioDevice {
         Self {
             fd: -1,
             local_fd: -1,
+            last_stage: STAGE_NONE,
             position_base_ms: 0,
             position_started_at_ms: None,
         }
@@ -316,32 +304,68 @@ impl AudioDevice {
         if self.fd >= 0 {
             return Ok(self.fd);
         }
+        self.last_stage = STAGE_AUDIO_OPEN;
         let fd = unsafe { nuttx_open(DEVICE_PATH.as_ptr(), O_RDWR) };
         if fd < 0 {
-            return Err(fd);
+            return Err(neg_errno(fd));
         }
         self.fd = fd;
         Ok(fd)
     }
 
+    fn ioctl_stage(command: u32) -> u8 {
+        match command {
+            IOC_STOP => STAGE_IOCTL_STOP,
+            IOC_SET_FORMAT => STAGE_IOCTL_SET_FORMAT,
+            IOC_START => STAGE_IOCTL_START,
+            _ => STAGE_IOCTL_OTHER,
+        }
+    }
+
+    fn stage_name(stage: u8) -> &'static str {
+        match stage {
+            STAGE_AUDIO_OPEN => "audio_open",
+            STAGE_LOCAL_OPEN => "local_open",
+            STAGE_LOCAL_READ => "local_read",
+            STAGE_AUDIO_WRITE => "audio_write",
+            STAGE_IOCTL_STOP => "ioctl_stop",
+            STAGE_IOCTL_SET_FORMAT => "ioctl_set_format",
+            STAGE_IOCTL_START => "ioctl_start",
+            STAGE_IOCTL_OTHER => "ioctl_other",
+            _ => "audio",
+        }
+    }
+
+    pub fn failure_stage(&self) -> &'static str {
+        Self::stage_name(self.last_stage)
+    }
+
     fn ioctl_value(&mut self, command: u32, argument: usize) -> Result<(), i32> {
+        self.last_stage = Self::ioctl_stage(command);
         let fd = self.ensure_open()?;
         let result = unsafe { nuttx_ioctl(fd, command, argument) };
-        if result < 0 { Err(result) } else { Ok(()) }
+        if result < 0 {
+            Err(neg_errno(result))
+        } else {
+            Ok(())
+        }
     }
 
     fn ioctl(&mut self, command: u32) -> Result<(), i32> {
         self.ioctl_value(command, 0)
     }
 
-    fn status(&mut self) -> Option<AudioStatusV1> {
+    fn status(&mut self) -> Result<AudioStatusV1, i32> {
         let mut status = AudioStatusV1 {
             struct_size: core::mem::size_of::<AudioStatusV1>() as u32,
             ..AudioStatusV1::default()
         };
         self.ioctl_value(IOC_GET_STATUS, core::ptr::addr_of_mut!(status) as usize)
-            .ok()
             .map(|()| status)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.fd >= 0
     }
 
     pub fn volume_percent(&mut self) -> Result<u8, i32> {
@@ -368,26 +392,18 @@ impl AudioDevice {
         let mut c_path = Vec::with_capacity(resolved.len() + 1);
         c_path.extend_from_slice(resolved.as_bytes());
         c_path.push(0);
+        self.last_stage = STAGE_LOCAL_OPEN;
         let fd = unsafe { nuttx_open(c_path.as_ptr(), O_RDONLY) };
         if fd < 0 {
-            return Err(fd);
+            return Err(neg_errno(fd));
         }
         self.local_fd = fd;
         self.position_base_ms = 0;
         self.position_started_at_ms = None;
 
-        if player.duration_ms == 0 {
-            let duration_ms = mp3_duration_ms(fd).ok().filter(|duration| *duration != 0);
-            let position = unsafe { nuttx_lseek(fd, 0, SEEK_SET) };
-            if position != 0 {
-                self.close_local();
-                return Err(if position < 0 { position as i32 } else { EIO });
-            }
-            if let Some(duration_ms) = duration_ms {
-                player.set_duration(duration_ms);
-            }
-        }
-
+        // Imported metadata supplies duration when available. Do not probe the
+        // file with lseek here: some Band 10 storage backends can read the
+        // stream but reject lseek with ENOTTY, which must not block playback.
         if let Err(error) = player.stream_opened(String::from("local"), self) {
             self.close_local();
             return Err(error);
@@ -418,8 +434,9 @@ impl AudioDevice {
                 )
             };
             if count < 0 {
+                self.last_stage = STAGE_LOCAL_READ;
                 self.close_local();
-                return Err(count);
+                return Err(neg_errno(count));
             }
             if count == 0 {
                 if player.stream_ended(self)? {
@@ -445,7 +462,11 @@ impl AudioDevice {
         let (offset, position_ms) = find_mp3_seek_point(self.local_fd, target_ms)?;
         let result = unsafe { nuttx_lseek(self.local_fd, offset as i64, SEEK_SET) };
         if result < 0 || result as u64 != offset {
-            return Err(if result < 0 { result as i32 } else { EIO });
+            return Err(if result < 0 {
+                neg_errno(result as i32)
+            } else {
+                EIO
+            });
         }
         self.prepare_and_prebuffer()?;
         self.position_base_ms = position_ms;
@@ -507,13 +528,24 @@ impl AudioSink for AudioDevice {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
+        self.last_stage = STAGE_AUDIO_WRITE;
         let fd = self.ensure_open()?;
         let count = u32::try_from(bytes.len()).map_err(|_| -1)?;
         let result = unsafe { nuttx_write(fd, bytes.as_ptr().cast::<c_void>(), count) };
         if result == EAGAIN {
             Ok(0)
         } else if result == -1 {
-            classify_generic_write_failure(self.status())
+            // NuttX reports a driver's negative errno as -1 and stores the
+            // actual value in the task errno slot. Read it before issuing the
+            // diagnostic GET_STATUS ioctl, which would overwrite that slot.
+            let write_errno = unsafe { get_errno() };
+            if write_errno == 11 {
+                Ok(0)
+            } else if write_errno > 0 {
+                Err(-write_errno)
+            } else {
+                classify_generic_write_failure(self.status().ok())
+            }
         } else if result < 0 {
             Err(result)
         } else {

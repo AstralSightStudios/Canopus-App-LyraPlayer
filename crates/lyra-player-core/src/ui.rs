@@ -1,7 +1,7 @@
 use alloc::format;
 use canopus_ui_core::{
-    ActionRow, Layout, NavigationPage, Snapshot, StatusRow, Text, TextStyle, Tree, UiError, View,
-    view,
+    ActionRow, Layout, NavigationPage, Snapshot, StatusRow, Style, Text, TextStyle, Tree, UiError,
+    View, view,
 };
 
 use crate::{LyraApp, Route, Song, playback::PlaybackState};
@@ -269,7 +269,10 @@ impl View<UiEvent> for CoverImage<'_> {
                 height: 180,
                 ..Layout::default()
             },
-        )
+        )?;
+        let mut style = Style::default();
+        style.corner_radius = 24;
+        tree.set_style(PLAYER_COVER_KEY, style)
     }
 }
 
@@ -378,5 +381,12 @@ mod tests {
             image_keys,
             alloc::vec![PLAYER_BACKGROUND_KEY, PLAYER_COVER_KEY]
         );
+        let cover_index = snapshot
+            .nodes
+            .iter()
+            .take(snapshot.node_count as usize)
+            .position(|node| node.key == PLAYER_COVER_KEY)
+            .unwrap();
+        assert_eq!(snapshot.styles[cover_index].corner_radius, 24);
     }
 }
