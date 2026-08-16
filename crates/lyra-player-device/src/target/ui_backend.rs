@@ -8,13 +8,17 @@ use alloc::vec::Vec;
 
 use canopus_target_private::*;
 use canopus_ui_core::{NodeKind, Snapshot};
-use lyra_player_core::ui::PLAYER_BACKGROUND_KEY;
+use lyra_player_core::ui::{PLAYER_BACKGROUND_KEY, PLAYER_COVER_KEY};
 
 use super::native_app::{APP_ID, PAGE_COUNT, PAGE_OVERVIEW, PAGE_PLAYER, page_descriptor_ptr};
 use super::storage;
 
 static EMPTY_TEXT: [u8; 1] = [0];
 const REFRESH_PERIOD_MS: u32 = 100;
+const PLAYER_CONTENT_HEIGHT: i32 = 480;
+const PLAYER_MEDIA_TOP: i32 = 100;
+const PLAYER_TITLE_TOP: i32 = 300;
+const PLAYER_AUTHOR_TOP: i32 = 348;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -456,6 +460,16 @@ fn target_row_kind(kind: NodeKind) -> u8 {
     }
 }
 
+unsafe fn set_row_hidden(row: *mut core::ffi::c_void, hidden: u32) {
+    unsafe {
+        lvx_set_hidden(row, hidden);
+        let trailing = lvx_list_row_trailing(row);
+        if !trailing.is_null() {
+            lvx_set_hidden(trailing, hidden);
+        }
+    }
+}
+
 /// Band-9 (LVGL v8) trailing-kind for a row kind. Band-9 numbers differ from
 /// band-10: 1 = switch, 12 = forward arrow, 0 = none.
 #[cfg(feature = "target-xiaomi-band-9-pro-3-1-175")]
@@ -533,8 +547,18 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 return -1;
             }
             unsafe {
-                lvx_object_set_size(backend.content_root, CONTENT_WIDTH, CONTENT_HEIGHT);
-                lvx_object_align(backend.content_root, ALIGN_TOP_MID, 0, CONTENT_TOP_OFFSET);
+                let content_height = if page_index == PAGE_PLAYER {
+                    PLAYER_CONTENT_HEIGHT
+                } else {
+                    CONTENT_HEIGHT
+                };
+                let content_top = if page_index == PAGE_PLAYER {
+                    0
+                } else {
+                    CONTENT_TOP_OFFSET
+                };
+                lvx_object_set_size(backend.content_root, CONTENT_WIDTH, content_height);
+                lvx_object_align(backend.content_root, ALIGN_TOP_MID, 0, content_top);
             }
         }
         if backend.content_root.is_null() {
@@ -582,6 +606,7 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
     let mut image_used = 0usize;
     let mut bar_used = 0usize;
     let mut previous: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut player_row_count = 0u32;
 
     for index in 0..snapshot.node_count as usize {
         let node = &snapshot.nodes[index];
@@ -595,6 +620,9 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             continue;
         }
         if kind == NodeKind::NavigationPage {
+            if page_index == PAGE_PLAYER {
+                continue;
+            }
             let title_mode = if page_index == PAGE_OVERVIEW {
                 0u32
             } else {
@@ -644,21 +672,37 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 backend.label_count += 1;
                 object = created;
             }
+            let is_player_title = page_index == PAGE_PLAYER && label_used == 0;
+            let is_player_author = page_index == PAGE_PLAYER && label_used == 1;
+            let is_player_label = page_index == PAGE_PLAYER;
+            let label_width = CONTENT_WIDTH;
             let label_hash = hash_word(
-                hash_text(0x811C_9DC5, primary),
-                snapshot.styles[index].text_style as u32,
+                hash_word(
+                    hash_text(0x811C_9DC5, primary),
+                    snapshot.styles[index].text_style as u32,
+                ),
+                label_width as u32,
             );
             if created_now || backend.label_hashes[label_used as usize] != label_hash {
                 unsafe {
+                    if created_now && is_player_label {
+                        lvx_label_set_text_align_center(object);
+                    }
                     lvx_label_set_text(object, primary.as_ptr());
-                    apply_misans(object);
-                    lvx_object_set_size(object, CONTENT_WIDTH, wrapped_label_height(primary));
+                    if !is_player_author {
+                        apply_misans(object);
+                    }
+                    lvx_object_set_size(object, label_width, wrapped_label_height(primary));
                 }
                 backend.label_hashes[label_used as usize] = label_hash;
             }
             unsafe { lvx_set_hidden(object, 0) };
             if layout_changed {
-                if previous.is_null() {
+                if is_player_title {
+                    unsafe { lvx_object_align(object, ALIGN_TOP_MID, 0, PLAYER_TITLE_TOP) };
+                } else if is_player_author {
+                    unsafe { lvx_object_align(object, ALIGN_TOP_MID, 0, PLAYER_AUTHOR_TOP) };
+                } else if previous.is_null() {
                     unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
                 } else {
                     let gap = if page_index == PAGE_PLAYER && label_used == 0 {
@@ -733,7 +777,9 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     lvx_set_hidden(object, 0);
                 }
                 if layout_changed {
-                    if previous.is_null() {
+                    if page_index == PAGE_PLAYER && node.key == PLAYER_COVER_KEY {
+                        unsafe { lvx_object_align(object, ALIGN_TOP_MID, 0, PLAYER_MEDIA_TOP) };
+                    } else if previous.is_null() {
                         unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
                     } else {
                         unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, 8) };
@@ -886,13 +932,26 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             }
             backend.row_hashes[slot] = content_hash;
         }
-        unsafe { lvx_set_hidden(object, 0) };
+        unsafe { set_row_hidden(object, 0) };
         if layout_changed {
-            if previous.is_null() {
+            if page_index == PAGE_PLAYER && player_row_count == 0 {
+                unsafe {
+                    lvx_align_to(
+                        object,
+                        backend.content_root,
+                        ALIGN_TOP_MID,
+                        0,
+                        PLAYER_CONTENT_HEIGHT + ROW_GAP,
+                    )
+                };
+            } else if previous.is_null() {
                 unsafe { lvx_align_to(object, backend.content_root, ALIGN_TOP_MID, 0, 0) };
             } else {
                 unsafe { lvx_align_to(object, previous, ALIGN_OUT_BOTTOM_MID, 0, ROW_GAP) };
             }
+        }
+        if page_index == PAGE_PLAYER {
+            player_row_count = player_row_count.saturating_add(1);
         }
         previous = object;
         backend.row_keys[slot] = node.key;
@@ -907,7 +966,7 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
 
     for i in 0..UI_MAX_ROWS {
         if !backend.rows[i].is_null() && (used_mask & (1 << i)) == 0 {
-            unsafe { lvx_set_hidden(backend.rows[i], 1) };
+            unsafe { set_row_hidden(backend.rows[i], 1) };
             backend.bindings[i] = Binding {
                 generation: 0,
                 key: 0,

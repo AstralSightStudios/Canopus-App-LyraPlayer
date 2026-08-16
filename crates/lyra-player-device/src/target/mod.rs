@@ -192,7 +192,8 @@ fn route_page(route: Route) -> usize {
 
 pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
-    let _ = try_with_core(|core| {
+    let effects = try_with_core(|core| {
+        let mut effects = alloc::vec::Vec::new();
         if let Some(command) = core.pending_audio.take() {
             match command {
                 runtime::PendingAudioCommand::Stream(path) => {
@@ -205,7 +206,7 @@ pub fn audio_service_tick() {
                         core.app.player.state = PlaybackState::Failed;
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                         runtime().last_error.store(error, Ordering::Release);
-                        return;
+                        return effects;
                     }
                     core.app.error = None;
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
@@ -215,7 +216,7 @@ pub fn audio_service_tick() {
                         core.app.error = Some(alloc::format!("audio ioctl failed: {error}"));
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                         runtime().last_error.store(error, Ordering::Release);
-                        return;
+                        return effects;
                     }
                 }
                 runtime::PendingAudioCommand::SetVolume(volume) => {
@@ -223,7 +224,7 @@ pub fn audio_service_tick() {
                         core.app.error = Some(alloc::format!("volume ioctl failed: {error}"));
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                         runtime().last_error.store(error, Ordering::Release);
-                        return;
+                        return effects;
                     }
                 }
             }
@@ -238,7 +239,13 @@ pub fn audio_service_tick() {
             ));
             core.app.generation = core.app.generation.wrapping_add(1).max(1);
             runtime().last_error.store(error, Ordering::Release);
-            return;
+            return effects;
+        }
+        if core.app.player.state == PlaybackState::Draining
+            && !core.audio.local_is_open()
+            && core.app.has_next()
+        {
+            effects.extend(core.app.update(Action::Next));
         }
         if tick % 5 == 0 {
             if let Some(position_ms) = core.audio.playback_position_ms() {
@@ -258,7 +265,10 @@ pub fn audio_service_tick() {
                 Err(error) => runtime().last_error.store(error, Ordering::Release),
             }
         }
-    });
+        effects
+    })
+    .unwrap_or_default();
+    execute_effects(effects);
 }
 
 pub fn ui_maintenance_tick() {

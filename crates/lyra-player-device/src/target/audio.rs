@@ -368,6 +368,10 @@ impl AudioDevice {
         self.fd >= 0
     }
 
+    pub fn local_is_open(&self) -> bool {
+        self.local_fd >= 0
+    }
+
     pub fn volume_percent(&mut self) -> Result<u8, i32> {
         let mut volume = 0u32;
         self.ioctl_value(IOC_GET_VOLUME, core::ptr::addr_of_mut!(volume) as usize)?;
