@@ -122,7 +122,7 @@
 .warning-text {
   width: 276px;
   color: #e5e5e5;
-  font-size: 18px;
+  font-size: 16px;
   line-height: 20px;
   lines: 3;
   margin-top: 4px;

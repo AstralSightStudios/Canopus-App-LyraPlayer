@@ -142,10 +142,10 @@ fn player(app: &LyraApp) -> Result<Snapshot, UiError> {
         return commit(tree, app.generation);
     };
     let artist = song.artist_line();
-    let toggle = if app.player.state == PlaybackState::Paused {
-        "继续播放"
-    } else {
-        "暂停"
+    let toggle = match app.player.state {
+        PlaybackState::Playing | PlaybackState::Buffering => "暂停",
+        PlaybackState::Paused => "继续播放",
+        _ => "播放",
     };
     let volume = format!("{}%", app.player.volume_percent);
     let view = view!(NavigationPage {

@@ -197,6 +197,11 @@ pub fn audio_service_tick() {
         if let Some(command) = core.pending_audio.take() {
             match command {
                 runtime::PendingAudioCommand::Stream(path) => {
+                    if let Ok(volume) = core.audio.volume_percent() {
+                        if core.app.player.sync_volume(volume) {
+                            core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                        }
+                    }
                     if let Err(error) = core.audio.start_local(&path, &mut core.app.player) {
                         core.app.error = Some(alloc::format!(
                             "local audio start {}: {}",
@@ -218,6 +223,7 @@ pub fn audio_service_tick() {
                         runtime().last_error.store(error, Ordering::Release);
                         return effects;
                     }
+                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
                 }
                 runtime::PendingAudioCommand::SetVolume(volume) => {
                     if let Err(error) = core.app.player.set_volume(volume, &mut core.audio) {
