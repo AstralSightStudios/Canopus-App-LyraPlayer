@@ -50,6 +50,10 @@ CANOPUS_TARGET=xiaomi-band-9-pro-3.1.175 \
 
 `module.bin` 和 `receipt.bin` 是按目标固件生成的构建产物，不应跨固件复用。
 
+播放控制图标使用 Font Awesome Free 6.x 的 `backward-step`、`play`、`pause`
+和 `forward-step` SVG，图标按 CC BY 4.0 要求保留来源注释，转换为白色透明
+64×64 LVGL v9 BIN 后随表盘部署到 `/data/canopus/`。
+
 ## 安装
 
 1. 构建当前设备精确固件对应的安装表盘。

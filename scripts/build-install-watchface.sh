@@ -205,9 +205,20 @@ printf '%s\n' "[4/4] validate and stage installer watchface"
     exit 1
 }
 python3 "$ROOT/scripts/encode-lvgl-icon.py" "$ICON_SOURCE" "$WATCHFACE/appicon_lyra.bin"
+for asset in lyra-previous.bin lyra-play.bin lyra-pause.bin lyra-next.bin; do
+    source="$ROOT/watchfaces/lyra-player/$asset"
+    destination="$WATCHFACE/$asset"
+    [ -f "$source" ] || {
+        echo "error: missing player control asset: $source" >&2
+        exit 1
+    }
+    if [ "$source" != "$destination" ]; then
+        cp "$source" "$destination"
+    fi
+done
 cp "$OUT/lyra-player.elf" "$WATCHFACE/module.bin"
 cp "$OUT/receipt.bin" "$WATCHFACE/receipt.bin"
-chmod 644 "$WATCHFACE/module.bin" "$WATCHFACE/receipt.bin" "$WATCHFACE/appicon_lyra.bin"
+chmod 644 "$WATCHFACE/module.bin" "$WATCHFACE/receipt.bin" "$WATCHFACE/appicon_lyra.bin" "$WATCHFACE"/lyra-*.bin
 if command -v luac >/dev/null 2>&1; then
     luac -p "$WATCHFACE/main.lua"
 fi
@@ -217,10 +228,17 @@ watchface = pathlib.Path(sys.argv[1])
 module = (watchface / "module.bin").read_bytes()
 receipt = (watchface / "receipt.bin").read_bytes()
 icon = (watchface / "appicon_lyra.bin").read_bytes()
+controls = {
+    name: (watchface / name).read_bytes()
+    for name in ("lyra-previous.bin", "lyra-play.bin", "lyra-pause.bin", "lyra-next.bin")
+}
 if not module.startswith(b"\x7fELF") or not 512 <= len(module) <= 393216:
     raise SystemExit(f"invalid staged module size: {len(module)}")
 if len(icon) != 54768 or icon[:4] != b"\x19\x10\x00\x00" or icon[4:8] != b"\x75\x00\x75\x00" or icon[8:10] != b"\xd4\x01":
     raise SystemExit(f"invalid staged app icon: {len(icon)} bytes")
+for name, control in controls.items():
+    if len(control) != 16396 or control[:4] != b"\x19\x10\x00\x00" or control[4:8] != b"\x40\x00\x40\x00" or control[8:10] != b"\x00\x01":
+        raise SystemExit(f"invalid staged control icon {name}: {len(control)} bytes")
 if len(receipt) != 256 or receipt[:4] != b"CMI1":
     raise SystemExit("invalid CMI1 receipt")
 magic, version, header, flags, lifecycle, module_version, artifact_size, reserved = struct.unpack("<8I", receipt[:32])

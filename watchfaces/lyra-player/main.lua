@@ -9,6 +9,18 @@ local RECEIPT_RESOURCE = SCRIPT_PATH .. "receipt.bin"
 local MODULE_RESOURCE = SCRIPT_PATH .. "module.bin"
 local APP_ICON_RESOURCE = SCRIPT_PATH .. "appicon_lyra.bin"
 local APP_ICON_PATH = "/data/canopus/appicon_lyra.bin"
+local CONTROL_RESOURCES = {
+    SCRIPT_PATH .. "lyra-previous.bin",
+    SCRIPT_PATH .. "lyra-play.bin",
+    SCRIPT_PATH .. "lyra-pause.bin",
+    SCRIPT_PATH .. "lyra-next.bin",
+}
+local CONTROL_PATHS = {
+    "/data/canopus/lyra-previous.bin",
+    "/data/canopus/lyra-play.bin",
+    "/data/canopus/lyra-pause.bin",
+    "/data/canopus/lyra-next.bin",
+}
 local INBOX = "/data/canopus/inbox/"
 local RECEIPT_PATH = INBOX .. TOKEN .. ".cmi"
 local MODULE_PATH = INBOX .. TOKEN .. ".ko"
@@ -87,6 +99,10 @@ local function stage_files()
     local receipt = read_all(RECEIPT_RESOURCE)
     local module = read_all(MODULE_RESOURCE)
     local icon = read_all(APP_ICON_RESOURCE)
+    local controls = {}
+    for index, resource in ipairs(CONTROL_RESOURCES) do
+        controls[index] = read_all(resource)
+    end
     if type(receipt) ~= "string" or #receipt ~= 256
         or u32(receipt, 0) ~= 0x31494D43 then
         return false, "Missing or invalid signed receipt"
@@ -100,6 +116,14 @@ local function stage_files()
         or u16(icon, 4) ~= 117 or u16(icon, 6) ~= 117
         or u16(icon, 8) ~= 468 then
         return false, "Missing or invalid Lyra app icon"
+    end
+    for index, control in ipairs(controls) do
+        if type(control) ~= "string" or #control ~= 16396
+            or control:sub(1, 4) ~= "\25\16\0\0"
+            or u16(control, 4) ~= 64 or u16(control, 6) ~= 64
+            or u16(control, 8) ~= 256 then
+            return false, "Missing or invalid playback control icon " .. tostring(index)
+        end
     end
 
     local probe = io.open(RECEIPT_PATH, "wb")
@@ -118,9 +142,19 @@ local function stage_files()
     if not write_all(APP_ICON_PATH, icon) then
         return false, "Cannot stage app icon"
     end
+    for index, path in ipairs(CONTROL_PATHS) do
+        if not write_all(path, controls[index]) then
+            return false, "Cannot stage playback control icon " .. tostring(index)
+        end
+    end
     if read_all(RECEIPT_PATH) ~= receipt or read_all(MODULE_PATH) ~= module
         or read_all(APP_ICON_PATH) ~= icon then
         return false, "Staged file verification failed"
+    end
+    for index, path in ipairs(CONTROL_PATHS) do
+        if read_all(path) ~= controls[index] then
+            return false, "Staged control icon verification failed"
+        end
     end
     return true
 end

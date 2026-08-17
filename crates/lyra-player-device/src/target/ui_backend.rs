@@ -16,9 +16,20 @@ use super::storage;
 static EMPTY_TEXT: [u8; 1] = [0];
 const REFRESH_PERIOD_MS: u32 = 100;
 const PLAYER_CONTENT_HEIGHT: i32 = 480;
-const PLAYER_MEDIA_TOP: i32 = 100;
-const PLAYER_TITLE_TOP: i32 = 300;
-const PLAYER_AUTHOR_TOP: i32 = 348;
+const PLAYER_MEDIA_TOP: i32 = 72;
+const PLAYER_TITLE_TOP: i32 = 270;
+const PLAYER_AUTHOR_TOP: i32 = 318;
+const PLAYER_CONTROL_TOP: i32 = 378;
+const PLAYER_CONTROL_SIZE: i32 = 52;
+const PLAYER_CONTROL_PRESSED_SIZE: i32 = 46;
+const ROW_IMAGE_BUTTON: u8 = 4;
+const EVENT_PRESSED: u32 = 1;
+const EVENT_RELEASED: u32 = 2;
+const EVENT_PRESS_LOST: u32 = 3;
+const CONTROL_PREVIOUS_ICON: &[u8] = b"/data/canopus/lyra-previous.bin\0";
+const CONTROL_PLAY_ICON: &[u8] = b"/data/canopus/lyra-play.bin\0";
+const CONTROL_PAUSE_ICON: &[u8] = b"/data/canopus/lyra-pause.bin\0";
+const CONTROL_NEXT_ICON: &[u8] = b"/data/canopus/lyra-next.bin\0";
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -298,6 +309,80 @@ extern "C" fn row_event(event: *mut core::ffi::c_void) {
         binding.key,
         binding.event_id,
     );
+}
+
+fn control_x_offset(key: u32) -> i32 {
+    match key {
+        7 => -84,
+        6 => 0,
+        8 => 84,
+        _ => 0,
+    }
+}
+
+unsafe fn set_control_geometry(object: *mut core::ffi::c_void, key: u32, pressed: bool) {
+    let size = if pressed {
+        PLAYER_CONTROL_PRESSED_SIZE
+    } else {
+        PLAYER_CONTROL_SIZE
+    };
+    unsafe {
+        lvx_object_set_size(object, size, size);
+        lvx_object_align(
+            object,
+            ALIGN_TOP_MID,
+            control_x_offset(key),
+            PLAYER_CONTROL_TOP,
+        );
+    }
+}
+
+extern "C" fn image_button_event(event: *mut core::ffi::c_void) {
+    if event.is_null() {
+        return;
+    }
+    let code = unsafe { lvx_event_get_code(event) };
+    let encoded = unsafe { lvx_event_get_user_data(event) };
+    let page_index = encoded >> 8;
+    let slot = encoded & 0xFF;
+    if page_index >= PAGE_COUNT || slot >= UI_MAX_ROWS {
+        return;
+    }
+    let backend = page_backend(page_index);
+    if !backend.active || !backend.interactive || backend.row_kinds[slot] != ROW_IMAGE_BUTTON {
+        return;
+    }
+    match code {
+        EVENT_PRESSED => unsafe {
+            set_control_geometry(backend.rows[slot], backend.row_keys[slot], true);
+        },
+        EVENT_RELEASED | EVENT_PRESS_LOST | EVENT_CLICKED => unsafe {
+            set_control_geometry(backend.rows[slot], backend.row_keys[slot], false);
+        },
+        _ => return,
+    }
+    if code != EVENT_CLICKED {
+        return;
+    }
+    let binding = backend.bindings[slot];
+    if binding.event_id != 0 && binding.enabled {
+        super::handle_ui_event(
+            page_index,
+            binding.generation,
+            binding.key,
+            binding.event_id,
+        );
+    }
+}
+
+fn control_icon(key: u32, label: &str) -> Option<&'static [u8]> {
+    match key {
+        7 => Some(CONTROL_PREVIOUS_ICON),
+        6 if label == "继续播放" => Some(CONTROL_PLAY_ICON),
+        6 => Some(CONTROL_PAUSE_ICON),
+        8 => Some(CONTROL_NEXT_ICON),
+        _ => None,
+    }
 }
 
 extern "C" fn page_title_back(event: *mut core::ffi::c_void) {
@@ -685,13 +770,14 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             );
             if created_now || backend.label_hashes[label_used as usize] != label_hash {
                 unsafe {
+                    if created_now && is_player_author {
+                        lvx_label_set_author_scale(object);
+                    }
                     if created_now && is_player_label {
                         lvx_label_set_text_align_center(object);
                     }
                     lvx_label_set_text(object, primary.as_ptr());
-                    if !is_player_author {
-                        apply_misans(object);
-                    }
+                    apply_misans(object);
                     lvx_object_set_size(object, label_width, wrapped_label_height(primary));
                 }
                 backend.label_hashes[label_used as usize] = label_hash;
@@ -834,6 +920,57 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             bar_used += 1;
             continue;
         }
+
+        if page_index == PAGE_PLAYER
+            && kind == NodeKind::ActionRow
+            && control_icon(node.key, primary).is_some()
+        {
+            let slot = match find_row(backend, snapshot, ROW_IMAGE_BUTTON, node.key, used_mask) {
+                Some(slot) => slot,
+                None => return -1,
+            };
+            let mut object = backend.rows[slot];
+            let created_now = object.is_null();
+            if created_now {
+                object = unsafe { lvx_image_create(backend.content_root) };
+                if object.is_null() {
+                    return -1;
+                }
+                backend.rows[slot] = object;
+                backend.row_kinds[slot] = ROW_IMAGE_BUTTON;
+                backend.row_keys[slot] = node.key;
+                backend.row_count += 1;
+                let cookie = encoded_cookie(page_index, slot) as *mut core::ffi::c_void;
+                unsafe {
+                    lvx_event_add(object, image_button_event, EVENT_PRESSED, cookie);
+                    lvx_event_add(object, image_button_event, EVENT_RELEASED, cookie);
+                    lvx_event_add(object, image_button_event, EVENT_PRESS_LOST, cookie);
+                    lvx_event_add(object, image_button_event, EVENT_CLICKED, cookie);
+                }
+            }
+            let content_hash = row_content_hash(primary, "", u32::from(node.enabled()));
+            if created_now || backend.row_hashes[slot] != content_hash {
+                let icon = match control_icon(node.key, primary) {
+                    Some(icon) => icon,
+                    None => return -1,
+                };
+                unsafe { lvx_image_set_src(object, icon.as_ptr().cast()) };
+                backend.row_hashes[slot] = content_hash;
+            }
+            unsafe {
+                set_control_geometry(object, node.key, false);
+                lvx_set_hidden(object, 0);
+            }
+            backend.bindings[slot] = Binding {
+                generation: snapshot.generation,
+                key: node.key,
+                event_id: node.event_id,
+                enabled: node.enabled(),
+            };
+            used_mask |= 1 << slot;
+            continue;
+        }
+
         if !matches!(
             kind,
             NodeKind::StatusRow | NodeKind::Button | NodeKind::ActionRow | NodeKind::SwitchRow
@@ -966,7 +1103,11 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
 
     for i in 0..UI_MAX_ROWS {
         if !backend.rows[i].is_null() && (used_mask & (1 << i)) == 0 {
-            unsafe { set_row_hidden(backend.rows[i], 1) };
+            if backend.row_kinds[i] == ROW_IMAGE_BUTTON {
+                unsafe { lvx_set_hidden(backend.rows[i], 1) };
+            } else {
+                unsafe { set_row_hidden(backend.rows[i], 1) };
+            }
             backend.bindings[i] = Binding {
                 generation: 0,
                 key: 0,
