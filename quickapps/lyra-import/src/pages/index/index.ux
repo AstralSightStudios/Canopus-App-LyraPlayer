@@ -155,6 +155,8 @@ const FAST_CHUNK_BYTES = 36608
 const ULTRA_CHUNK_BYTES = 36753
 const MAX_CHUNK_BYTES = ULTRA_CHUNK_BYTES
 const MAX_CHUNK_RETRIES = 2
+const DECODE_QUARTETS_PER_SLICE = 512
+const CRC_BYTES_PER_SLICE = 4096
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 const BASE64_LOOKUP = (() => {
   const table = new Array(128).fill(-1)
@@ -194,7 +196,11 @@ export default {
       const payload = event && event.data !== undefined ? event.data : event
       this.operation = this.operation
         .then(() => this.handleMessage(payload))
-        .catch((error) => this.failActive('io-error', error && error.message ? error.message : String(error)))
+        .catch((error) => {
+          const reason = error && error.message ? error.message : String(error)
+          if (this.active) return this.failActive('io-error', reason)
+          this.sendError('', 'io-error', reason)
+        })
     }
   },
 
@@ -213,6 +219,10 @@ export default {
         this.statusText = '无法准备音乐库'
         this.detailText = String(error)
       })
+  },
+
+  yieldEventLoop() {
+    return new Promise((resolve) => setTimeout(resolve, 0))
   },
 
   async handleMessage(payload) {
@@ -432,7 +442,10 @@ export default {
     const active = this.requireActive(message.id)
     if (!active) return
     const asset = active.assets[active.assetIndex]
-    if (!asset || message.asset !== asset.kind || message.seq !== active.nextSeq || message.offset !== active.nextOffset) {
+    const expectedSeq = active.nextSeq
+    const expectedOffset = active.nextOffset
+    const cursorStillValid = () => this.active === active && active.assets[active.assetIndex] === asset && active.nextSeq === expectedSeq && active.nextOffset === expectedOffset
+    if (!asset || message.asset !== asset.kind || message.seq !== expectedSeq || message.offset !== expectedOffset) {
       await this.failActive('out-of-order', 'unexpected chunk sequence')
       return
     }
@@ -440,20 +453,34 @@ export default {
       await this.failActive('invalid-request', 'base64 chunk required')
       return
     }
-    const bytes = this.decodeBase64(message.data)
-    if (!bytes || bytes.length === 0 || bytes.length > active.chunkBytes) {
+    const encoded = message.data
+    const maxEncodedLength = Math.ceil(active.chunkBytes / 3) * 4
+    if (!encoded || encoded.length % 4 !== 0 || encoded.length > maxEncodedLength) {
       await this.requestChunkRetry(active, asset, 'invalid-base64')
       return
     }
-    const hasChecksum = typeof message.crc32 === 'string'
-    const checksumValid = active.checksum === 'none'
-      ? !hasChecksum
-      : hasChecksum && this.crc32Hex(bytes) === message.crc32
-    if (active.nextOffset + bytes.length > asset.size || !checksumValid) {
+    const expectedChecksum = message.crc32
+    await this.yieldEventLoop()
+    const bytes = await this.decodeBase64Async(encoded, active.chunkBytes)
+    if (!bytes || bytes.length === 0 || bytes.length > active.chunkBytes || !cursorStillValid()) {
+      if (cursorStillValid()) await this.requestChunkRetry(active, asset, 'invalid-base64')
+      return
+    }
+    const hasChecksum = typeof expectedChecksum === 'string'
+    let checksumValid = active.checksum === 'none' ? !hasChecksum : false
+    if (active.checksum !== 'none' && hasChecksum) {
+      checksumValid = (await this.crc32HexAsync(bytes)) === expectedChecksum
+    }
+    if (!checksumValid || !cursorStillValid()) {
+      if (cursorStillValid()) await this.requestChunkRetry(active, asset, 'checksum-mismatch')
+      return
+    }
+    if (expectedOffset + bytes.length > asset.size) {
       await this.requestChunkRetry(active, asset, 'checksum-mismatch')
       return
     }
-    await this.writeBuffer(active.stagingDir + '/' + asset.fileName + '.part', bytes, active.nextOffset)
+    await this.writeBuffer(active.stagingDir + '/' + asset.fileName + '.part', bytes, expectedOffset)
+    if (!cursorStillValid()) return
     active.retrySeq = -1
     active.retryCount = 0
     active.nextSeq += 1
@@ -687,39 +714,53 @@ export default {
     this.progressWidth = Math.floor(this.progress * 2.88)
   },
 
-  decodeBase64(input) {
+  async decodeBase64Async(input, maxBytes) {
     if (!input || input.length % 4 !== 0) return null
+    const maxEncodedLength = Math.ceil(maxBytes / 3) * 4
+    if (input.length > maxEncodedLength) return null
     let padding = 0
     if (input.endsWith('==')) padding = 2
     else if (input.endsWith('=')) padding = 1
     const outputLength = input.length / 4 * 3 - padding
+    if (outputLength <= 0 || outputLength > maxBytes) return null
     const output = new Uint8Array(outputLength)
     let cursor = 0
+    await this.yieldEventLoop()
     for (let index = 0; index < input.length; index += 4) {
+      const lastQuartet = index + 4 === input.length
       const c0 = input.charCodeAt(index)
       const c1 = input.charCodeAt(index + 1)
       const c2 = input.charCodeAt(index + 2)
       const c3 = input.charCodeAt(index + 3)
       const v0 = c0 < 128 ? BASE64_LOOKUP[c0] : -1
       const v1 = c1 < 128 ? BASE64_LOOKUP[c1] : -1
+      if (v0 < 0 || v1 < 0) return null
+      if (c2 === 61) {
+        if (!lastQuartet || c3 !== 61 || (v1 & 15) !== 0) return null
+      } else if (c3 === 61 && !lastQuartet) {
+        return null
+      }
       const v2 = c2 === 61 ? 0 : (c2 < 128 ? BASE64_LOOKUP[c2] : -1)
       const v3 = c3 === 61 ? 0 : (c3 < 128 ? BASE64_LOOKUP[c3] : -1)
-      if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return null
-      const word = v0 << 18 | v1 << 12 | v2 << 6 | v3
+      if (v2 < 0 || v3 < 0) return null
+      if (c3 === 61 && c2 !== 61 && (v2 & 3) !== 0) return null
+      const word = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
       if (cursor < outputLength) output[cursor++] = word >>> 16 & 255
       if (cursor < outputLength) output[cursor++] = word >>> 8 & 255
       if (cursor < outputLength) output[cursor++] = word & 255
+      if ((index / 4 + 1) % DECODE_QUARTETS_PER_SLICE === 0) await this.yieldEventLoop()
     }
     return output
   },
 
-  crc32Hex(bytes) {
+  async crc32HexAsync(bytes) {
     let crc = 0xffffffff
     for (let index = 0; index < bytes.length; index += 1) {
       crc ^= bytes[index]
       for (let bit = 0; bit < 8; bit += 1) {
         crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0)
       }
+      if ((index + 1) % CRC_BYTES_PER_SLICE === 0) await this.yieldEventLoop()
     }
     return ('00000000' + ((crc ^ 0xffffffff) >>> 0).toString(16)).slice(-8)
   },
