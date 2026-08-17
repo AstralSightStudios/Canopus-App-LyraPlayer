@@ -116,13 +116,13 @@
 .warning-title {
   width: 276px;
   color: #fbbf24;
-  font-size: 15px;
+  font-size: 20px;
   font-weight: bold;
 }
 .warning-text {
   width: 276px;
   color: #e5e5e5;
-  font-size: 14px;
+  font-size: 18px;
   line-height: 20px;
   lines: 3;
   margin-top: 4px;
