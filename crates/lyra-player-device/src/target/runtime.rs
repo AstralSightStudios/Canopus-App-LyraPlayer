@@ -10,6 +10,7 @@ pub enum PendingAudioCommand {
     Stream(String),
     Toggle,
     SetVolume(u8),
+    Stop,
 }
 
 pub const APP_NONE: u32 = 0;

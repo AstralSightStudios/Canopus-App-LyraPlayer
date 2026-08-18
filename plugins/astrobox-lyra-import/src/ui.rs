@@ -8,7 +8,7 @@ use qrcode::{QrCode, render::svg};
 use serde::Deserialize;
 
 use crate::astrobox::psys_host::{
-    dialog::{self, FilterConfig, PickConfig},
+    dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
     ui_v3 as ui,
 };
 use crate::{artwork, import, interconnect, library, netease, state};
@@ -42,6 +42,7 @@ const EVENT_LOGOUT: &str = "action:netease.logout";
 const EVENT_LIBRARY_REFRESH: &str = "action:library.refresh";
 const EVENT_LIBRARY_MOVE_UP_PREFIX: &str = "action:library.move.up.";
 const EVENT_LIBRARY_MOVE_DOWN_PREFIX: &str = "action:library.move.down.";
+const EVENT_LIBRARY_DELETE_PREFIX: &str = "action:library.delete.";
 
 #[derive(Default, Deserialize)]
 struct UiPayload {
@@ -79,6 +80,8 @@ pub fn on_event(event_id: &str, payload: &str) {
                     state.library_request_id.clear();
                     state.library_revision.clear();
                     state.library_total = 0;
+                    state.library_busy = false;
+                    state.library_target = None;
                 }
                 state.selected_addr = selected_addr;
             });
@@ -181,6 +184,20 @@ pub fn on_event(event_id: &str, payload: &str) {
                 library::move_track(track_id, "down");
             }
         }
+        event if event.starts_with(EVENT_LIBRARY_DELETE_PREFIX) => {
+            if let Some(track_id) = event
+                .strip_prefix(EVENT_LIBRARY_DELETE_PREFIX)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                let track_name = state::snapshot()
+                    .device_library
+                    .iter()
+                    .find(|track| track.id == track_id)
+                    .map(|track| track.name.clone())
+                    .unwrap_or_else(|| "这首音乐".to_string());
+                confirm_delete(track_id, &track_name);
+            }
+        }
         event if event.starts_with(EVENT_SEARCH_RESULT_PREFIX) => {
             if let Some(index) = event
                 .strip_prefix(EVENT_SEARCH_RESULT_PREFIX)
@@ -212,6 +229,36 @@ pub fn on_event(event_id: &str, payload: &str) {
         _ => {}
     }
     rerender();
+}
+
+fn confirm_delete(track_id: u64, track_name: &str) {
+    let result = wit_bindgen::block_on(dialog::show_dialog(
+        DialogType::Alert,
+        DialogStyle::System,
+        &DialogInfo {
+            title: "删除音乐".to_string(),
+            content: format!(
+                "确定删除《{}》吗？音频、封面、背景和歌词都会被永久删除。",
+                track_name
+            ),
+            buttons: vec![
+                DialogButton {
+                    id: "cancel".to_string(),
+                    primary: false,
+                    content: "取消".to_string(),
+                },
+                DialogButton {
+                    id: "delete".to_string(),
+                    primary: true,
+                    content: "删除".to_string(),
+                },
+            ],
+        },
+    )
+    .into_future());
+    if result.clicked_btn_id == "delete" {
+        library::delete_track(track_id);
+    }
 }
 
 fn pick_asset(kind: &str, extensions: &[&str]) {
@@ -684,7 +731,11 @@ fn device_library_card(state: &state::UiState) -> ui::Element {
             13,
             "#a1a1aa",
         ))
-        .child(button("刷新手表音乐", EVENT_LIBRARY_REFRESH, "#0f766e"));
+        .child(if state.library_busy {
+            button("刷新手表音乐", EVENT_LIBRARY_REFRESH, "#0f766e").disabled()
+        } else {
+            button("刷新手表音乐", EVENT_LIBRARY_REFRESH, "#0f766e")
+        });
 
     if state.device_library.is_empty() {
         let message = if state.library_total == 0 && !state.library_revision.is_empty() {
@@ -727,19 +778,27 @@ fn device_library_card(state: &state::UiState) -> ui::Element {
             ))
             .child(text(&metadata, 13, "#a1a1aa"));
         if index > 0 {
-            item = item.child(button(
+            item = item.child(library_button(
                 "上移",
                 &format!("{EVENT_LIBRARY_MOVE_UP_PREFIX}{}", track.id),
                 "#3f3f46",
+                state.library_busy,
             ));
         }
         if index + 1 < state.device_library.len() {
-            item = item.child(button(
+            item = item.child(library_button(
                 "下移",
                 &format!("{EVENT_LIBRARY_MOVE_DOWN_PREFIX}{}", track.id),
                 "#4f46e5",
+                state.library_busy,
             ));
         }
+        item = item.child(library_button(
+            "删除",
+            &format!("{EVENT_LIBRARY_DELETE_PREFIX}{}", track.id),
+            "#b91c1c",
+            state.library_busy,
+        ));
         card = card.child(item);
     }
     card
@@ -1025,6 +1084,15 @@ fn button(label: &str, event_id: &str, background: &str) -> ui::Element {
         .bg(background)
         .text_color("#ffffff")
         .on(ui::Event::Click, event_id)
+}
+
+fn library_button(label: &str, event_id: &str, background: &str, disabled: bool) -> ui::Element {
+    let button = button(label, event_id, background);
+    if disabled {
+        button.disabled()
+    } else {
+        button
+    }
 }
 
 fn text(content: &str, size: u32, color: &str) -> ui::Element {

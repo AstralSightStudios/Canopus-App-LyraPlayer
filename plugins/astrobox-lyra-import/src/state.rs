@@ -90,6 +90,8 @@ pub struct UiState {
     pub library_request_id: String,
     pub library_revision: String,
     pub library_total: usize,
+    pub library_busy: bool,
+    pub library_target: Option<u64>,
     pub library_nonce: u64,
     pub netease_cookie: String,
     pub netease_view: NeteaseView,

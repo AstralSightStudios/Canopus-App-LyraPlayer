@@ -233,6 +233,9 @@ pub fn audio_service_tick() {
                         return effects;
                     }
                 }
+                runtime::PendingAudioCommand::Stop => {
+                    core.audio.stop_local();
+                }
             }
         }
         if let Err(error) = core.audio.pump_local(&mut core.app.player) {
@@ -316,6 +319,9 @@ fn execute_effects(effects: alloc::vec::Vec<Effect>) {
                     return;
                 }
                 core.pending_audio = Some(runtime::PendingAudioCommand::Stream(path));
+            }),
+            Effect::StopAudio => with_core(|core| {
+                core.pending_audio = Some(runtime::PendingAudioCommand::Stop);
             }),
             Effect::Navigate(route) => ui_backend::navigate(route_page(route)),
         }

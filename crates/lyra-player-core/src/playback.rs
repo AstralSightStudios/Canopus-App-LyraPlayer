@@ -208,6 +208,18 @@ impl Player {
         Ok(())
     }
 
+    pub fn clear(&mut self) {
+        self.state = PlaybackState::Idle;
+        self.current = None;
+        self.queue.clear();
+        self.position_ms = 0;
+        self.duration_ms = 0;
+        self.stream_id = None;
+        self.error = None;
+        self.pending_audio.clear();
+        self.pending_offset = 0;
+    }
+
     pub fn take_next(&mut self) -> Option<Song> {
         self.queue.pop_front()
     }

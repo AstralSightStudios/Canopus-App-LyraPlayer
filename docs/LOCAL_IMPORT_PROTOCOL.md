@@ -299,7 +299,38 @@ manifest schema 中 `cover_url` 与 `background_url` 都可以为空；旧版 ma
 
 插件收到成功响应后必须重新分页读取权威列表，不能只在本地乐观换位。manifest 数组顺序同时是 Lyra 本地列表和上一首/下一首的顺序。
 
-### 9.3 错误
+### 9.3 删除单首音乐
+
+插件必须基于最近一次完整读取到的 `revision` 发送删除请求。`trackId` 只用于匹配 manifest 元数据，快应用不得把它直接拼接成文件路径：
+
+```json
+{
+  "tag":"lyra-library-delete",
+  "version":1,
+  "requestId":"library-3",
+  "revision":"3-a1b2c3d4",
+  "trackId":347230
+}
+```
+
+快应用先严格验证 manifest 和目标记录的 `local_path`，从 manifest 路径提取唯一的导入 transaction directory，并确认没有其它记录共享该目录。成功时先发布不包含目标记录的新 manifest，再把该 transaction directory 移入 `deleting/` quarantine，最后清理其中的音频、封面、背景、歌词和事务 journal。删除过程不会重新编号其它曲目。
+
+```json
+{
+  "tag":"lyra-library-deleted",
+  "version":1,
+  "requestId":"library-3",
+  "revision":"2-7c31d9aa",
+  "trackId":347230,
+  "cleanupPending":false
+}
+```
+
+`cleanupPending` 为 `true` 表示 manifest 已完成逻辑删除，但文件系统清理暂时失败；快应用会保留 bounded journal，并在启动或下一次管理操作中继续清理。发布 manifest 失败、revision 冲突、路径无法验证或状态无法确认时不得删除目录；插件必须保留列表并提示用户刷新或重试。
+
+如果删除的歌曲正被 Lyra Player 播放，原生播放器在下一次音乐库轮询看到当前 ID 消失后停止音频、清空当前歌曲和队列，回到 Idle，不会自动播放下一首。删除其它歌曲不会改变当前播放。
+
+### 9.4 错误
 
 ```json
 {"tag":"lyra-library-error","requestId":"library-2","code":"conflict"}
@@ -311,8 +342,10 @@ manifest schema 中 `cover_url` 与 `background_url` 都可以为空；旧版 ma
 - `invalid-request`：版本、请求 ID、方向或消息格式无效；
 - `invalid-library`：现有 manifest 无法严格解析，禁止覆盖；
 - `conflict`：读取后曲目顺序已变化，必须刷新；
-- `boundary`：曲目已经位于目标方向的边界。
+- `boundary`：曲目已经位于目标方向的边界；
+- `not-found`：删除目标不在当前 manifest 中；
+- `io-error`：文件读写或恢复失败，必须保守地保留现有 manifest。
 
 排序发布先写同目录临时文件，并保留旧 manifest 备份；新 manifest 发布失败时恢复旧文件。Vela 文件 API 不提供已验证的覆盖式原子 rename，因此切换期间仍存在极短的无 manifest 窗口，原生播放器应保留上一次成功读取的列表并在后续周期重试。
 
-旧版快应用会把未知管理消息作为 `invalid-request` 返回；插件应提示更新快应用，但不得影响导入协议 v2。使用排序功能时必须同时更新 AstroBox 插件和 Lyra Import 快应用。
+旧版快应用会把未知管理消息作为 `lyra-import-error` / `invalid-request` 返回；插件应提示更新快应用，但不得影响导入协议 v2。使用排序或删除功能时必须同时更新 AstroBox 插件和 Lyra Import 快应用。

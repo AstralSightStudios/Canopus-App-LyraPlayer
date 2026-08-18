@@ -32,6 +32,7 @@ impl Route {
 #[derive(Clone, Debug)]
 pub enum Effect {
     StreamAudio { path: String },
+    StopAudio,
     Navigate(Route),
 }
 
@@ -74,11 +75,30 @@ impl LyraApp {
     pub fn update(&mut self, action: Action) -> Vec<Effect> {
         let mut effects = Vec::new();
         match action {
-            Action::Boot(tracks) | Action::ReloadLibrary(tracks) => {
+            Action::Boot(tracks) => {
                 if self.local_tracks == tracks {
                     return effects;
                 }
                 self.local_tracks = tracks;
+            }
+            Action::ReloadLibrary(tracks) => {
+                if self.local_tracks == tracks {
+                    return effects;
+                }
+                let current_id = self.player.current.as_ref().map(|song| song.id);
+                let current_removed =
+                    current_id.is_some_and(|id| !tracks.iter().any(|song| song.id == id));
+                self.local_tracks = tracks;
+                if current_removed {
+                    self.player.clear();
+                    self.error = Some(String::from("当前歌曲已从音乐库删除"));
+                    effects.push(Effect::StopAudio);
+                } else if let Some(id) = current_id {
+                    if let Some(updated) = self.local_tracks.iter().find(|song| song.id == id) {
+                        self.player.current = Some(updated.clone());
+                        self.player.duration_ms = updated.duration_ms;
+                    }
+                }
             }
             Action::Open(route) => self.navigate(route, &mut effects),
             Action::Back => {
@@ -227,6 +247,46 @@ mod tests {
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(2));
         assert_eq!(app.player.position_ms, 0);
         assert_eq!(app.player.state, crate::playback::PlaybackState::Resolving);
+    }
+
+    #[test]
+    fn reloading_library_clears_deleted_current_song_and_stops_audio() {
+        let mut app = LyraApp::default();
+        let tracks = alloc::vec![local_song(1), local_song(2)];
+        app.update(Action::Boot(tracks.clone()));
+        app.update(Action::SelectSong(tracks[0].clone()));
+        app.player.state = crate::playback::PlaybackState::Playing;
+
+        let effects = app.update(Action::ReloadLibrary(alloc::vec![tracks[1].clone()]));
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StopAudio))
+        );
+        assert_eq!(app.player.state, crate::playback::PlaybackState::Idle);
+        assert!(app.player.current.is_none());
+        assert!(app.player.queue.is_empty());
+        assert_eq!(app.local_tracks.len(), 1);
+    }
+
+    #[test]
+    fn reloading_library_without_current_song_keeps_playback() {
+        let mut app = LyraApp::default();
+        let tracks = alloc::vec![local_song(1), local_song(2)];
+        app.update(Action::Boot(tracks.clone()));
+        app.update(Action::SelectSong(tracks[0].clone()));
+        app.player.state = crate::playback::PlaybackState::Playing;
+
+        let effects = app.update(Action::ReloadLibrary(alloc::vec![tracks[0].clone()]));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StopAudio))
+        );
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(1));
+        assert_eq!(app.player.state, crate::playback::PlaybackState::Playing);
     }
 
     #[test]

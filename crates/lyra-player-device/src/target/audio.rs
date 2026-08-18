@@ -495,9 +495,15 @@ impl AudioDevice {
         )
     }
 
-    pub fn abort_local(&mut self) {
-        let _ = AudioSink::stop(self);
+    pub fn stop_local(&mut self) {
+        if self.local_fd >= 0 {
+            let _ = AudioSink::stop(self);
+        }
         self.close_local();
+    }
+
+    pub fn abort_local(&mut self) {
+        self.stop_local();
     }
 
     fn close_local(&mut self) {

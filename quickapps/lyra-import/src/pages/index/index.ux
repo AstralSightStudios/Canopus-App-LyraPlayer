@@ -146,6 +146,8 @@ const TRACKS = ROOT + '/tracks'
 const LIBRARY = ROOT + '/library.json'
 const LIBRARY_TMP = ROOT + '/library.json.tmp'
 const LIBRARY_BACKUP = ROOT + '/library.json.backup'
+const DELETE_JOURNAL = ROOT + '/library-delete.pending.json'
+const DELETING = ROOT + '/deleting'
 const PHYSICAL_ROOT = '/data/files/com.canopus.lyraimport/lyra'
 const LEGACY_PHYSICAL_ROOT = '/data/quickapp/files/com.canopus.lyraimport/lyra'
 const PROTOCOL_VERSION = 2
@@ -214,7 +216,11 @@ export default {
       }
     })
     this.ensureDirectories()
-      .then(() => this.repairLibraryPaths())
+      .then(() => this.recoverPendingDelete())
+      .then((recovered) => {
+        if (!recovered) throw new Error('无法恢复未完成的音乐删除事务')
+        return this.repairLibraryPaths()
+      })
       .catch((error) => {
         this.statusText = '无法准备音乐库'
         this.detailText = String(error)
@@ -239,6 +245,9 @@ export default {
         return
       case 'lyra-library-move':
         await this.moveLibraryTrack(message)
+        return
+      case 'lyra-library-delete':
+        await this.deleteLibraryTrack(message)
         return
       case 'lyra-import-hello':
         this.send({
@@ -309,29 +318,88 @@ export default {
     }
   },
 
-  async moveLibraryTrack(message) {
+  async deleteLibraryTrack(message) {
     const trackId = Number(message.trackId)
-    if (message.version !== 1 || !this.validId(message.requestId) || this.active || !['up', 'down'].includes(message.direction) || typeof message.revision !== 'string' || !Number.isSafeInteger(trackId) || trackId <= 0) {
+    if (message.version !== 1 || !this.validId(message.requestId) || this.active || typeof message.revision !== 'string' || !Number.isSafeInteger(trackId) || trackId <= 0) {
       this.send({ tag: 'lyra-library-error', requestId: message.requestId || '', code: this.active ? 'busy' : 'invalid-request' })
       return
     }
+
     try {
+      if (!(await this.recoverPendingDelete())) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'io-error' })
+        return
+      }
       const library = await this.readLibraryStrict()
-      if (!library || message.revision !== this.libraryRevision(library)) {
-        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: library ? 'conflict' : 'invalid-library' })
+      if (!library) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'invalid-library' })
         return
       }
-      const from = library.tracks.findIndex((track) => Number(track.id) === trackId)
-      const to = message.direction === 'up' ? from - 1 : from + 1
-      if (from < 0 || to < 0 || to >= library.tracks.length) {
-        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'boundary' })
+      const currentRevision = this.libraryRevision(library)
+      if (message.revision !== currentRevision) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'conflict' })
         return
       }
-      const item = library.tracks[from]
-      library.tracks[from] = library.tracks[to]
-      library.tracks[to] = item
-      await this.publishLibrary(library)
-      this.send({ tag: 'lyra-library-moved', version: 1, requestId: message.requestId, revision: this.libraryRevision(library), trackId, from, to })
+      const target = this.validateDeleteTarget(library, trackId)
+      if (!target) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'invalid-library' })
+        return
+      }
+      if (!target.track) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'not-found' })
+        return
+      }
+
+      const nextLibrary = {
+        ...library,
+        tracks: library.tracks.filter((track) => Number(track.id) !== trackId)
+      }
+      const nextRevision = this.libraryRevision(nextLibrary)
+      const journal = {
+        version: 1,
+        transactionId: target.transactionId,
+        trackId,
+        oldRevision: currentRevision,
+        newRevision: nextRevision
+      }
+      await this.writeText(DELETE_JOURNAL, JSON.stringify(journal))
+      await this.publishLibraryForDelete(nextLibrary)
+
+      const source = TRACKS + '/' + target.transactionId
+      const quarantine = DELETING + '/' + target.transactionId
+      try {
+        if (await this.pathExists(quarantine)) {
+          throw new Error('delete quarantine already exists')
+        }
+        await this.move(source, quarantine)
+      } catch (error) {
+        try {
+          const sourceStillExists = await this.pathExists(source)
+          const quarantineStillExists = await this.pathExists(quarantine)
+          if (sourceStillExists && !quarantineStillExists) await this.restoreDeleteManifest()
+        } catch (_) {}
+        throw error
+      }
+
+      let cleanupPending = false
+      try {
+        await this.removeDirectoryStrict(quarantine)
+      } catch (_) {
+        cleanupPending = true
+      }
+      try {
+        await this.removeFileStrict(LIBRARY_BACKUP)
+      } catch (_) {
+        cleanupPending = true
+      }
+      if (!cleanupPending) {
+        try {
+          await this.removeFileStrict(DELETE_JOURNAL)
+        } catch (_) {
+          cleanupPending = true
+        }
+      }
+      this.send({ tag: 'lyra-library-deleted', version: 1, requestId: message.requestId, revision: nextRevision, trackId, cleanupPending })
     } catch (_) {
       this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'io-error' })
     }
@@ -369,6 +437,149 @@ export default {
       const library = JSON.parse(text)
       return library && library.version === 1 && Array.isArray(library.tracks) && library.tracks.every((track) => track && Number.isFinite(Number(track.id))) ? library : null
     } catch (_) { return null }
+  },
+
+  validateDeleteTarget(library, trackId) {
+    if (!library || library.version !== 1 || !Array.isArray(library.tracks)) return null
+    const seenIds = {}
+    const seenDirectories = {}
+    let target = null
+    let targetTransactionId = ''
+    for (const track of library.tracks) {
+      const id = Number(track && track.id)
+      if (!track || !Number.isSafeInteger(id) || id <= 0 || seenIds[id]) return null
+      seenIds[id] = true
+      const audio = this.parseLibraryPath(track.local_path, ['audio.mp3'])
+      if (!audio || seenDirectories[audio.transactionId]) return null
+      seenDirectories[audio.transactionId] = true
+      const album = track.album && typeof track.album === 'object' ? track.album : {}
+      const resources = [
+        { value: album.cover_url, names: ['cover.jpg', 'cover.jpeg', 'cover.png', 'cover.bin'] },
+        { value: album.background_url, names: ['background.bin'] },
+        { value: track.lyrics_path, names: ['lyrics.lrc', 'lyrics.json'] }
+      ]
+      for (const resource of resources) {
+        if (resource.value === undefined || resource.value === null || resource.value === '') continue
+        const parsed = this.parseLibraryPath(resource.value, resource.names)
+        if (!parsed || parsed.transactionId !== audio.transactionId) return null
+      }
+      if (id === trackId) {
+        target = track
+        targetTransactionId = audio.transactionId
+      }
+    }
+    return { track: target, transactionId: targetTransactionId }
+  },
+
+  parseLibraryPath(path, allowedNames) {
+    if (typeof path !== 'string' || !path || path.includes('\\') || /[\x00-\x1f\x7f]/.test(path)) return null
+    let relative = ''
+    const roots = [PHYSICAL_ROOT, LEGACY_PHYSICAL_ROOT]
+    for (const root of roots) {
+      if (path.startsWith(root + '/')) {
+        relative = path.slice(root.length + 1)
+        break
+      }
+    }
+    if (!relative) return null
+    const parts = relative.split('/')
+    if (parts.length !== 3 || parts[0] !== 'tracks' || !this.validId(parts[1]) || !allowedNames.includes(parts[2])) return null
+    return { transactionId: parts[1], fileName: parts[2] }
+  },
+
+  async recoverPendingDelete() {
+    const text = await this.readText(DELETE_JOURNAL)
+    if (!text) return true
+    let journal
+    try {
+      journal = JSON.parse(text)
+    } catch (_) {
+      return false
+    }
+    const trackId = Number(journal && journal.trackId)
+    if (!journal || journal.version !== 1 || !this.validId(journal.transactionId) || !Number.isSafeInteger(trackId) || trackId <= 0 || typeof journal.oldRevision !== 'string' || typeof journal.newRevision !== 'string') {
+      return false
+    }
+    const source = TRACKS + '/' + journal.transactionId
+    const quarantine = DELETING + '/' + journal.transactionId
+    const sourceExists = await this.pathExists(source)
+    const quarantineExists = await this.pathExists(quarantine)
+    if (sourceExists && quarantineExists) return false
+
+    const currentText = await this.readText(LIBRARY)
+    if (!currentText) {
+      const backup = await this.readText(LIBRARY_BACKUP)
+      if (!backup || (!sourceExists && !quarantineExists)) return false
+      await this.move(LIBRARY_BACKUP, LIBRARY)
+      if (!sourceExists && quarantineExists) await this.move(quarantine, source)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    const library = await this.readLibraryStrict()
+    if (!library) {
+      const backup = await this.readText(LIBRARY_BACKUP)
+      if (!backup || (!sourceExists && !quarantineExists)) return false
+      await this.removeFileStrict(LIBRARY)
+      await this.move(LIBRARY_BACKUP, LIBRARY)
+      if (!sourceExists && quarantineExists) await this.move(quarantine, source)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    const revision = this.libraryRevision(library)
+    const hasTarget = library.tracks.some((track) => Number(track.id) === trackId)
+    if (revision === journal.oldRevision && hasTarget) {
+      if (!sourceExists && quarantineExists) await this.move(quarantine, source)
+      else if (!sourceExists || quarantineExists) return false
+      await this.removeFileStrict(LIBRARY_BACKUP)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    if (revision !== journal.newRevision || hasTarget) return false
+    if (!sourceExists && !quarantineExists) {
+      await this.removeFileStrict(LIBRARY_BACKUP)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    if (sourceExists) await this.move(source, quarantine)
+    if (!(await this.pathExists(quarantine))) return false
+    try {
+      await this.removeDirectoryStrict(quarantine)
+    } catch (_) {
+      return false
+    }
+    await this.removeFileStrict(LIBRARY_BACKUP)
+    await this.removeFileStrict(DELETE_JOURNAL)
+    return true
+  },
+
+  async publishLibraryForDelete(library) {
+    await this.writeText(LIBRARY_TMP, JSON.stringify(library))
+    const hadLibrary = Boolean(await this.readText(LIBRARY))
+    await this.removeFileStrict(LIBRARY_BACKUP)
+    if (hadLibrary) {
+      await this.move(LIBRARY, LIBRARY_BACKUP)
+    } else {
+      await this.removeFileStrict(LIBRARY)
+    }
+    try {
+      await this.move(LIBRARY_TMP, LIBRARY)
+    } catch (error) {
+      if (hadLibrary) await this.move(LIBRARY_BACKUP, LIBRARY)
+      throw error
+    }
+  },
+
+  async restoreDeleteManifest() {
+    const backup = await this.readText(LIBRARY_BACKUP)
+    if (!backup) throw new Error('delete manifest backup missing')
+    let library
+    try {
+      library = JSON.parse(backup)
+    } catch (_) {
+      throw new Error('delete manifest backup invalid')
+    }
+    await this.publishLibrary(library)
+    await this.removeFileStrict(DELETE_JOURNAL)
   },
 
   async publishLibrary(library) {
@@ -769,6 +980,15 @@ export default {
     await this.mkdir(ROOT)
     await this.mkdir(STAGING)
     await this.mkdir(TRACKS)
+    await this.mkdir(DELETING)
+  },
+
+  pathExists(uri) {
+    return new Promise((resolve, reject) => file.access({
+      uri,
+      success: () => resolve(true),
+      fail: (data, code) => Number(code) === 301 ? resolve(false) : reject(new Error('access ' + code + ': ' + data))
+    }))
   },
 
   mkdir(uri) {
@@ -848,6 +1068,23 @@ export default {
 
   removeDirectory(uri) {
     return new Promise((resolve) => file.rmdir({ uri, recursive: true, success: resolve, fail: resolve }))
+  },
+
+  removeFileStrict(uri) {
+    return new Promise((resolve, reject) => file.delete({
+      uri,
+      success: resolve,
+      fail: (data, code) => Number(code) === 301 ? resolve() : reject(new Error('delete ' + code + ': ' + data))
+    }))
+  },
+
+  removeDirectoryStrict(uri) {
+    return new Promise((resolve, reject) => file.rmdir({
+      uri,
+      recursive: true,
+      success: resolve,
+      fail: (data, code) => Number(code) === 301 ? resolve() : reject(new Error('rmdir ' + code + ': ' + data))
+    }))
   }
 }
 </script>
