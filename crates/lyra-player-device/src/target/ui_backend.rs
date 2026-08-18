@@ -214,7 +214,16 @@ extern "C" fn refresh_timer(timer: *mut core::ffi::c_void) {
         if backend.active && backend.interactive {
             super::ui_maintenance_tick();
             let rendered_generation = backend.rendered_generation;
-            if super::rebuild_if_changed(page_index, rendered_generation) != 0 {
+            let force_player_refresh = page_index == PAGE_PLAYER
+                && super::runtime::runtime()
+                    .player_media_refresh_pending
+                    .swap(false, core::sync::atomic::Ordering::AcqRel);
+            let result = if force_player_refresh {
+                super::rebuild(page_index)
+            } else {
+                super::rebuild_if_changed(page_index, rendered_generation)
+            };
+            if result != 0 {
                 backend.refresh_failed = true;
             }
         }

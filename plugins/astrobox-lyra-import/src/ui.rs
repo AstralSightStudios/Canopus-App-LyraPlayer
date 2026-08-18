@@ -906,13 +906,6 @@ fn song_list(
             .flex()
             .flex_direction(ui::FlexDirection::Column)
             .gap(6);
-        if !song.cover_url.is_empty() {
-            item = item.child(
-                ui::Element::new(ui::ElementType::Image, Some(&song.cover_url))
-                    .width(56)
-                    .height(56),
-            );
-        }
         item = item
             .child(text(&song.name, 17, "#fafafa"))
             .child(text(&metadata, 13, "#a1a1aa"))
@@ -948,13 +941,6 @@ fn playlist_list(playlists: &[state::CloudPlaylist]) -> ui::Element {
             .flex()
             .flex_direction(ui::FlexDirection::Column)
             .gap(6);
-        if !playlist.cover_url.is_empty() {
-            item = item.child(
-                ui::Element::new(ui::ElementType::Image, Some(&playlist.cover_url))
-                    .width(56)
-                    .height(56),
-            );
-        }
         item = item
             .child(text(&playlist.name, 17, "#fafafa"))
             .child(text(&metadata, 13, "#a1a1aa"))

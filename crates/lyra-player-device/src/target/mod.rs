@@ -255,6 +255,9 @@ pub fn audio_service_tick() {
             && core.app.has_next()
         {
             effects.extend(core.app.update(Action::Next));
+            runtime()
+                .player_media_refresh_pending
+                .store(true, Ordering::Release);
         }
         if tick % 5 == 0 {
             if let Some(position_ms) = core.audio.playback_position_ms() {

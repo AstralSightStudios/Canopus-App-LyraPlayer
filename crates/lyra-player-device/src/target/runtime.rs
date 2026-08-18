@@ -43,6 +43,7 @@ pub struct Runtime {
     pub active_page: AtomicU32,
     pub timer_ticks: AtomicU32,
     pub library_poll_tick: AtomicU32,
+    pub player_media_refresh_pending: AtomicBool,
 }
 
 impl Runtime {
@@ -56,6 +57,7 @@ impl Runtime {
             active_page: AtomicU32::new(0),
             timer_ticks: AtomicU32::new(0),
             library_poll_tick: AtomicU32::new(0),
+            player_media_refresh_pending: AtomicBool::new(false),
         }
     }
 }

@@ -1070,20 +1070,22 @@ export default {
     return new Promise((resolve) => file.rmdir({ uri, recursive: true, success: resolve, fail: resolve }))
   },
 
-  removeFileStrict(uri) {
-    return new Promise((resolve, reject) => file.delete({
+  async removeFileStrict(uri) {
+    if (!(await this.pathExists(uri))) return
+    await new Promise((resolve, reject) => file.delete({
       uri,
       success: resolve,
-      fail: (data, code) => Number(code) === 301 ? resolve() : reject(new Error('delete ' + code + ': ' + data))
+      fail: (data, code) => reject(new Error('delete ' + code + ': ' + data))
     }))
   },
 
-  removeDirectoryStrict(uri) {
-    return new Promise((resolve, reject) => file.rmdir({
+  async removeDirectoryStrict(uri) {
+    if (!(await this.pathExists(uri))) return
+    await new Promise((resolve, reject) => file.rmdir({
       uri,
       recursive: true,
       success: resolve,
-      fail: (data, code) => Number(code) === 301 ? resolve() : reject(new Error('rmdir ' + code + ': ' + data))
+      fail: (data, code) => reject(new Error('rmdir ' + code + ': ' + data))
     }))
   }
 }

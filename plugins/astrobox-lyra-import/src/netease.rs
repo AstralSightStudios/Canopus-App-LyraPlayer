@@ -112,8 +112,6 @@ struct PlaylistWire {
     name: String,
     #[serde(default, alias = "trackCount")]
     track_count: u32,
-    #[serde(default, alias = "coverImgUrl")]
-    cover_url: String,
     #[serde(default)]
     creator: PlaylistCreatorWire,
 }
@@ -261,7 +259,6 @@ pub fn user_playlists(cookie: &str) -> Result<Vec<CloudPlaylist>, String> {
             name: playlist.name,
             creator: playlist.creator.nickname,
             track_count: playlist.track_count,
-            cover_url: playlist.cover_url,
         })
         .collect())
 }

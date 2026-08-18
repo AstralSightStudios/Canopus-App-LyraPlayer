@@ -1,7 +1,7 @@
 {
   "name": "Lyra音乐导入器",
   "icon": "icon.png",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "将本地MP3或网易云音乐中的资源通过Lyra Import快应用导入Lyra Player",
   "author": "Searchstars",
   "website": "",

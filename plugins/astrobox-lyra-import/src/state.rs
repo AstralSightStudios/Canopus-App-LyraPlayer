@@ -39,7 +39,6 @@ pub struct CloudPlaylist {
     pub name: String,
     pub creator: String,
     pub track_count: u32,
-    pub cover_url: String,
 }
 
 #[derive(Clone, Debug, Default)]
