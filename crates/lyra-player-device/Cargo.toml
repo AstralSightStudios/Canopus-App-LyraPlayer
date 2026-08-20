@@ -15,6 +15,7 @@ device = ["dep:canopus-target-private"]
 target-xiaomi-band-10-pro-3-101-030 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-030"]
 target-xiaomi-band-10-pro-3-101-036 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-036"]
 target-xiaomi-band-9-pro-3-1-175 = ["device", "canopus-target-private/target-xiaomi-band-9-pro-3-1-175"]
+target-xiaomi-band-10-pro-3-101-043 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-043"]
 
 [dependencies]
 lyra-player-core = { path = "../lyra-player-core", default-features = false }
