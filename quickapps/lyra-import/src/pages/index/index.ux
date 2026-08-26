@@ -19,7 +19,7 @@
         <text class="warning-text">音乐导入完成后请勿删除该快应用，删除该快应用也将一并删除导入的音乐。</text>
       </div>
 
-      <text class="hint">导入时请保持此页面打开</text>
+      <text class="hint">导入时请保持此页面打开、屏幕亮起</text>
     </div>
   </div>
 </template>
@@ -129,8 +129,8 @@
 }
 .hint {
   width: 300px;
-  color: #737373;
-  font-size: 13px;
+  color: #FF1100;
+  font-size: 16px;
   text-align: center;
   margin-top: 12px;
 }
@@ -139,6 +139,7 @@
 <script>
 import interconnect from '@system.interconnect'
 import file from '@system.file'
+import brightness from '@system.brightness'
 
 const ROOT = 'internal://files/lyra'
 const STAGING = ROOT + '/staging'
@@ -225,6 +226,9 @@ export default {
         this.statusText = '无法准备音乐库'
         this.detailText = String(error)
       })
+    brightness.setKeepScreenOn({
+        keepScreenOn: true
+    })
   },
 
   yieldEventLoop() {

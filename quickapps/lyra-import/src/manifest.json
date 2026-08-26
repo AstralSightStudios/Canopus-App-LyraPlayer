@@ -1,15 +1,16 @@
 {
   "package": "com.canopus.lyraimport",
   "name": "Lyra Import",
-  "versionName": "1.2.0",
-  "versionCode": 4,
+  "versionName": "1.2.2",
+  "versionCode": 6,
   "minPlatformVersion": 1200,
   "icon": "/common/logo.png",
   "simulationVersion": "default",
   "deviceTypeList": ["watch"],
   "features": [
     { "name": "system.interconnect" },
-    { "name": "system.file" }
+    { "name": "system.file" },
+    { "name": "system.brightness" }
   ],
   "config": {
     "logLevel": "log",

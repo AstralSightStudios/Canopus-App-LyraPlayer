@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds one production installer watchface containing exact payload pairs for
-# Xiaomi Band 10 Pro firmware 3.101.030, 3.101.036, and 3.101.043.
+# Xiaomi Band 10 Pro firmware 3.101.036 and 3.101.043.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -9,7 +9,6 @@ WATCHFACE=${CANOPUS_WATCHFACE_OUT:-"$ROOT/watchfaces/lyra-player-prod"}
 mkdir -p "$WATCHFACE"
 
 set -- \
-  xiaomi-band-10-pro-3.101.030 \
   xiaomi-band-10-pro-3.101.036 \
   xiaomi-band-10-pro-3.101.043
 for TARGET_ID do
@@ -40,7 +39,6 @@ for TARGET_ID do
 done
 
 python3 - "$ROOT" "$CANOPUS" "$WATCHFACE" \
-  xiaomi-band-10-pro-3.101.030 \
   xiaomi-band-10-pro-3.101.036 \
   xiaomi-band-10-pro-3.101.043 <<'PY'
 import hashlib

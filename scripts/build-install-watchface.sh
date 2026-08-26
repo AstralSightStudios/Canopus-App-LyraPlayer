@@ -5,7 +5,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CANOPUS=${CANOPUS_ROOT:-"$ROOT/../Canopus"}
-TARGET_ID=${CANOPUS_TARGET:-xiaomi-band-10-pro-3.101.030}
+TARGET_ID=${CANOPUS_TARGET:-xiaomi-band-10-pro-3.101.036}
 TARGET_PROFILE="$ROOT/targets/$TARGET_ID.env"
 [ -f "$TARGET_PROFILE" ] || {
     echo "error: unsupported module target: $TARGET_ID" >&2
@@ -80,6 +80,7 @@ printf '%s\n' "[2/4] link and verify relocatable module"
     -ffreestanding -fno-common -fno-builtin -fno-stack-protector \
     -fno-unwind-tables -fno-asynchronous-unwind-tables \
     -fdata-sections -ffunction-sections -Os -Wall -Wextra -Werror \
+    -DCANOPUS_STATIC_CANDIDATE="${CANOPUS_STATIC_CANDIDATE:-0}" \
     -c "$ROOT/crates/lyra-player-device/c_shim/canopus_ctor.c" \
     -o "$OUT/canopus_ctor.o"
 RUSTLIB="$ROOT/target/$TRIPLE/release/liblyra_player_device.a"
@@ -113,9 +114,16 @@ link_module "$PRELIM"
 if "$CANOPUS_CLI" verify "$PRELIM" \
     --target "$TARGET_ID" --targets-dir "$CANOPUS/targets" \
     >"$VERIFY_PRELIM" 2>&1; then
-    echo "error: preliminary link unexpectedly required no opaque-word encoding" >&2
-    exit 1
-fi
+    if [ "${CANOPUS_STATIC_CANDIDATE:-0}" = 1 ]; then
+        # Candidate backends contain no approved firmware callables, so there
+        # are no target-address words to encode. Keep the verified relocatable
+        # link as the final compile-only artifact.
+        cp "$PRELIM" "$FINAL"
+    else
+        echo "error: preliminary link unexpectedly required no opaque-word encoding" >&2
+        exit 1
+    fi
+else
 python3 "$ROOT/scripts/encode-opaque-words.py" generate \
     --verifier-output "$VERIFY_PRELIM" --output-c "$FIXUP_C" \
     --metadata "$FIXUP_JSON"
@@ -134,6 +142,7 @@ compile_fixups
 link_module "$FINAL" "$FIXUP_O"
 python3 "$ROOT/scripts/encode-opaque-words.py" patch \
     --elf "$FINAL" --metadata "$FIXUP_JSON"
+fi
 OBJCOPY=${RUST_OBJCOPY:-$(command -v rust-objcopy || find "$HOME/.rustup" -name rust-objcopy 2>/dev/null | head -1)}
 [ -n "$OBJCOPY" ] && [ -x "$OBJCOPY" ] || {
     echo "error: rust-objcopy is required to produce a bounded installer artifact" >&2

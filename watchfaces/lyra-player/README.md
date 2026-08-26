@@ -13,19 +13,16 @@ CMI1 Ed25519 签名的 Lyra Player ELF 和 receipt 写入
 
 ## 构建并签名
 
-默认构建 Band 10 Pro 3.101.030：
+默认构建 Band 10 Pro 3.101.036：
 
 ```sh
 scripts/build-install-watchface.sh
 ```
 
-选择其他已支持目标：
+选择另一个已支持目标：
 
 ```sh
-CANOPUS_TARGET=xiaomi-band-10-pro-3.101.036 \
-  scripts/build-install-watchface.sh
-
-CANOPUS_TARGET=xiaomi-band-9-pro-3.1.175 \
+CANOPUS_TARGET=xiaomi-band-10-pro-3.101.043 \
   scripts/build-install-watchface.sh
 ```
 
