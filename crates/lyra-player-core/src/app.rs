@@ -1,6 +1,23 @@
 use alloc::{string::String, vec::Vec};
 
-use crate::{Song, playback::Player};
+use crate::{
+    Song,
+    playback::{PlaybackMode, Player},
+};
+
+/// Rows the firmware list widget can hold on one library page.
+pub const LIBRARY_PAGE_SIZE: usize = 20;
+
+/// Cheap deterministic spread for shuffle. The device has no RNG we can rely
+/// on, so the step is derived from the track id and the library generation:
+/// stable within a generation, different after the library is rebuilt.
+fn shuffle_noise(id: u64, generation: u32) -> u32 {
+    let mut x = (id as u32) ^ generation.rotate_left(13) ^ ((id >> 32) as u32);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Route {
@@ -46,6 +63,12 @@ pub enum Action {
     Previous,
     Next,
     Tick(u32),
+    /// Advance the repeat/shuffle mode by one step.
+    CycleMode,
+    /// Move the library list one page forward (`true`) or back (`false`).
+    LibraryPage(bool),
+    /// The queue ran out with nothing left to play.
+    PlaybackExhausted,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +79,10 @@ pub struct LyraApp {
     pub player: Player,
     pub error: Option<String>,
     pub generation: u32,
+    pub mode: PlaybackMode,
+    /// Zero-based page of the library list; the list widget can only hold
+    /// `LIBRARY_PAGE_SIZE` rows at once.
+    pub library_page: usize,
 }
 
 impl Default for LyraApp {
@@ -67,6 +94,8 @@ impl Default for LyraApp {
             player: Player::default(),
             error: None,
             generation: 1,
+            mode: PlaybackMode::default(),
+            library_page: 0,
         }
     }
 }
@@ -131,6 +160,19 @@ impl LyraApp {
                 }
             }
             Action::Tick(ms) => self.player.tick(ms),
+            Action::CycleMode => self.mode = self.mode.next(),
+            Action::LibraryPage(forward) => {
+                let last = self.library_page_count().saturating_sub(1);
+                self.library_page = if forward {
+                    self.library_page.saturating_add(1).min(last)
+                } else {
+                    self.library_page.saturating_sub(1)
+                };
+            }
+            Action::PlaybackExhausted => {
+                self.player.clear();
+                self.player.state = crate::playback::PlaybackState::Finished;
+            }
         }
         self.touch();
         effects
@@ -144,13 +186,58 @@ impl LyraApp {
         self.adjacent_song(true).is_some()
     }
 
+    /// Number of library pages, at least one so an empty library still renders.
+    pub fn library_page_count(&self) -> usize {
+        self.local_tracks.len().div_ceil(LIBRARY_PAGE_SIZE).max(1)
+    }
+
+    /// The slice of the library shown on the current page.
+    pub fn library_page_songs(&self) -> &[Song] {
+        let start = self.library_page.saturating_mul(LIBRARY_PAGE_SIZE);
+        let end = start
+            .saturating_add(LIBRARY_PAGE_SIZE)
+            .min(self.local_tracks.len());
+        self.local_tracks.get(start..end).unwrap_or(&[])
+    }
+
+    /// Resolves a library row on the current page to its song.
+    pub fn library_song_at(&self, row: usize) -> Option<Song> {
+        self.library_page_songs().get(row).cloned()
+    }
+
     fn adjacent_song(&self, next: bool) -> Option<Song> {
         let id = self.player.current.as_ref()?.id;
         let index = self.local_tracks.iter().position(|song| song.id == id)?;
-        let adjacent = if next {
-            index.checked_add(1)?
-        } else {
-            index.checked_sub(1)?
+        let count = self.local_tracks.len();
+        if count == 0 {
+            return None;
+        }
+        let adjacent = match self.mode {
+            PlaybackMode::ListOnce => {
+                if next {
+                    index.checked_add(1)?
+                } else {
+                    index.checked_sub(1)?
+                }
+            }
+            PlaybackMode::RepeatAll => {
+                if next {
+                    (index + 1) % count
+                } else {
+                    (index + count - 1) % count
+                }
+            }
+            PlaybackMode::Shuffle => {
+                if count == 1 {
+                    return None;
+                }
+                // A whole shuffled ordering would have to survive library
+                // reloads and page changes; stepping to another track by a
+                // rotating offset keeps the queue stateless and never repeats
+                // the track that is already playing.
+                let step = 1 + (shuffle_noise(id, self.generation) as usize) % (count - 1);
+                (index + step) % count
+            }
         };
         self.local_tracks.get(adjacent).cloned()
     }

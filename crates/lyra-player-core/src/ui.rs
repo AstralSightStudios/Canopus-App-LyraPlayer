@@ -14,6 +14,11 @@ pub const EVENT_PREVIOUS: u32 = 5;
 pub const EVENT_NOW_PLAYING: u32 = 6;
 pub const EVENT_VOLUME_DOWN: u32 = 7;
 pub const EVENT_VOLUME_UP: u32 = 8;
+pub const EVENT_LIBRARY_PREV: u32 = 9;
+pub const EVENT_LIBRARY_NEXT: u32 = 10;
+pub const EVENT_MODE: u32 = 11;
+/// Song rows are the only events whose meaning depends on the library
+/// snapshot, so they are kept above every fixed-purpose event id.
 pub const EVENT_LOCAL_SONG_BASE: u32 = 1_000;
 pub const PLAYER_BACKGROUND_KEY: u32 = 39;
 pub const PLAYER_COVER_KEY: u32 = 40;
@@ -71,6 +76,13 @@ fn home(app: &LyraApp) -> Result<Snapshot, UiError> {
                 event: UiEvent(EVENT_LIBRARY),
                 enabled: true
             },
+            ActionRow {
+                key: 6,
+                label: "播放模式",
+                detail: app.mode.label(),
+                event: UiEvent(EVENT_MODE),
+                enabled: true
+            },
             Text {
                 key: 5,
                 text: "请通过 Lyra Import 快应用导入音乐",
@@ -90,6 +102,11 @@ fn library(app: &LyraApp) -> Result<Snapshot, UiError> {
     } else {
         "来自 Lyra Import 的音频与封面"
     };
+    let page_label = format!(
+        "第 {}/{} 页",
+        app.library_page + 1,
+        app.library_page_count()
+    );
     let view = view!(NavigationPage {
         key: 1,
         title: "本地音乐",
@@ -100,7 +117,21 @@ fn library(app: &LyraApp) -> Result<Snapshot, UiError> {
                 style: TextStyle::Description
             },
             SongRows {
-                songs: &app.local_tracks
+                songs: app.library_page_songs()
+            },
+            ActionRow {
+                key: 10,
+                label: "上一页",
+                detail: page_label.as_str(),
+                event: UiEvent(EVENT_LIBRARY_PREV),
+                enabled: app.library_page > 0
+            },
+            ActionRow {
+                key: 11,
+                label: "下一页",
+                detail: page_label.as_str(),
+                event: UiEvent(EVENT_LIBRARY_NEXT),
+                enabled: app.library_page + 1 < app.library_page_count()
             },
             ActionRow {
                 key: 3,
@@ -270,8 +301,10 @@ impl View<UiEvent> for CoverImage<'_> {
                 ..Layout::default()
             },
         )?;
-        let mut style = Style::default();
-        style.corner_radius = 24;
+        let style = Style {
+            corner_radius: 24,
+            ..Style::default()
+        };
         tree.set_style(PLAYER_COVER_KEY, style)
     }
 }
@@ -289,7 +322,7 @@ struct SongRows<'a> {
 }
 impl View<UiEvent> for SongRows<'_> {
     fn render(&self, tree: &mut Tree) -> Result<(), UiError> {
-        for (index, song) in self.songs.iter().take(20).enumerate() {
+        for (index, song) in self.songs.iter().enumerate() {
             let artist = song.artist_line();
             tree.action_row(
                 100 + index as u32,
@@ -325,6 +358,7 @@ fn playback_label(state: PlaybackState) -> &'static str {
         PlaybackState::Paused => "已暂停",
         PlaybackState::Draining => "即将结束",
         PlaybackState::Failed => "播放失败",
+        PlaybackState::Finished => "无可播放歌曲",
     }
 }
 
@@ -341,6 +375,151 @@ mod tests {
             let snapshot = render(&app).unwrap();
             assert_eq!(snapshot.nodes[0].kind(), Some(NodeKind::NavigationPage));
         }
+    }
+
+    fn library_of(count: usize) -> LyraApp {
+        LyraApp {
+            route: Route::Library,
+            local_tracks: (0..count)
+                .map(|index| Song {
+                    id: index as u64 + 1,
+                    name: alloc::format!("track {index}"),
+                    ..Song::default()
+                })
+                .collect(),
+            ..LyraApp::default()
+        }
+    }
+
+    fn row_enabled(app: &LyraApp, event: u32) -> bool {
+        let snapshot = render(app).unwrap();
+        snapshot
+            .nodes
+            .iter()
+            .take(snapshot.node_count as usize)
+            .find(|node| node.event_id == event)
+            .map(|node| node.enabled())
+            .unwrap_or_else(|| panic!("no row carries event {event}"))
+    }
+
+    fn row_count(app: &LyraApp) -> usize {
+        let snapshot = render(app).unwrap();
+        snapshot
+            .nodes
+            .iter()
+            .take(snapshot.node_count as usize)
+            .filter(|node| {
+                matches!(
+                    node.kind(),
+                    Some(NodeKind::ActionRow)
+                        | Some(NodeKind::StatusRow)
+                        | Some(NodeKind::Button)
+                        | Some(NodeKind::SwitchRow)
+                )
+            })
+            .count()
+    }
+
+    /// The renderer refuses a snapshot with more rows than the firmware backend
+    /// can hold (`UI_MAX_ROWS`, 25), and a full library page plus its own
+    /// navigation rows is the widest page the app builds.
+    #[test]
+    fn a_full_library_page_stays_within_the_firmware_row_budget() {
+        const UI_MAX_ROWS: usize = 25;
+        for count in [0, 1, crate::LIBRARY_PAGE_SIZE, crate::LIBRARY_PAGE_SIZE * 3] {
+            let mut app = library_of(count);
+            for page in 0..app.library_page_count() {
+                app.library_page = page;
+                assert!(
+                    row_count(&app) <= UI_MAX_ROWS,
+                    "library page {page} of {count} tracks renders {} rows",
+                    row_count(&app)
+                );
+            }
+        }
+        let mut home = library_of(crate::LIBRARY_PAGE_SIZE * 3);
+        home.route = Route::Home;
+        assert!(row_count(&home) <= UI_MAX_ROWS);
+    }
+
+    /// Row events carry the index within the current page, so the same event id
+    /// must resolve to a different song once the page moves.
+    #[test]
+    fn song_rows_are_addressed_within_the_current_page() {
+        let mut app = library_of(crate::LIBRARY_PAGE_SIZE * 2 + 3);
+        assert_eq!(app.library_page_count(), 3);
+
+        assert_eq!(app.library_song_at(0).unwrap().name, "track 0");
+        app.update(crate::Action::LibraryPage(true));
+        assert_eq!(app.library_page, 1);
+        assert_eq!(
+            app.library_song_at(0).unwrap().name,
+            alloc::format!("track {}", crate::LIBRARY_PAGE_SIZE)
+        );
+        // The last page is short; rows past its end must resolve to nothing.
+        app.update(crate::Action::LibraryPage(true));
+        assert_eq!(app.library_page, 2);
+        assert_eq!(app.library_page_songs().len(), 3);
+        assert!(app.library_song_at(3).is_none());
+
+        // Paging clamps at both ends, and the rows that would do nothing are
+        // rendered disabled rather than looking pressable.
+        app.update(crate::Action::LibraryPage(true));
+        assert_eq!(app.library_page, 2);
+        assert!(!row_enabled(&app, EVENT_LIBRARY_NEXT));
+        assert!(row_enabled(&app, EVENT_LIBRARY_PREV));
+
+        for _ in 0..5 {
+            app.update(crate::Action::LibraryPage(false));
+        }
+        assert_eq!(app.library_page, 0);
+        assert!(!row_enabled(&app, EVENT_LIBRARY_PREV));
+        assert!(row_enabled(&app, EVENT_LIBRARY_NEXT));
+
+        // A library that fits on one page offers neither direction.
+        let single = library_of(2);
+        assert!(!row_enabled(&single, EVENT_LIBRARY_PREV));
+        assert!(!row_enabled(&single, EVENT_LIBRARY_NEXT));
+    }
+
+    #[test]
+    fn exhausting_the_queue_reports_nothing_left_to_play() {
+        let mut app = library_of(1);
+        app.update(crate::Action::SelectSong(app.local_tracks[0].clone()));
+        app.player.state = PlaybackState::Draining;
+        assert_eq!(playback_label(app.player.state), "即将结束");
+
+        app.update(crate::Action::PlaybackExhausted);
+        assert_eq!(app.player.state, PlaybackState::Finished);
+        assert!(app.player.current.is_none());
+        assert_eq!(playback_label(app.player.state), "无可播放歌曲");
+    }
+
+    #[test]
+    fn cycling_the_mode_is_shown_on_home_and_returns_to_the_start() {
+        let mut app = library_of(3);
+        app.route = Route::Home;
+        let first = app.mode.label();
+        let mut seen = alloc::vec![first];
+        for _ in 0..2 {
+            app.update(crate::Action::CycleMode);
+            let snapshot = render(&app).unwrap();
+            assert!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .take(snapshot.node_count as usize)
+                    .any(|node| snapshot.secondary(node) == app.mode.label()),
+                "home must show {}",
+                app.mode.label()
+            );
+            seen.push(app.mode.label());
+        }
+        app.update(crate::Action::CycleMode);
+        assert_eq!(app.mode.label(), first);
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "each mode must have a distinct label");
     }
 
     #[test]

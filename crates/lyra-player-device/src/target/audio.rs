@@ -8,7 +8,7 @@ use canopus_target_private::{
     O_RDONLY, O_RDWR, canopus_fw_clock_gettime, get_errno, nuttx_close, nuttx_ioctl, nuttx_lseek,
     nuttx_open, nuttx_read, nuttx_write, stock_timespec_t,
 };
-use lyra_player_core::playback::{AudioSink, Player};
+use lyra_player_core::playback::{AudioSink, MediaControl, Player};
 
 use super::storage;
 
@@ -23,6 +23,10 @@ const IOC_DRAIN: u32 = 0x30D;
 const IOC_GET_STATUS: u32 = 0x30F;
 const IOC_SET_VOLUME: u32 = 0x310;
 const IOC_GET_VOLUME: u32 = 0x311;
+const CONTROL_PLAY: u32 = 1;
+const CONTROL_PAUSE: u32 = 2;
+const CONTROL_NEXT: u32 = 3;
+const CONTROL_PREVIOUS: u32 = 4;
 const AUDIO_STATE_CONFIGURED: u32 = 2;
 const AUDIO_STATE_BUFFERING: u32 = 3;
 const AUDIO_STATE_PLAYING: u32 = 4;
@@ -47,6 +51,7 @@ const STAGE_IOCTL_STOP: u8 = 5;
 const STAGE_IOCTL_SET_FORMAT: u8 = 6;
 const STAGE_IOCTL_START: u8 = 7;
 const STAGE_IOCTL_OTHER: u8 = 8;
+const STAGE_AUDIO_CONTROL: u8 = 9;
 
 fn monotonic_ms() -> Option<u64> {
     let mut time = stock_timespec_t {
@@ -77,6 +82,18 @@ fn neg_errno(raw: i32) -> i32 {
         }
     }
     raw
+}
+
+/// `struct canopus_audio_control_event_v1` from the module's `canopus_audio.h`.
+/// A read of `/dev/canopus_audio` pops one headset gesture off the module's
+/// control queue.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct ControlEventV1 {
+    struct_size: u32,
+    kind: u32,
+    sequence: u32,
+    reserved: u32,
 }
 
 #[repr(C)]
@@ -332,12 +349,54 @@ impl AudioDevice {
             STAGE_IOCTL_SET_FORMAT => "ioctl_set_format",
             STAGE_IOCTL_START => "ioctl_start",
             STAGE_IOCTL_OTHER => "ioctl_other",
+            STAGE_AUDIO_CONTROL => "audio_control",
             _ => "audio",
         }
     }
 
     pub fn failure_stage(&self) -> &'static str {
         Self::stage_name(self.last_stage)
+    }
+
+    /// Pops one headset gesture off the module's control queue, if any.
+    ///
+    /// The queue only exists once the device is open, and the app must not
+    /// force it open just to poll: a closed fd simply means no AVRCP session
+    /// is feeding us, so report "nothing pending" rather than an error. An
+    /// empty queue answers `EAGAIN`, which is the steady state on almost every
+    /// tick and must not be recorded as a failure.
+    pub fn poll_headset_control(&mut self) -> Result<Option<MediaControl>, i32> {
+        if self.fd < 0 {
+            return Ok(None);
+        }
+        let mut event = ControlEventV1::default();
+        let count = unsafe {
+            nuttx_read(
+                self.fd,
+                core::ptr::addr_of_mut!(event).cast::<c_void>(),
+                core::mem::size_of::<ControlEventV1>() as u32,
+            )
+        };
+        if count < 0 {
+            let error = neg_errno(count);
+            if error == EAGAIN {
+                return Ok(None);
+            }
+            self.last_stage = STAGE_AUDIO_CONTROL;
+            return Err(error);
+        }
+        if count as usize != core::mem::size_of::<ControlEventV1>() {
+            self.last_stage = STAGE_AUDIO_CONTROL;
+            return Err(EIO);
+        }
+        Ok(match event.kind {
+            CONTROL_PLAY => Some(MediaControl::Play),
+            CONTROL_PAUSE => Some(MediaControl::Pause),
+            CONTROL_NEXT => Some(MediaControl::Next),
+            CONTROL_PREVIOUS => Some(MediaControl::Previous),
+            // A newer module may add kinds; ignoring them keeps the queue draining.
+            _ => None,
+        })
     }
 
     fn ioctl_value(&mut self, command: u32, argument: usize) -> Result<(), i32> {

@@ -11,7 +11,50 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Draining,
+    /// The queue played through to the end and nothing else is available.
+    /// Distinct from `Idle`, which is the state before anything was chosen.
+    Finished,
     Failed,
+}
+
+/// How the player picks the track that follows the current one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaybackMode {
+    /// Play the library in order and stop after the last track.
+    #[default]
+    ListOnce,
+    /// Play in order and wrap around at either end.
+    RepeatAll,
+    /// Pick another track pseudo-randomly.
+    Shuffle,
+}
+
+impl PlaybackMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::ListOnce => Self::RepeatAll,
+            Self::RepeatAll => Self::Shuffle,
+            Self::Shuffle => Self::ListOnce,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ListOnce => "列表播放",
+            Self::RepeatAll => "循环播放",
+            Self::Shuffle => "随机播放",
+        }
+    }
+}
+
+/// A media control a headset gesture asked for, as delivered by the
+/// BluetoothAudio module's control-event queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaControl {
+    Play,
+    Pause,
+    Next,
+    Previous,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +180,25 @@ impl Player {
         Ok(true)
     }
 
+    /// Whether a headset play/pause gesture would change anything right now.
+    ///
+    /// A headset asks for an absolute state rather than a toggle, so a gesture
+    /// that matches what the player is already doing is ignored instead of
+    /// bouncing playback. Track changes are not decided here; they depend on
+    /// the queue and belong to the app.
+    pub fn transport_control_applies(&self, control: MediaControl) -> bool {
+        match control {
+            MediaControl::Play => self.state == PlaybackState::Paused,
+            MediaControl::Pause => {
+                matches!(
+                    self.state,
+                    PlaybackState::Playing | PlaybackState::Buffering
+                )
+            }
+            MediaControl::Next | MediaControl::Previous => false,
+        }
+    }
+
     pub fn toggle<S: AudioSink>(&mut self, sink: &mut S) -> Result<(), S::Error> {
         match self.state {
             PlaybackState::Playing | PlaybackState::Buffering => {
@@ -228,6 +290,92 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headset_play_applies_only_to_a_paused_stream() {
+        let mut player = Player::default();
+        for state in [
+            PlaybackState::Idle,
+            PlaybackState::Resolving,
+            PlaybackState::Buffering,
+            PlaybackState::Playing,
+            PlaybackState::Draining,
+            PlaybackState::Failed,
+            PlaybackState::Finished,
+        ] {
+            player.state = state;
+            assert!(
+                !player.transport_control_applies(MediaControl::Play),
+                "play must not act in {state:?}"
+            );
+        }
+        player.state = PlaybackState::Paused;
+        assert!(player.transport_control_applies(MediaControl::Play));
+    }
+
+    #[test]
+    fn headset_pause_applies_only_while_audio_is_running() {
+        let mut player = Player::default();
+        for state in [PlaybackState::Playing, PlaybackState::Buffering] {
+            player.state = state;
+            assert!(
+                player.transport_control_applies(MediaControl::Pause),
+                "pause must act in {state:?}"
+            );
+        }
+        for state in [
+            PlaybackState::Idle,
+            PlaybackState::Resolving,
+            PlaybackState::Paused,
+            PlaybackState::Draining,
+            PlaybackState::Failed,
+            PlaybackState::Finished,
+        ] {
+            player.state = state;
+            assert!(
+                !player.transport_control_applies(MediaControl::Pause),
+                "pause must not act in {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_headset_gesture_is_idempotent_through_toggle() {
+        let mut sink = ShortSink {
+            max_write: 16,
+            ..ShortSink::default()
+        };
+        let mut player = Player {
+            state: PlaybackState::Playing,
+            ..Player::default()
+        };
+
+        assert!(player.transport_control_applies(MediaControl::Pause));
+        player.toggle(&mut sink).unwrap();
+        assert_eq!(player.state, PlaybackState::Paused);
+        // A second pause gesture must be ignored rather than resuming.
+        assert!(!player.transport_control_applies(MediaControl::Pause));
+
+        assert!(player.transport_control_applies(MediaControl::Play));
+        player.toggle(&mut sink).unwrap();
+        assert_eq!(player.state, PlaybackState::Playing);
+        assert!(!player.transport_control_applies(MediaControl::Play));
+    }
+
+    #[test]
+    fn track_change_gestures_are_not_decided_by_the_player() {
+        let mut player = Player::default();
+        for state in [
+            PlaybackState::Playing,
+            PlaybackState::Paused,
+            PlaybackState::Idle,
+            PlaybackState::Finished,
+        ] {
+            player.state = state;
+            assert!(!player.transport_control_applies(MediaControl::Next));
+            assert!(!player.transport_control_applies(MediaControl::Previous));
+        }
+    }
 
     #[derive(Default)]
     struct ShortSink {

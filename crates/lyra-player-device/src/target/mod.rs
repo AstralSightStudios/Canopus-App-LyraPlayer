@@ -3,7 +3,11 @@
 
 use core::sync::atomic::Ordering;
 
-use lyra_player_core::{Action, Effect, Route, playback::PlaybackState, ui};
+use lyra_player_core::{
+    Action, Effect, Route,
+    playback::{MediaControl, PlaybackState},
+    ui,
+};
 
 use runtime::{initialized, runtime, try_with_core, with_core};
 
@@ -133,14 +137,15 @@ pub fn handle_back(page_index: usize) {
 
 pub fn handle_ui_event(page_index: usize, generation: u32, _key: u32, event_id: u32) {
     if event_id == ui::EVENT_BACK {
-        let valid = with_core(|core| core.app.generation == generation);
+        let valid =
+            with_core(|core| core.app.generation == generation || event_survives_restale(event_id));
         if valid {
             handle_back(page_index);
         }
         return;
     }
     let effects = with_core(|core| {
-        if core.app.generation != generation {
+        if core.app.generation != generation && !event_survives_restale(event_id) {
             return None;
         }
         if event_id == ui::EVENT_TOGGLE {
@@ -166,16 +171,37 @@ pub fn handle_ui_event(page_index: usize, generation: u32, _key: u32, event_id: 
     let _ = rebuild(page_index);
 }
 
+/// Whether an event still means the same thing after the render generation has
+/// moved on.
+///
+/// The audio pump bumps `generation` on nearly every tick, so a binding
+/// captured at render time is stale within milliseconds and the press would be
+/// dropped. Only events that index into the library snapshot (the song rows)
+/// actually depend on that generation; the fixed-purpose events -- back, open
+/// library, toggle, next/previous, now-playing, volume -- mean the same thing
+/// whatever the library looks like, so a stale generation must not swallow
+/// them.
+fn event_survives_restale(event_id: u32) -> bool {
+    event_id < ui::EVENT_LOCAL_SONG_BASE
+}
+
 fn action_for_event(app: &lyra_player_core::LyraApp, event_id: u32) -> Option<Action> {
     match event_id {
         ui::EVENT_LIBRARY => Some(Action::Open(Route::Library)),
         ui::EVENT_PREVIOUS => Some(Action::Previous),
         ui::EVENT_NEXT => Some(Action::Next),
         ui::EVENT_NOW_PLAYING => Some(Action::Open(Route::Player)),
-        event if (ui::EVENT_LOCAL_SONG_BASE..ui::EVENT_LOCAL_SONG_BASE + 20).contains(&event) => {
-            app.local_tracks
-                .get((event - ui::EVENT_LOCAL_SONG_BASE) as usize)
-                .cloned()
+        ui::EVENT_LIBRARY_PREV => Some(Action::LibraryPage(false)),
+        ui::EVENT_LIBRARY_NEXT => Some(Action::LibraryPage(true)),
+        ui::EVENT_MODE => Some(Action::CycleMode),
+        // Song rows carry the row index on the *current page*, not the index
+        // into the whole library, so they must be resolved through the page.
+        event
+            if (ui::EVENT_LOCAL_SONG_BASE
+                ..ui::EVENT_LOCAL_SONG_BASE + lyra_player_core::LIBRARY_PAGE_SIZE as u32)
+                .contains(&event) =>
+        {
+            app.library_song_at((event - ui::EVENT_LOCAL_SONG_BASE) as usize)
                 .map(Action::SelectSong)
         }
         _ => None,
@@ -190,10 +216,46 @@ fn route_page(route: Route) -> usize {
     }
 }
 
+/// The module's control queue holds this many records and drops the newest
+/// when full, so draining exactly that many per tick can never leave a gesture
+/// stranded, while still bounding the work one tick may do.
+const MAX_HEADSET_CONTROLS_PER_TICK: usize = 8;
+
+/// Turns AVRCP gestures from the headset into the same actions the on-screen
+/// controls produce.
+///
+/// Play/pause is routed through the player's own transport rule rather than
+/// applied blindly: the headset repeats a gesture whenever it is unsure of our
+/// state, and toggling on a repeat would invert playback instead of confirming
+/// it. Track changes are the app's decision, not the player's, so they go
+/// straight to `update`.
+fn apply_headset_controls(core: &mut runtime::Core, effects: &mut alloc::vec::Vec<Effect>) {
+    for _ in 0..MAX_HEADSET_CONTROLS_PER_TICK {
+        let control = match core.audio.poll_headset_control() {
+            Ok(Some(control)) => control,
+            Ok(None) => return,
+            Err(error) => {
+                runtime().last_error.store(error, Ordering::Release);
+                return;
+            }
+        };
+        match control {
+            MediaControl::Play | MediaControl::Pause => {
+                if core.app.player.transport_control_applies(control) {
+                    core.pending_audio = Some(runtime::PendingAudioCommand::Toggle);
+                }
+            }
+            MediaControl::Next => effects.extend(core.app.update(Action::Next)),
+            MediaControl::Previous => effects.extend(core.app.update(Action::Previous)),
+        }
+    }
+}
+
 pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
     let effects = try_with_core(|core| {
         let mut effects = alloc::vec::Vec::new();
+        apply_headset_controls(core, &mut effects);
         if let Some(command) = core.pending_audio.take() {
             match command {
                 runtime::PendingAudioCommand::Stream(path) => {
@@ -250,11 +312,15 @@ pub fn audio_service_tick() {
             runtime().last_error.store(error, Ordering::Release);
             return effects;
         }
-        if core.app.player.state == PlaybackState::Draining
-            && !core.audio.local_is_open()
-            && core.app.has_next()
-        {
-            effects.extend(core.app.update(Action::Next));
+        if core.app.player.state == PlaybackState::Draining && !core.audio.local_is_open() {
+            if core.app.has_next() {
+                effects.extend(core.app.update(Action::Next));
+            } else {
+                // Nothing follows. Without this the player would sit in
+                // Draining forever and the home row would keep advertising the
+                // last track as "即将结束" long after the audio stopped.
+                effects.extend(core.app.update(Action::PlaybackExhausted));
+            }
             runtime()
                 .player_media_refresh_pending
                 .store(true, Ordering::Release);

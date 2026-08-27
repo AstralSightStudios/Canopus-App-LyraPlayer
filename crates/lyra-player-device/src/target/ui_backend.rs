@@ -20,14 +20,16 @@ const PLAYER_MEDIA_TOP: i32 = 72;
 const PLAYER_TITLE_TOP: i32 = 270;
 const PLAYER_AUTHOR_TOP: i32 = 318;
 const PLAYER_CONTROL_TOP: i32 = 382;
-#[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
+/// The player title is pinned to a single line and scrolled. Letting it wrap
+/// pushed a long name down into the author line at `PLAYER_AUTHOR_TOP`, so the
+/// two overlapped.
+const PLAYER_TITLE_HEIGHT: i32 = 44;
+/// Scale factors for `lvx_image_set_scale`, where 256 is 1:1. The control
+/// icons are drawn into a fixed 64x64 object and scaled, never resized: an
+/// LVGL image clips to its object box instead of fitting to it, so shrinking
+/// the object crops the icon on all four sides.
 const PLAYER_CONTROL_SIZE: i32 = 192;
-#[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
 const PLAYER_CONTROL_PRESSED_SIZE: i32 = 100;
-#[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-const PLAYER_CONTROL_SIZE: i32 = 44;
-#[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-const PLAYER_CONTROL_PRESSED_SIZE: i32 = 40;
 const CONTROL_ANIMATION_PERIOD_MS: u32 = 16;
 const CONTROL_ANIMATION_STEPS: u32 = 8;
 const ROW_IMAGE_BUTTON: u8 = 4;
@@ -55,7 +57,6 @@ struct PageBackend {
     page_title: *mut core::ffi::c_void,
     refresh_timer: *mut core::ffi::c_void,
     rows: [*mut core::ffi::c_void; UI_MAX_ROWS],
-    #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
     control_images: [*mut core::ffi::c_void; UI_MAX_ROWS],
     labels: [*mut core::ffi::c_void; UI_MAX_LABELS],
     images: [*mut core::ffi::c_void; 2],
@@ -96,7 +97,6 @@ const fn empty_backend() -> PageBackend {
         page_title: core::ptr::null_mut(),
         refresh_timer: core::ptr::null_mut(),
         rows: [core::ptr::null_mut(); UI_MAX_ROWS],
-        #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
         control_images: [core::ptr::null_mut(); UI_MAX_ROWS],
         labels: [core::ptr::null_mut(); UI_MAX_LABELS],
         images: [core::ptr::null_mut(); 2],
@@ -377,18 +377,13 @@ fn control_x_offset(key: u32) -> i32 {
     }
 }
 
+/// The object that carries the icon. It is always distinct from the hitbox:
+/// the hitbox is a stock list row (the only widget class confirmed to receive
+/// touch on this firmware) and the icon is a plain image parked on top of it.
 fn control_visual(backend: &PageBackend, slot: usize) -> *mut core::ffi::c_void {
-    #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
-    {
-        backend.control_images[slot]
-    }
-    #[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-    {
-        backend.rows[slot]
-    }
+    backend.control_images[slot]
 }
 
-#[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
 unsafe fn set_control_image_scale(image: *mut core::ffi::c_void, key: u32, scale: i32) {
     unsafe {
         lvx_object_set_size(image, 64, 64);
@@ -402,7 +397,6 @@ unsafe fn set_control_image_scale(image: *mut core::ffi::c_void, key: u32, scale
     }
 }
 
-#[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
 unsafe fn set_control_hitbox_geometry(object: *mut core::ffi::c_void, key: u32) {
     unsafe {
         lvx_object_set_size(object, 64, 64);
@@ -416,20 +410,7 @@ unsafe fn set_control_hitbox_geometry(object: *mut core::ffi::c_void, key: u32) 
 }
 
 unsafe fn set_control_geometry_size(object: *mut core::ffi::c_void, key: u32, size: i32) {
-    unsafe {
-        #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
-        {
-            set_control_image_scale(object, key, size);
-        }
-        #[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-        lvx_object_set_size(object, size, size);
-        lvx_object_align(
-            object,
-            ALIGN_TOP_MID,
-            control_x_offset(key),
-            PLAYER_CONTROL_TOP,
-        );
-    }
+    unsafe { set_control_image_scale(object, key, size) };
 }
 
 unsafe fn set_control_geometry(object: *mut core::ffi::c_void, key: u32, pressed: bool) {
@@ -501,7 +482,13 @@ fn start_control_animation(page_index: usize, slot: usize, pressed: bool) {
         return;
     }
     if backend.anim_timers[slot].is_null() {
-        unsafe { set_control_geometry(backend.rows[slot], backend.row_keys[slot], pressed) };
+        unsafe {
+            set_control_geometry(
+                control_visual(backend, slot),
+                backend.row_keys[slot],
+                pressed,
+            )
+        };
         return;
     }
     let target = if pressed {
@@ -538,22 +525,7 @@ extern "C" fn image_button_event(event: *mut core::ffi::c_void) {
         EVENT_RELEASED | EVENT_PRESS_LOST | EVENT_CLICKED => {
             start_control_animation(page_index, slot, false)
         }
-        _ => return,
-    }
-    if code != EVENT_CLICKED {
-        return;
-    }
-    #[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-    {
-        let binding = backend.bindings[slot];
-        if binding.event_id != 0 && binding.enabled {
-            super::handle_ui_event(
-                page_index,
-                binding.generation,
-                binding.key,
-                binding.event_id,
-            );
-        }
+        _ => {}
     }
 }
 
@@ -955,13 +927,23 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     if created_now && is_player_label {
                         lvx_label_set_text_align_center(object);
                     }
+                    if created_now && is_player_title {
+                        // Circular scroll needs a fixed width to scroll within,
+                        // which the explicit set_size below provides.
+                        lvx_label_set_long_mode(object, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                    }
                     lvx_label_set_text(object, primary.as_ptr());
                     if is_player_author {
                         apply_author_misans(object);
                     } else {
                         apply_misans(object);
                     }
-                    lvx_object_set_size(object, label_width, wrapped_label_height(primary));
+                    let height = if is_player_title {
+                        PLAYER_TITLE_HEIGHT
+                    } else {
+                        wrapped_label_height(primary)
+                    };
+                    lvx_object_set_size(object, label_width, height);
                 }
                 backend.label_hashes[label_used as usize] = label_hash;
             }
@@ -1113,49 +1095,35 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 None => return -1,
             };
             let mut object = backend.rows[slot];
-            #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
             let mut image = backend.control_images[slot];
             let created_now = object.is_null();
             if created_now {
                 let cookie = encoded_cookie(page_index, slot) as *mut core::ffi::c_void;
-                #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
-                {
-                    // Use the stock list-row class as the hitbox. Its event
-                    // path is the only one confirmed to receive touch input
-                    // on this firmware.
-                    object = unsafe {
-                        lvx_list_row_create(
-                            backend.content_root,
-                            EMPTY_TEXT.as_ptr(),
-                            EMPTY_TEXT.as_ptr(),
-                            TRAILING_NONE,
-                        )
-                    };
-                    if object.is_null() {
-                        return -1;
-                    }
-                    image = unsafe { lvx_image_create(backend.content_root) };
-                    if image.is_null() {
-                        return -1;
-                    }
-                    backend.control_images[slot] = image;
-                    unsafe {
-                        lvx_object_move_to_index(object, 0);
-                        lvx_event_add(object, row_event, EVENT_CLICKED, cookie);
-                        lvx_event_add(object, image_button_event, EVENT_ALL, cookie);
-                    }
+                // Use the stock list-row class as the hitbox. Its event path
+                // is the only one confirmed to receive touch input on this
+                // firmware; a bare image with LV_OBJ_FLAG_CLICKABLE never sees
+                // a press, which is why the controls were dead everywhere the
+                // image was also the button.
+                object = unsafe {
+                    lvx_list_row_create(
+                        backend.content_root,
+                        EMPTY_TEXT.as_ptr(),
+                        EMPTY_TEXT.as_ptr(),
+                        TRAILING_NONE,
+                    )
+                };
+                if object.is_null() {
+                    return -1;
                 }
-                #[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-                {
-                    object = unsafe { lvx_image_create(backend.content_root) };
-                    if object.is_null() {
-                        return -1;
-                    }
-                    let _ = cookie;
-                    unsafe {
-                        lvx_object_add_flag(object, LV_OBJ_FLAG_CLICKABLE);
-                        lvx_event_add(object, image_button_event, EVENT_ALL, cookie);
-                    }
+                image = unsafe { lvx_image_create(backend.content_root) };
+                if image.is_null() {
+                    return -1;
+                }
+                backend.control_images[slot] = image;
+                unsafe {
+                    lvx_object_move_to_index(object, 0);
+                    lvx_event_add(object, row_event, EVENT_CLICKED, cookie);
+                    lvx_event_add(object, image_button_event, EVENT_ALL, cookie);
                 }
                 backend.rows[slot] = object;
                 backend.row_kinds[slot] = ROW_IMAGE_BUTTON;
@@ -1180,33 +1148,20 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     Some(icon) => icon,
                     None => return -1,
                 };
-                #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
                 unsafe {
                     lvx_image_set_src(image, icon.as_ptr().cast());
-                }
-                #[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-                unsafe {
-                    lvx_image_set_src(object, icon.as_ptr().cast());
                 }
                 backend.row_hashes[slot] = content_hash;
             }
             unsafe {
-                #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
-                {
-                    set_control_hitbox_geometry(object, node.key);
-                    set_control_geometry_size(image, node.key, backend.anim_sizes[slot]);
-                    // Keep the proven stock-row hitbox behind the page background.
-                    // This avoids mutating the row's local style while preserving its
-                    // firmware-backed touch path.
-                    lvx_object_move_to_index(object, 0);
-                    lvx_set_hidden(object, 0);
-                    lvx_set_hidden(image, 0);
-                }
-                #[cfg(not(feature = "target-xiaomi-band-10-pro-3-101-036"))]
-                {
-                    set_control_geometry_size(object, node.key, backend.anim_sizes[slot]);
-                    lvx_set_hidden(object, 0);
-                }
+                set_control_hitbox_geometry(object, node.key);
+                set_control_geometry_size(image, node.key, backend.anim_sizes[slot]);
+                // Keep the proven stock-row hitbox behind the page background.
+                // This avoids mutating the row's local style while preserving its
+                // firmware-backed touch path.
+                lvx_object_move_to_index(object, 0);
+                lvx_set_hidden(object, 0);
+                lvx_set_hidden(image, 0);
             }
             backend.bindings[slot] = Binding {
                 generation: snapshot.generation,
@@ -1353,7 +1308,6 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             if backend.row_kinds[i] == ROW_IMAGE_BUTTON {
                 unsafe {
                     lvx_set_hidden(backend.rows[i], 1);
-                    #[cfg(feature = "target-xiaomi-band-10-pro-3-101-036")]
                     if !backend.control_images[i].is_null() {
                         lvx_set_hidden(backend.control_images[i], 1);
                     }

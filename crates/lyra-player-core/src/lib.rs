@@ -8,5 +8,5 @@ pub mod persistence;
 pub mod playback;
 pub mod ui;
 
-pub use app::{Action, Effect, LyraApp, Route};
+pub use app::{Action, Effect, LIBRARY_PAGE_SIZE, LyraApp, Route};
 pub use model::*;
