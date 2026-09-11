@@ -24,9 +24,11 @@ scripts/build-install-watchface-prod.sh xiaomi-band-11
 由框架准备 `/data/canopus/inbox` 和新安装端点。安装后的模块保持禁用。
 `LYRA_PLAYER_ICON` 可以指定应用图标 PNG；私钥不会进入安装包。
 
-**Band 11 `.139` 目前仅完成构建与安装入口适配。** Rust 后端仍使用
-`static_candidate.rs`，identity guard 返回 `-38`，不能启用为可工作的播放器。
-框架管理器的实机成功不代表 Lyra 音频服务已有实机支持。
+**Band 11 `.139` 已接入独立 Rust 后端，可安装并在管理器启用。**
+播放器按 212×520 布局：180×180 封面、188 宽文字与收窄的播放控件；
+原生列表保留系统字体与样式，背景居中裁剪，纵向滚动可访问状态、音量和返回列表。
+应先启用 BluetoothAudio 并连接耳机。固件 ABI、交叉编译和签名检查已通过；
+真实音频播放及显示效果仍待设备验证。详见框架 `docs/band11-bluetooth-139.md`。
 
 10 Pro 的开发安装流程和播放控制图标说明见
 [开发安装表盘](watchfaces/lyra-player/README.md)。

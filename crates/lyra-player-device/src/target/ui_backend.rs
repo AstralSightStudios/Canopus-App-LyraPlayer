@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 use canopus_target_private::*;
 use canopus_ui_core::{NodeKind, Snapshot};
+use lyra_player_core::player_layout::PlayerLayout;
 use lyra_player_core::ui::{PLAYER_BACKGROUND_KEY, PLAYER_COVER_KEY};
 
 use super::native_app::{APP_ID, PAGE_COUNT, PAGE_OVERVIEW, PAGE_PLAYER, page_descriptor_ptr};
@@ -15,15 +16,20 @@ use super::storage;
 
 static EMPTY_TEXT: [u8; 1] = [0];
 const REFRESH_PERIOD_MS: u32 = 100;
-const PLAYER_CONTENT_HEIGHT: i32 = 480;
-const PLAYER_MEDIA_TOP: i32 = 72;
-const PLAYER_TITLE_TOP: i32 = 270;
-const PLAYER_AUTHOR_TOP: i32 = 318;
-const PLAYER_CONTROL_TOP: i32 = 382;
+const PLAYER_LAYOUT: PlayerLayout = if cfg!(feature = "target-xiaomi-band-11-4-100-139") {
+    PlayerLayout::BAND_11
+} else {
+    PlayerLayout::BAND_10_PRO
+};
+const PLAYER_CONTENT_HEIGHT: i32 = PLAYER_LAYOUT.height;
+const PLAYER_MEDIA_TOP: i32 = PLAYER_LAYOUT.cover_top;
+const PLAYER_TITLE_TOP: i32 = PLAYER_LAYOUT.title_top;
+const PLAYER_AUTHOR_TOP: i32 = PLAYER_LAYOUT.author_top;
+const PLAYER_CONTROL_TOP: i32 = PLAYER_LAYOUT.controls_top;
 /// The player title is pinned to a single line and scrolled. Letting it wrap
 /// pushed a long name down into the author line at `PLAYER_AUTHOR_TOP`, so the
 /// two overlapped.
-const PLAYER_TITLE_HEIGHT: i32 = 44;
+const PLAYER_TITLE_HEIGHT: i32 = PLAYER_LAYOUT.title_height;
 /// Scale factors for `lvx_image_set_scale`, where 256 is 1:1. The control
 /// icons are drawn into a fixed 64x64 object and scaled, never resized: an
 /// LVGL image clips to its object box instead of fitting to it, so shrinking
@@ -35,6 +41,9 @@ const CONTROL_ANIMATION_STEPS: u32 = 8;
 const ROW_IMAGE_BUTTON: u8 = 4;
 const EVENT_ALL: u32 = 0;
 const EVENT_PRESSED: u32 = 1;
+#[cfg(feature = "target-xiaomi-band-11-4-100-139")]
+const EVENT_RELEASED: u32 = 8; // .139 native switch event body 0xc6a0f90.
+#[cfg(not(feature = "target-xiaomi-band-11-4-100-139"))]
 const EVENT_RELEASED: u32 = 2;
 const EVENT_PRESS_LOST: u32 = 3;
 const CONTROL_PREVIOUS_ICON: &[u8] = b"/data/canopus/lyra-previous.bin\0";
@@ -369,12 +378,7 @@ extern "C" fn row_event(event: *mut core::ffi::c_void) {
 }
 
 fn control_x_offset(key: u32) -> i32 {
-    match key {
-        7 => -72,
-        6 => 0,
-        8 => 72,
-        _ => 0,
-    }
+    PLAYER_LAYOUT.control_x(key)
 }
 
 /// The object that carries the icon. It is always distinct from the hitbox:
@@ -399,12 +403,12 @@ unsafe fn set_control_image_scale(image: *mut core::ffi::c_void, key: u32, scale
 
 unsafe fn set_control_hitbox_geometry(object: *mut core::ffi::c_void, key: u32) {
     unsafe {
-        lvx_object_set_size(object, 64, 64);
+        lvx_object_set_size(object, PLAYER_LAYOUT.hitbox_size, PLAYER_LAYOUT.hitbox_size);
         lvx_object_align(
             object,
             ALIGN_TOP_MID,
             control_x_offset(key),
-            PLAYER_CONTROL_TOP,
+            PLAYER_CONTROL_TOP + (64 - PLAYER_LAYOUT.hitbox_size) / 2,
         );
     }
 }
@@ -641,6 +645,9 @@ fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snap
         backend.background_hash = image_hash;
     }
     unsafe {
+        // Background assets use the library's 336x520 format. Center them
+        // in the target viewport; its normal child clipping crops the sides
+        // on Band 11 without stretching the cover art or shifting controls.
         lvx_object_set_size(backend.background, 336, 520);
         lvx_object_align(backend.background, ALIGN_TOP_MID, 0, 0);
         lvx_object_move_to_index(backend.background, 0);
@@ -796,7 +803,12 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 } else {
                     CONTENT_TOP_OFFSET
                 };
-                lvx_object_set_size(backend.content_root, CONTENT_WIDTH, content_height);
+                lvx_object_set_size(backend.content_root, PLAYER_LAYOUT.width, content_height);
+                if page_index == PAGE_PLAYER {
+                    lvx_object_set_content_pad_bottom(backend.content_root, 0, 0);
+                    // Keep vertical scrolling: status, volume and back rows
+                    // follow the artwork and playback controls below the fold.
+                }
                 lvx_object_align(backend.content_root, ALIGN_TOP_MID, 0, content_top);
             }
         }
@@ -914,7 +926,11 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
             let is_player_title = page_index == PAGE_PLAYER && label_used == 0;
             let is_player_author = page_index == PAGE_PLAYER && label_used == 1;
             let is_player_label = page_index == PAGE_PLAYER;
-            let label_width = CONTENT_WIDTH;
+            let label_width = if is_player_label {
+                PLAYER_LAYOUT.text_width
+            } else {
+                CONTENT_WIDTH
+            };
             let label_hash = hash_word(
                 hash_word(
                     hash_text(0x811C_9DC5, primary),
@@ -927,7 +943,11 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     if created_now && is_player_label {
                         lvx_label_set_text_align_center(object);
                     }
-                    if created_now && is_player_title {
+                    if created_now
+                        && (is_player_title
+                            || (is_player_author
+                                && cfg!(feature = "target-xiaomi-band-11-4-100-139")))
+                    {
                         // Circular scroll needs a fixed width to scroll within,
                         // which the explicit set_size below provides.
                         lvx_label_set_long_mode(object, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -940,6 +960,9 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     }
                     let height = if is_player_title {
                         PLAYER_TITLE_HEIGHT
+                    } else if is_player_author && cfg!(feature = "target-xiaomi-band-11-4-100-139")
+                    {
+                        PLAYER_LAYOUT.author_height
                     } else {
                         wrapped_label_height(primary)
                     };
@@ -1071,7 +1094,11 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                 backend.bar_hashes[bar_used] = bar_hash;
             }
             unsafe {
-                lvx_object_set_size(object, i32::from(layout.width), i32::from(layout.height));
+                lvx_object_set_size(
+                    object,
+                    i32::from(layout.width).min(PLAYER_LAYOUT.text_width),
+                    i32::from(layout.height),
+                );
                 lvx_set_hidden(object, 0);
             }
             if layout_changed {

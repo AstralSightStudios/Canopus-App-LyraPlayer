@@ -100,7 +100,14 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
         (*descriptor).on_create = page_on_create as *const () as *mut core::ffi::c_void;
         (*descriptor).on_resume = page_on_resume as *const () as *mut core::ffi::c_void;
         (*descriptor).on_pause = page_on_pause as *const () as *mut core::ffi::c_void;
-        (*descriptor).on_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
+        #[cfg(not(feature = "target-xiaomi-band-11-4-100-139"))]
+        {
+            (*descriptor).on_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
+        }
+        #[cfg(feature = "target-xiaomi-band-11-4-100-139")]
+        {
+            (*descriptor).on_ui_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
+        }
     }
 }
 
@@ -113,9 +120,10 @@ pub fn install_stage(stage: u32) -> Result<(), i32> {
 
     if stage == 1 {
         if !existing.is_null() {
-            // The installed app object carries its package name pointer at +0x8.
-            let package: *const u8 =
-                unsafe { core::ptr::read(existing.cast::<u8>().add(8) as *const *const u8) };
+            // Read the package field using the exact target descriptor layout.
+            let package: *const u8 = unsafe {
+                core::ptr::read(existing.cast::<u8>().add(APP_PACKAGE_OFFSET) as *const *const u8)
+            };
             if !c_str_equal(package, PACKAGE_NAME) {
                 r.app_error.store(-101, Ordering::Release);
                 r.app_state.store(APP_FAILED, Ordering::Release);
@@ -150,8 +158,9 @@ pub fn install_stage(stage: u32) -> Result<(), i32> {
             r.app_state.store(APP_FAILED, Ordering::Release);
             return Err(-100);
         }
-        let package: *const u8 =
-            unsafe { core::ptr::read(installed.cast::<u8>().add(8) as *const *const u8) };
+        let package: *const u8 = unsafe {
+            core::ptr::read(installed.cast::<u8>().add(APP_PACKAGE_OFFSET) as *const *const u8)
+        };
         if !c_str_equal(package, PACKAGE_NAME) {
             r.app_error.store(-101, Ordering::Release);
             r.app_state.store(APP_FAILED, Ordering::Release);
@@ -168,8 +177,9 @@ pub fn install_stage(stage: u32) -> Result<(), i32> {
             r.app_state.store(APP_FAILED, Ordering::Release);
             return Err(-102);
         }
-        let package: *const u8 =
-            unsafe { core::ptr::read(existing.cast::<u8>().add(8) as *const *const u8) };
+        let package: *const u8 = unsafe {
+            core::ptr::read(existing.cast::<u8>().add(APP_PACKAGE_OFFSET) as *const *const u8)
+        };
         if !c_str_equal(package, PACKAGE_NAME) {
             r.app_error.store(-101, Ordering::Release);
             r.app_state.store(APP_FAILED, Ordering::Release);

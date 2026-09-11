@@ -7,7 +7,7 @@ local CONFIG = {["token"] = "lyra_player",
 ["assets"] = {"appicon_lyra.bin","lyra-previous.bin","lyra-play.bin","lyra-pause.bin","lyra-next.bin"},
 ["targets"] = {["4.100.139"] = {["id"] = "xiaomi-band-11-4.100.139",
 ["firmware"] = "31ce82257f7c127950dc5070b86316730cf468a41f0d004559e41e7d923b2c74",
-["runtime_pending"] = true,
+["runtime_pending"] = false,
 ["build"] = "user-4.100.139-cn-202608280000"}}}
 local progress = (function()
 -- One checkpoint per UI timer tick. Never busy-wait or call timer:ready():
