@@ -16,7 +16,9 @@ const uint8_t canopus_rodata_anchor[4] = {0};
 __attribute__((section(".rodata.str1.1"), used, aligned(4)))
 const uint8_t canopus_rodata_str1_1_anchor[4] = {0xA7, 0x5C, 0xD3, 0x00};
 
+#if !CANOPUS_STATIC_CANDIDATE
 extern void canopus_decode_opaque_words(void) __attribute__((weak));
+#endif
 
 __attribute__((constructor)) static void canopus_mod_ctor(void)
 {
@@ -28,9 +30,11 @@ __attribute__((constructor)) static void canopus_mod_ctor(void)
     __asm__ volatile("" : : "r"(canopus_rodata_anchor),
                      "r"(canopus_rodata_str1_1_anchor) : "memory");
 
+#if !CANOPUS_STATIC_CANDIDATE
     if (canopus_decode_opaque_words != 0) {
         canopus_decode_opaque_words();
     }
+#endif
     (void)canopus_mod_prepare(0);
     (void)canopus_register_module_descriptor();
 }

@@ -9,4 +9,11 @@ __pycache__/
 /watchfaces/lyra-player/module.bin
 /watchfaces/lyra-player/receipt.bin
 /watchfaces/lyra-player-*/
+!/watchfaces/lyra-player-prod/
+/watchfaces/lyra-player-prod/*
+!/watchfaces/lyra-player-prod/docs/
+!/watchfaces/lyra-player-prod/xiaomi-band-*/
+/watchfaces/lyra-player-prod/xiaomi-band-*/*
+!/watchfaces/lyra-player-prod/xiaomi-band-*/main.lua
+!/watchfaces/lyra-player-prod/xiaomi-band-*/docs/
 .DS_Store
