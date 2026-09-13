@@ -20,6 +20,8 @@ pub struct SelectedFile {
     pub path: String,
     pub size: u64,
     pub duration_ms: u32,
+    /// Detected from the file's content: "mp3", "jpeg", "png", "json" or "lrc".
+    pub format: &'static str,
 }
 
 #[derive(Clone, Debug, Default)]

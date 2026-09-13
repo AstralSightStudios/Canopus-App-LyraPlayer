@@ -167,46 +167,53 @@ fn transfer() -> &'static Mutex<Option<Transfer>> {
     TRANSFER.get_or_init(|| Mutex::new(None))
 }
 
+/// Checks a picked file by its content rather than its name: on Android the
+/// name is the last segment of a `content://` URI and has no extension.
 pub fn inspect_file(path: &str, name: &str, kind: &str) -> Result<state::SelectedFile, String> {
     let metadata = fs::metadata(path).map_err(|error| format!("cannot stat file: {error}"))?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err("selected file is empty".to_string());
     }
-    let allowed = match kind {
-        "audio" => ["mp3"].as_slice(),
-        "cover" => ["jpg", "jpeg", "png"].as_slice(),
-        "lyrics" => ["lrc", "json", "txt"].as_slice(),
-        _ => return Err("unknown asset kind".to_string()),
-    };
-    let extension = Path::new(name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !allowed.contains(&extension.as_str()) {
-        return Err(format!("unsupported {kind} file extension"));
-    }
     let limit = match kind {
         "audio" => 64 * 1024 * 1024,
         "cover" => 4 * 1024 * 1024,
-        _ => 2 * 1024 * 1024,
+        "lyrics" => 2 * 1024 * 1024,
+        _ => return Err("unknown asset kind".to_string()),
     };
     if metadata.len() > limit {
         return Err(format!("selected {kind} file exceeds import limit"));
     }
-    let duration_ms = if kind == "audio" {
-        mp3_duration::from_path(path)
-            .ok()
-            .map(|duration| duration.as_millis().min(u128::from(u32::MAX)) as u32)
-            .unwrap_or(0)
-    } else {
-        0
+    let unreadable = |error: std::io::Error| format!("无法读取所选文件：{error}");
+    let (format, duration_ms) = match kind {
+        "audio" => {
+            if !crate::sniff::is_mp3(Path::new(path)).map_err(unreadable)? {
+                return Err("所选文件不是 MP3 音频".to_string());
+            }
+            let duration_ms = mp3_duration::from_path(path)
+                .ok()
+                .map(|duration| duration.as_millis().min(u128::from(u32::MAX)) as u32)
+                .unwrap_or(0);
+            ("mp3", duration_ms)
+        }
+        "cover" => match crate::sniff::image_format(Path::new(path)).map_err(unreadable)? {
+            Some(crate::sniff::ImageFormat::Jpeg) => ("jpeg", 0),
+            Some(crate::sniff::ImageFormat::Png) => ("png", 0),
+            None => return Err("封面必须是 JPEG 或 PNG".to_string()),
+        },
+        _ => {
+            let bytes = fs::read(path).map_err(unreadable)?;
+            match crate::sniff::lyrics_format(&bytes) {
+                Some(format) => (format.as_str(), 0),
+                None => return Err("歌词必须是 LRC 或 JSON 文本".to_string()),
+            }
+        }
     };
     Ok(state::SelectedFile {
         name: name.to_string(),
         path: path.to_string(),
         size: metadata.len(),
         duration_ms,
+        format,
     })
 }
 

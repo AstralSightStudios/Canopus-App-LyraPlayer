@@ -3,10 +3,12 @@ use wit_bindgen::FutureReader;
 use crate::exports::astrobox::psys_plugin::{event_v3 as event, event_v3::EventType, lifecycle};
 
 mod artwork;
+mod id3;
 mod import;
 mod interconnect;
 mod library;
 mod netease;
+mod sniff;
 mod state;
 mod ui;
 

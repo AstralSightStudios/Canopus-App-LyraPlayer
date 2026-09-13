@@ -11,7 +11,7 @@ use crate::astrobox::psys_host::{
     dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
     ui_v3 as ui,
 };
-use crate::{artwork, import, interconnect, library, netease, state};
+use crate::{artwork, id3, import, interconnect, library, netease, state};
 
 const EVENT_PICK_AUDIO: &str = "action:file.audio";
 const EVENT_PICK_COVER: &str = "action:file.cover";
@@ -284,15 +284,28 @@ fn pick_asset(kind: &str, extensions: &[&str]) {
         return;
     }
     let path = format!("media/{}", result.name);
-    match import::inspect_file(&path, &result.name, kind) {
+    let inspected = import::inspect_file(&path, &result.name, kind);
+    // On Android the name is a content URI segment such as "audio%3A1000012345",
+    // so the file's own tags are the only meaningful source for these fields.
+    let tags = match &inspected {
+        Ok(selected) if kind == "audio" => id3::read_tags(Path::new(&selected.path)),
+        _ => id3::TrackTags::default(),
+    };
+    match inspected {
         Ok(selected) => state::with_state(|state| {
             if kind == "audio" {
-                state.track_name = selected
-                    .name
-                    .rsplit_once('.')
-                    .map(|item| item.0)
-                    .unwrap_or(&selected.name)
-                    .to_string();
+                // A new audio file replaces the form's metadata wholesale, so
+                // nothing from the previously picked song lingers.
+                state.track_name = tags.title.unwrap_or_else(|| {
+                    selected
+                        .name
+                        .rsplit_once('.')
+                        .map(|item| item.0)
+                        .unwrap_or(&selected.name)
+                        .to_string()
+                });
+                state.artist = tags.artist.unwrap_or_default();
+                state.album = tags.album.unwrap_or_default();
                 if selected.duration_ms != 0 {
                     state.duration_ms = selected.duration_ms;
                 }
@@ -351,19 +364,10 @@ fn start_local() {
         }
     }
     if let Some(lyrics) = snapshot.lyrics {
-        let extension = lyrics
-            .name
-            .rsplit_once('.')
-            .map(|item| item.1)
-            .unwrap_or("lrc");
         assets.push(import::ImportAsset::lyrics(
             lyrics.path,
             lyrics.size,
-            if extension.eq_ignore_ascii_case("json") {
-                "json"
-            } else {
-                "lrc"
-            },
+            lyrics.format,
         ));
     }
     let artists = if snapshot.artist.trim().is_empty() {
