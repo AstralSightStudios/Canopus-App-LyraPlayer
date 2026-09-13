@@ -87,14 +87,14 @@ impl ImportAsset {
         }
     }
 
-    pub fn background_bin(path: String, size: u64) -> Self {
+    pub fn background_bin(background: crate::artwork::PreparedBackground) -> Self {
         Self {
             kind: "background",
-            path,
-            size,
+            path: background.path,
+            size: background.size,
             extension: Some("bin"),
             format: Some(crate::artwork::LVGL_V9_FORMAT),
-            width: Some(crate::artwork::BACKGROUND_WIDTH),
+            width: Some(background.width),
             height: Some(crate::artwork::BACKGROUND_HEIGHT),
         }
     }
@@ -341,6 +341,19 @@ pub async fn handle(addr: &str, package: &str, payload: &str) {
     }
 }
 
+/// Background widths the quick app declared in its hello. Quick apps without
+/// the field accept only the original 10 Pro width.
+fn accepted_background_widths(hello: &Value) -> Vec<u32> {
+    match hello.get("backgroundWidths").and_then(Value::as_array) {
+        Some(items) => items
+            .iter()
+            .filter_map(Value::as_u64)
+            .filter_map(|width| u32::try_from(width).ok())
+            .collect(),
+        None => vec![crate::artwork::DeviceProfile::Band10Pro.background_width()],
+    }
+}
+
 async fn handle_hello(addr: &str, value: &Value) -> Result<(), String> {
     if value.get("version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
         || value.get("window").and_then(Value::as_u64) != Some(1)
@@ -394,11 +407,25 @@ async fn handle_hello(addr: &str, value: &Value) -> Result<(), String> {
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_CHUNK_BYTES as u64) as usize;
         let mode_limit = item.mode.max_chunk_bytes();
+        let asset_count = item.assets.len();
         if !supports_artwork {
             item.assets.retain(|asset| {
                 asset.metadata.kind != "background"
                     && asset.metadata.format != Some(crate::artwork::LVGL_V9_FORMAT)
             });
+        } else {
+            // A quick app that predates per-device backgrounds only accepts
+            // the 10 Pro width and would reject the whole import otherwise.
+            let background_widths = accepted_background_widths(value);
+            item.assets.retain(|asset| {
+                asset.metadata.kind != "background"
+                    || asset
+                        .metadata
+                        .width
+                        .is_some_and(|width| background_widths.contains(&width))
+            });
+        }
+        if item.assets.len() != asset_count {
             let total = item.assets.iter().map(|asset| asset.metadata.size).sum();
             state::with_state(|state| state.total = total);
         }
@@ -780,9 +807,11 @@ fn validate_assets(assets: &[ImportAsset]) -> Result<(), String> {
                 }
                 "background" => {
                     asset.extension == Some("bin")
-                        && asset.width == Some(crate::artwork::BACKGROUND_WIDTH)
                         && asset.height == Some(crate::artwork::BACKGROUND_HEIGHT)
-                        && asset.size == crate::artwork::BACKGROUND_BIN_BYTES
+                        && crate::artwork::DeviceProfile::ALL.iter().any(|profile| {
+                            asset.width == Some(profile.background_width())
+                                && asset.size == profile.background_bin_bytes()
+                        })
                 }
                 _ => false,
             };
@@ -891,15 +920,40 @@ mod tests {
 
     #[test]
     fn accepts_fixed_lvgl_cover_and_background_assets() {
+        for profile in crate::artwork::DeviceProfile::ALL {
+            let assets = [
+                ImportAsset::audio("audio.mp3".into(), 10),
+                ImportAsset::cover_bin("cover.bin".into(), crate::artwork::COVER_BIN_BYTES),
+                ImportAsset::background_bin(crate::artwork::PreparedBackground {
+                    path: "background.bin".into(),
+                    size: profile.background_bin_bytes(),
+                    width: profile.background_width(),
+                }),
+            ];
+            assert!(validate_assets(&assets).is_ok(), "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_quick_app_accepts_only_the_original_background_width() {
+        assert_eq!(accepted_background_widths(&json!({})), vec![336]);
+        assert_eq!(
+            accepted_background_widths(&json!({ "backgroundWidths": [336, 212] })),
+            vec![336, 212]
+        );
+    }
+
+    #[test]
+    fn rejects_background_whose_size_disagrees_with_its_width() {
         let assets = [
             ImportAsset::audio("audio.mp3".into(), 10),
-            ImportAsset::cover_bin("cover.bin".into(), crate::artwork::COVER_BIN_BYTES),
-            ImportAsset::background_bin(
-                "background.bin".into(),
-                crate::artwork::BACKGROUND_BIN_BYTES,
-            ),
+            ImportAsset::background_bin(crate::artwork::PreparedBackground {
+                path: "background.bin".into(),
+                size: crate::artwork::DeviceProfile::Band10Pro.background_bin_bytes(),
+                width: crate::artwork::DeviceProfile::Band11.background_width(),
+            }),
         ];
-        assert!(validate_assets(&assets).is_ok());
+        assert!(validate_assets(&assets).is_err());
     }
 
     #[test]

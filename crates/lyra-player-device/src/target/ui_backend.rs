@@ -592,6 +592,8 @@ fn skip_image(key: u32) -> bool {
 
 #[cfg(not(feature = "target-xiaomi-band-9-pro-3-1-175"))]
 fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snapshot) -> bool {
+    use lyra_player_core::player_layout::{BACKGROUND_HEIGHT, LEGACY_BACKGROUND_WIDTH};
+
     if page_index != PAGE_PLAYER {
         return false;
     }
@@ -617,13 +619,24 @@ fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snap
         backend.background_hash = 0;
         return false;
     };
-    if !storage::validate_lvgl_v9_image(&resolved_path, 336, 520) {
-        if !backend.background.is_null() {
-            unsafe { lvx_set_hidden(backend.background, 1) };
+    // Importers size the background for the device they target; older ones
+    // always produced the 10 Pro width, which narrower screens center-crop.
+    let background_width = match storage::lvgl_v9_image_size(&resolved_path) {
+        Some((width, height))
+            if i32::from(height) == BACKGROUND_HEIGHT
+                && (i32::from(width) == PLAYER_LAYOUT.background_width
+                    || i32::from(width) == LEGACY_BACKGROUND_WIDTH) =>
+        {
+            i32::from(width)
         }
-        backend.background_hash = 0;
-        return false;
-    }
+        _ => {
+            if !backend.background.is_null() {
+                unsafe { lvx_set_hidden(backend.background, 1) };
+            }
+            backend.background_hash = 0;
+            return false;
+        }
+    };
     let image_hash = hash_word(hash_text(0x811C_9DC5, &resolved_path), resource_id);
     let mut source_path = resolved_path.into_bytes();
     source_path.push(0);
@@ -645,10 +658,10 @@ fn sync_background(backend: &mut PageBackend, page_index: usize, snapshot: &Snap
         backend.background_hash = image_hash;
     }
     unsafe {
-        // Background assets use the library's 336x520 format. Center them
-        // in the target viewport; its normal child clipping crops the sides
-        // on Band 11 without stretching the cover art or shifting controls.
-        lvx_object_set_size(backend.background, 336, 520);
+        // Center the background in the target viewport; a legacy 336-wide
+        // asset on Band 11 is cropped at the sides by normal child clipping
+        // without stretching the art or shifting controls.
+        lvx_object_set_size(backend.background, background_width, BACKGROUND_HEIGHT);
         lvx_object_align(backend.background, ALIGN_TOP_MID, 0, 0);
         lvx_object_move_to_index(backend.background, 0);
         lvx_set_hidden(backend.background, 0);

@@ -34,19 +34,19 @@
   background-color: #000000;
 }
 .content {
-  width: 300px;
+  width: 90%;
   flex-direction: column;
   align-items: center;
 }
 .title {
-  width: 300px;
+  width: 90%;
   color: #ffffff;
   font-size: 28px;
   font-weight: bold;
   text-align: center;
 }
 .status {
-  width: 300px;
+  width: 90%;
   color: #d1d5db;
   font-size: 17px;
   lines: 2;
@@ -55,7 +55,7 @@
   margin-top: 12px;
 }
 .progress-shell {
-  width: 288px;
+  width: 85%;
   height: 10px;
   border-radius: 5px;
   background-color: #262626;
@@ -68,14 +68,14 @@
   background-color: #3b82f6;
 }
 .percent {
-  width: 300px;
+  width: 90%;
   color: #ffffff;
   font-size: 19px;
   text-align: center;
   margin-top: 6px;
 }
 .summary {
-  width: 300px;
+  width: 90%;
   height: 70px;
   padding: 10px 12px 10px 12px;
   margin-top: 14px;
@@ -85,7 +85,7 @@
   justify-content: center;
 }
 .track {
-  width: 276px;
+  width: 85%;
   color: #ffffff;
   font-size: 18px;
   font-weight: bold;
@@ -94,7 +94,7 @@
   text-align: center;
 }
 .detail {
-  width: 276px;
+  width: 85%;
   color: #a3a3a3;
   font-size: 14px;
   lines: 1;
@@ -103,7 +103,7 @@
   margin-top: 5px;
 }
 .warning {
-  width: 300px;
+  width: 90%;
   height: 100px;
   padding: 10px 12px 10px 12px;
   margin-top: 12px;
@@ -114,13 +114,13 @@
   flex-direction: column;
 }
 .warning-title {
-  width: 276px;
+  width: 85%;
   color: #fbbf24;
   font-size: 20px;
   font-weight: bold;
 }
 .warning-text {
-  width: 276px;
+  width: 85%;
   color: #e5e5e5;
   font-size: 16px;
   line-height: 20px;
@@ -128,7 +128,7 @@
   margin-top: 4px;
 }
 .hint {
-  width: 300px;
+  width: 90%;
   color: #FF1100;
   font-size: 16px;
   text-align: center;
@@ -158,6 +158,8 @@ const FAST_CHUNK_BYTES = 36608
 const ULTRA_CHUNK_BYTES = 36753
 const MAX_CHUNK_BYTES = ULTRA_CHUNK_BYTES
 const MAX_CHUNK_RETRIES = 2
+// Player background widths (Band 10 Pro, Band 11); the height is always 520.
+const BACKGROUND_WIDTHS = [336, 212]
 const DECODE_QUARTETS_PER_SLICE = 512
 const CRC_BYTES_PER_SLICE = 4096
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -264,7 +266,8 @@ export default {
           chunkModes: ['crc32', 'none', 'none-48k'],
           assets: ['audio', 'cover', 'background', 'lyrics'],
           maxAssets: 4,
-          imageFormats: ['lvgl-v9-argb8888-bin']
+          imageFormats: ['lvgl-v9-argb8888-bin'],
+          backgroundWidths: BACKGROUND_WIDTHS
         })
         return
       case 'lyra-import-begin':
@@ -905,7 +908,8 @@ export default {
         return null
       }
       if (kind === 'background') {
-        if (source.format !== 'lvgl-v9-argb8888-bin' || source.extension !== 'bin' || source.width !== 336 || source.height !== 520 || size !== 698892) return null
+        // Band 10 Pro 336x520, Band 11 212x520; the size must match the header.
+        if (source.format !== 'lvgl-v9-argb8888-bin' || source.extension !== 'bin' || BACKGROUND_WIDTHS.indexOf(source.width) < 0 || source.height !== 520 || size !== 12 + source.width * 520 * 4) return null
       }
       if (kind === 'lyrics' && source.format === 'json') fileName = 'lyrics.json'
       output.push({ kind, size, fileName })

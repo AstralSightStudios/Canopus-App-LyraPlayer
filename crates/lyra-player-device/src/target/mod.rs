@@ -229,7 +229,7 @@ const MAX_HEADSET_CONTROLS_PER_TICK: usize = 8;
 /// state, and toggling on a repeat would invert playback instead of confirming
 /// it. Track changes are the app's decision, not the player's, so they go
 /// straight to `update`.
-fn apply_headset_controls(core: &mut runtime::Core, effects: &mut alloc::vec::Vec<Effect>) {
+fn apply_headset_controls(core: &mut runtime::Core) {
     for _ in 0..MAX_HEADSET_CONTROLS_PER_TICK {
         let control = match core.audio.poll_headset_control() {
             Ok(Some(control)) => control,
@@ -245,17 +245,25 @@ fn apply_headset_controls(core: &mut runtime::Core, effects: &mut alloc::vec::Ve
                     core.pending_audio = Some(runtime::PendingAudioCommand::Toggle);
                 }
             }
-            MediaControl::Next => effects.extend(core.app.update(Action::Next)),
-            MediaControl::Previous => effects.extend(core.app.update(Action::Previous)),
+            MediaControl::Next => {
+                let effects = core.app.update(Action::Next);
+                queue_audio_effects(core, effects);
+            }
+            MediaControl::Previous => {
+                let effects = core.app.update(Action::Previous);
+                queue_audio_effects(core, effects);
+            }
         }
     }
 }
 
+/// Runs on the Bluetooth owner thread. Everything it does must stay inside the
+/// non-blocking `try_with_core`: this thread can preempt a UI thread that holds
+/// the core lock, so spinning in `with_core` here would never see it released.
 pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
-    let effects = try_with_core(|core| {
-        let mut effects = alloc::vec::Vec::new();
-        apply_headset_controls(core, &mut effects);
+    let _ = try_with_core(|core| {
+        apply_headset_controls(core);
         if let Some(command) = core.pending_audio.take() {
             match command {
                 runtime::PendingAudioCommand::Stream(path) => {
@@ -273,7 +281,7 @@ pub fn audio_service_tick() {
                         core.app.player.state = PlaybackState::Failed;
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                         runtime().last_error.store(error, Ordering::Release);
-                        return effects;
+                        return;
                     }
                     core.app.error = None;
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
@@ -283,7 +291,7 @@ pub fn audio_service_tick() {
                         core.app.error = Some(alloc::format!("audio ioctl failed: {error}"));
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                         runtime().last_error.store(error, Ordering::Release);
-                        return effects;
+                        return;
                     }
                     core.app.generation = core.app.generation.wrapping_add(1).max(1);
                 }
@@ -292,7 +300,7 @@ pub fn audio_service_tick() {
                         core.app.error = Some(alloc::format!("volume ioctl failed: {error}"));
                         core.app.generation = core.app.generation.wrapping_add(1).max(1);
                         runtime().last_error.store(error, Ordering::Release);
-                        return effects;
+                        return;
                     }
                 }
                 runtime::PendingAudioCommand::Stop => {
@@ -310,17 +318,18 @@ pub fn audio_service_tick() {
             ));
             core.app.generation = core.app.generation.wrapping_add(1).max(1);
             runtime().last_error.store(error, Ordering::Release);
-            return effects;
+            return;
         }
         if core.app.player.state == PlaybackState::Draining && !core.audio.local_is_open() {
-            if core.app.has_next() {
-                effects.extend(core.app.update(Action::Next));
+            let effects = if core.app.has_next() {
+                core.app.update(Action::Next)
             } else {
                 // Nothing follows. Without this the player would sit in
                 // Draining forever and the home row would keep advertising the
                 // last track as "即将结束" long after the audio stopped.
-                effects.extend(core.app.update(Action::PlaybackExhausted));
-            }
+                core.app.update(Action::PlaybackExhausted)
+            };
+            queue_audio_effects(core, effects);
             runtime()
                 .player_media_refresh_pending
                 .store(true, Ordering::Release);
@@ -343,10 +352,7 @@ pub fn audio_service_tick() {
                 Err(error) => runtime().last_error.store(error, Ordering::Release),
             }
         }
-        effects
-    })
-    .unwrap_or_default();
-    execute_effects(effects);
+    });
 }
 
 pub fn ui_maintenance_tick() {
@@ -377,22 +383,38 @@ pub fn ui_maintenance_tick() {
     }
 }
 
+/// Executes effects on the UI thread: navigation drives the page manager and
+/// LVGL, so it is only valid here.
 fn execute_effects(effects: alloc::vec::Vec<Effect>) {
     for effect in effects {
         match effect {
-            Effect::StreamAudio { path } => with_core(|core| {
-                if !lyra_player_core::persistence::is_safe_audio_path(&path) {
-                    core.app.error = Some(alloc::string::String::from("invalid local audio path"));
-                    core.app.player.state = PlaybackState::Failed;
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                    return;
-                }
-                core.pending_audio = Some(runtime::PendingAudioCommand::Stream(path));
-            }),
-            Effect::StopAudio => with_core(|core| {
-                core.pending_audio = Some(runtime::PendingAudioCommand::Stop);
-            }),
             Effect::Navigate(route) => ui_backend::navigate(route_page(route)),
+            effect => with_core(|core| queue_audio_effect(core, effect)),
         }
+    }
+}
+
+/// Queues the audio side of effects on a core the caller already holds, for
+/// the Bluetooth thread. Track changes never navigate (see `LyraApp::update`),
+/// so there is no navigation to lose here.
+fn queue_audio_effects(core: &mut runtime::Core, effects: alloc::vec::Vec<Effect>) {
+    for effect in effects {
+        queue_audio_effect(core, effect);
+    }
+}
+
+fn queue_audio_effect(core: &mut runtime::Core, effect: Effect) {
+    match effect {
+        Effect::StreamAudio { path } => {
+            if !lyra_player_core::persistence::is_safe_audio_path(&path) {
+                core.app.error = Some(alloc::string::String::from("invalid local audio path"));
+                core.app.player.state = PlaybackState::Failed;
+                core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                return;
+            }
+            core.pending_audio = Some(runtime::PendingAudioCommand::Stream(path));
+        }
+        Effect::StopAudio => core.pending_audio = Some(runtime::PendingAudioCommand::Stop),
+        Effect::Navigate(_) => {}
     }
 }

@@ -13,29 +13,83 @@ use image::{
 pub const COVER_WIDTH: u32 = 180;
 pub const COVER_HEIGHT: u32 = 180;
 pub const COVER_CORNER_RADIUS: u32 = 24;
-pub const BACKGROUND_WIDTH: u32 = 336;
 pub const BACKGROUND_HEIGHT: u32 = 520;
-pub const BACKGROUND_FADE_START: u32 = 480;
+/// The bottom rows fade out so the background blends into the list below.
 pub const BACKGROUND_FADE_SPAN: u32 = 40;
 pub const LVGL_V9_FORMAT: &str = "lvgl-v9-argb8888-bin";
-pub const COVER_BIN_BYTES: u64 = 12 + COVER_WIDTH as u64 * COVER_HEIGHT as u64 * 4;
-pub const BACKGROUND_BIN_BYTES: u64 = 12 + BACKGROUND_WIDTH as u64 * BACKGROUND_HEIGHT as u64 * 4;
+pub const COVER_BIN_BYTES: u64 = lvgl_v9_bin_bytes(COVER_WIDTH, COVER_HEIGHT);
 
 const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SOURCE_DIMENSION: u32 = 2048;
 const MAX_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
-const BLUR_WIDTH: u32 = 84;
 const BLUR_HEIGHT: u32 = 120;
+
+/// The wearable the artwork is prepared for; it decides the background width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeviceProfile {
+    /// 336 px wide. Also used for devices we cannot identify, which is what
+    /// every import produced before per-device artwork.
+    #[default]
+    Band10Pro,
+    /// 212 px wide.
+    Band11,
+}
+
+impl DeviceProfile {
+    pub const ALL: [Self; 2] = [Self::Band10Pro, Self::Band11];
+
+    /// Identifies the device from the name AstroBox reports.
+    pub fn from_device_name(name: &str) -> Self {
+        const BAND_11: [&str; 3] = ["小米手环11", "小米手環11", "Xiaomi Smart Band 11"];
+        const BAND_10_PRO: [&str; 3] = [
+            "小米手环10 Pro",
+            "小米手環10 Pro",
+            "Xiaomi Smart Band 10 Pro",
+        ];
+        if BAND_11.iter().any(|key| name.contains(key)) {
+            Self::Band11
+        } else if BAND_10_PRO.iter().any(|key| name.contains(key)) {
+            Self::Band10Pro
+        } else {
+            Self::default()
+        }
+    }
+
+    pub const fn background_width(self) -> u32 {
+        match self {
+            Self::Band10Pro => 336,
+            Self::Band11 => 212,
+        }
+    }
+
+    pub const fn background_bin_bytes(self) -> u64 {
+        lvgl_v9_bin_bytes(self.background_width(), BACKGROUND_HEIGHT)
+    }
+}
+
+pub const fn lvgl_v9_bin_bytes(width: u32, height: u32) -> u64 {
+    12 + width as u64 * height as u64 * 4
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedBackground {
+    pub path: String,
+    pub size: u64,
+    pub width: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct PreparedArtwork {
     pub cover_path: String,
     pub cover_size: u64,
-    pub background_path: Option<String>,
-    pub background_size: Option<u64>,
+    pub background: Option<PreparedBackground>,
 }
 
-pub fn prepare(source: &Path, output_directory: &Path) -> Result<PreparedArtwork, String> {
+pub fn prepare(
+    source: &Path,
+    output_directory: &Path,
+    profile: DeviceProfile,
+) -> Result<PreparedArtwork, String> {
     let metadata = fs::metadata(source).map_err(|error| format!("无法读取封面：{error}"))?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_SOURCE_BYTES {
         return Err("封面为空或超过 4 MiB".to_string());
@@ -54,31 +108,34 @@ pub fn prepare(source: &Path, output_directory: &Path) -> Result<PreparedArtwork
     }
 
     let background_path = output_directory.join("background.bin");
-    let (background_path, background_size) = match background(&image)
+    let background = match background(&image, profile.background_width())
         .and_then(|background| write_lvgl_v9(&background_path, &background))
     {
         Ok(()) => {
             let size = file_size(&background_path)?;
-            if size == BACKGROUND_BIN_BYTES {
-                (Some(path_text(&background_path)?), Some(size))
+            if size == profile.background_bin_bytes() {
+                Some(PreparedBackground {
+                    path: path_text(&background_path)?,
+                    size,
+                    width: profile.background_width(),
+                })
             } else {
                 let _ = fs::remove_file(&background_path);
                 tracing::warn!("background BIN length mismatch; importing cover only");
-                (None, None)
+                None
             }
         }
         Err(error) => {
             let _ = fs::remove_file(&background_path);
             tracing::warn!("background generation skipped: {error}");
-            (None, None)
+            None
         }
     };
 
     Ok(PreparedArtwork {
         cover_path: path_text(&cover_path)?,
         cover_size,
-        background_path,
-        background_size,
+        background,
     })
 }
 
@@ -160,18 +217,14 @@ fn apply_rounded_corner_alpha(image: &mut RgbaImage) {
     }
 }
 
-fn background(image: &DynamicImage) -> Result<RgbaImage, String> {
+fn background(image: &DynamicImage, width: u32) -> Result<RgbaImage, String> {
     let source = image.to_rgba8();
-    let (crop_width, crop_height) = aspect_fill_crop(
-        source.width(),
-        source.height(),
-        BACKGROUND_WIDTH,
-        BACKGROUND_HEIGHT,
-    )?;
+    let (crop_width, crop_height) =
+        aspect_fill_crop(source.width(), source.height(), width, BACKGROUND_HEIGHT)?;
     let x = (source.width() - crop_width) / 2;
     let y = (source.height() - crop_height) / 2;
     let crop = imageops::crop_imm(&source, x, y, crop_width, crop_height).to_image();
-    let small = imageops::resize(&crop, BLUR_WIDTH, BLUR_HEIGHT, FilterType::Triangle);
+    let small = imageops::resize(&crop, (width / 4).max(1), BLUR_HEIGHT, FilterType::Triangle);
     let mut blurred = imageops::blur(&small, 8.0);
     let (top, bottom) = half_colors(&small);
 
@@ -194,12 +247,8 @@ fn background(image: &DynamicImage) -> Result<RgbaImage, String> {
         pixel[3] = 255;
     }
 
-    let mut output = imageops::resize(
-        &blurred,
-        BACKGROUND_WIDTH,
-        BACKGROUND_HEIGHT,
-        FilterType::Triangle,
-    );
+    let mut output = imageops::resize(&blurred, width, BACKGROUND_HEIGHT, FilterType::Triangle);
+    let fade_start = BACKGROUND_HEIGHT - BACKGROUND_FADE_SPAN;
     for (_, y, pixel) in output.enumerate_pixels_mut() {
         let edge = y.abs_diff(BACKGROUND_HEIGHT / 2);
         let vignette = edge.saturating_mul(20) / (BACKGROUND_HEIGHT / 2).max(1);
@@ -207,7 +256,7 @@ fn background(image: &DynamicImage) -> Result<RgbaImage, String> {
         for channel in 0..3 {
             pixel[channel] = ((u32::from(pixel[channel]) * keep) / 100) as u8;
         }
-        pixel[3] = if y < BACKGROUND_FADE_START {
+        pixel[3] = if y < fade_start {
             255
         } else {
             let fade_rows = BACKGROUND_FADE_SPAN.saturating_sub(1).max(1);
@@ -325,6 +374,39 @@ mod tests {
     fn aspect_fill_uses_center_crop() {
         assert_eq!(aspect_fill_crop(800, 400, 336, 520), Ok((258, 400)));
         assert_eq!(aspect_fill_crop(400, 800, 336, 520), Ok((400, 619)));
+        assert_eq!(aspect_fill_crop(800, 400, 212, 520), Ok((163, 400)));
+    }
+
+    #[test]
+    fn device_names_select_the_background_profile() {
+        for name in [
+            "小米手环11",
+            "小米手环11 A1B2",
+            "小米手環11",
+            "Xiaomi Smart Band 11",
+            "Xiaomi Smart Band 11 NFC",
+        ] {
+            assert_eq!(
+                DeviceProfile::from_device_name(name),
+                DeviceProfile::Band11,
+                "{name}"
+            );
+        }
+        for name in [
+            "小米手环10 Pro",
+            "小米手環10 Pro 5C3D",
+            "Xiaomi Smart Band 10 Pro",
+            "",
+            "Xiaomi Watch S4",
+        ] {
+            assert_eq!(
+                DeviceProfile::from_device_name(name),
+                DeviceProfile::Band10Pro,
+                "{name}"
+            );
+        }
+        assert_eq!(DeviceProfile::Band10Pro.background_bin_bytes(), 698_892);
+        assert_eq!(DeviceProfile::Band11.background_bin_bytes(), 440_972);
     }
 
     #[test]
@@ -350,17 +432,50 @@ mod tests {
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(640, 320, Rgba([220, 80, 40, 100])));
         let cover = square_cover(&image);
         assert_eq!(cover.dimensions(), (COVER_WIDTH, COVER_HEIGHT));
-        let background = background(&image).unwrap();
-        assert_eq!(
-            background.dimensions(),
-            (BACKGROUND_WIDTH, BACKGROUND_HEIGHT)
-        );
-        assert!(background
-            .enumerate_pixels()
-            .filter(|(_, y, _)| *y < BACKGROUND_FADE_START)
-            .all(|(_, _, pixel)| pixel[3] == 255));
-        assert_eq!(background.get_pixel(0, BACKGROUND_FADE_START)[3], 255);
-        assert_eq!(background.get_pixel(0, BACKGROUND_HEIGHT - 1)[3], 0);
+        let fade_start = BACKGROUND_HEIGHT - BACKGROUND_FADE_SPAN;
+        for profile in DeviceProfile::ALL {
+            let background = background(&image, profile.background_width()).unwrap();
+            assert_eq!(
+                background.dimensions(),
+                (profile.background_width(), BACKGROUND_HEIGHT)
+            );
+            assert!(
+                background
+                    .enumerate_pixels()
+                    .filter(|(_, y, _)| *y < fade_start)
+                    .all(|(_, _, pixel)| pixel[3] == 255)
+            );
+            assert_eq!(background.get_pixel(0, fade_start)[3], 255);
+            assert_eq!(background.get_pixel(0, BACKGROUND_HEIGHT - 1)[3], 0);
+        }
+    }
+
+    #[test]
+    fn prepared_background_matches_the_device_profile() {
+        let directory = unique_output_directory("artwork-profile-test");
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.png");
+        RgbaImage::from_pixel(400, 300, Rgba([30, 120, 200, 255]))
+            .save(&source)
+            .unwrap();
+        for profile in DeviceProfile::ALL {
+            let output = directory.join(format!("{profile:?}"));
+            let prepared = prepare(&source, &output, profile).unwrap();
+            assert_eq!(prepared.cover_size, COVER_BIN_BYTES);
+            let background = prepared.background.unwrap();
+            assert_eq!(background.width, profile.background_width());
+            assert_eq!(background.size, profile.background_bin_bytes());
+            let header = fs::read(&background.path).unwrap();
+            assert_eq!(
+                u16::from_le_bytes([header[4], header[5]]),
+                profile.background_width() as u16
+            );
+            assert_eq!(
+                u16::from_le_bytes([header[6], header[7]]),
+                BACKGROUND_HEIGHT as u16
+            );
+        }
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -384,14 +499,16 @@ mod tests {
             320,
             Rgba([220, 80, 40, 100]),
         ));
-        let background = background(&image).unwrap();
+        let fade_start = BACKGROUND_HEIGHT - BACKGROUND_FADE_SPAN;
+        assert_eq!(fade_start, 480);
+        let background = background(&image, DeviceProfile::Band10Pro.background_width()).unwrap();
         let mut previous = 255;
-        for y in BACKGROUND_FADE_START..BACKGROUND_HEIGHT {
+        for y in fade_start..BACKGROUND_HEIGHT {
             let alpha = background.get_pixel(0, y)[3];
             assert!(alpha <= previous);
             previous = alpha;
         }
-        assert_eq!(background.get_pixel(0, BACKGROUND_FADE_START)[3], 255);
+        assert_eq!(background.get_pixel(0, fade_start)[3], 255);
         assert_eq!(background.get_pixel(0, BACKGROUND_HEIGHT - 1)[3], 0);
     }
 }

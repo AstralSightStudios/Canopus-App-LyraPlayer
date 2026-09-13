@@ -308,8 +308,19 @@ fn pick_asset(kind: &str, extensions: &[&str]) {
     }
 }
 
+/// Artwork is sized for the device the import is sent to.
+fn selected_device_profile(snapshot: &state::UiState) -> artwork::DeviceProfile {
+    snapshot
+        .devices
+        .iter()
+        .find(|device| device.addr == snapshot.selected_addr)
+        .map(|device| artwork::DeviceProfile::from_device_name(&device.name))
+        .unwrap_or_default()
+}
+
 fn start_local() {
     let snapshot = state::snapshot();
+    let profile = selected_device_profile(&snapshot);
     let Some(audio) = snapshot.audio else {
         state::with_state(|state| state.status = "请先选择 MP3。".to_string());
         return;
@@ -321,16 +332,14 @@ fn start_local() {
     let mut assets = vec![import::ImportAsset::audio(audio.path, audio.size)];
     if let Some(cover) = snapshot.cover {
         let output = artwork::unique_output_directory("local-artwork");
-        match artwork::prepare(Path::new(&cover.path), &output) {
+        match artwork::prepare(Path::new(&cover.path), &output, profile) {
             Ok(prepared) => {
                 assets.push(import::ImportAsset::cover_bin(
                     prepared.cover_path,
                     prepared.cover_size,
                 ));
-                if let (Some(path), Some(size)) =
-                    (prepared.background_path, prepared.background_size)
-                {
-                    assets.push(import::ImportAsset::background_bin(path, size));
+                if let Some(background) = prepared.background {
+                    assets.push(import::ImportAsset::background_bin(background));
                 }
             }
             Err(error) => {
@@ -463,6 +472,7 @@ fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
         &song,
         &snapshot.netease_cookie,
         snapshot.netease_audio_bitrate,
+        selected_device_profile(&snapshot),
     ) {
         Ok(prepared) => prepared,
         Err(error) => {

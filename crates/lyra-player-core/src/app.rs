@@ -136,27 +136,22 @@ impl LyraApp {
                 }
             }
             Action::SelectSong(song) => {
-                self.player.select(song.clone(), core::iter::empty());
-                self.error = None;
                 self.navigate(Route::Player, &mut effects);
-                match song.local_path {
-                    Some(path) => effects.push(Effect::StreamAudio { path }),
-                    None => {
-                        self.player.state = crate::playback::PlaybackState::Failed;
-                        self.error = Some(String::from("歌曲缺少本地音频文件"));
-                    }
-                }
+                self.play(song, &mut effects);
             }
+            // Track changes never navigate. Besides the player page's own
+            // buttons, they come from headset gestures and from a track
+            // finishing, both handled on the Bluetooth thread, where the page
+            // manager must not be touched; the user may also be on another
+            // page or outside the app entirely.
             Action::Previous => {
                 if let Some(song) = self.adjacent_song(false) {
-                    effects.extend(self.update(Action::SelectSong(song)));
-                    return effects;
+                    self.play(song, &mut effects);
                 }
             }
             Action::Next => {
                 if let Some(song) = self.adjacent_song(true) {
-                    effects.extend(self.update(Action::SelectSong(song)));
-                    return effects;
+                    self.play(song, &mut effects);
                 }
             }
             Action::Tick(ms) => self.player.tick(ms),
@@ -240,6 +235,18 @@ impl LyraApp {
             }
         };
         self.local_tracks.get(adjacent).cloned()
+    }
+
+    fn play(&mut self, song: Song, effects: &mut Vec<Effect>) {
+        self.player.select(song.clone(), core::iter::empty());
+        self.error = None;
+        match song.local_path {
+            Some(path) => effects.push(Effect::StreamAudio { path }),
+            None => {
+                self.player.state = crate::playback::PlaybackState::Failed;
+                self.error = Some(String::from("歌曲缺少本地音频文件"));
+            }
+        }
     }
 
     fn navigate(&mut self, route: Route, effects: &mut Vec<Effect>) {
@@ -374,6 +381,68 @@ mod tests {
         );
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(1));
         assert_eq!(app.player.state, crate::playback::PlaybackState::Playing);
+    }
+
+    /// The mode row lives on the home page, so after switching to repeat or
+    /// shuffle the user is usually not on the player page when a track ends.
+    /// The automatic advance runs on the Bluetooth thread and must not ask for
+    /// navigation, which would drive the page manager from that thread.
+    #[test]
+    fn track_changes_in_every_mode_stay_on_the_current_page() {
+        let tracks = alloc::vec![local_song(1), local_song(2), local_song(3)];
+        for mode in [
+            PlaybackMode::ListOnce,
+            PlaybackMode::RepeatAll,
+            PlaybackMode::Shuffle,
+        ] {
+            let mut app = LyraApp::default();
+            app.update(Action::Boot(tracks.clone()));
+            app.update(Action::SelectSong(tracks[1].clone()));
+            app.update(Action::Back);
+            app.mode = mode;
+            assert_eq!(app.route, Route::Home);
+            let history = app.history.clone();
+
+            for action in [Action::Next, Action::Previous] {
+                let effects = app.update(action);
+                assert!(
+                    !effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::Navigate(_))),
+                    "{mode:?} track change must not navigate"
+                );
+                assert!(
+                    effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::StreamAudio { .. })),
+                    "{mode:?} track change must start audio"
+                );
+                assert_eq!(app.route, Route::Home);
+                assert_eq!(app.history, history);
+            }
+        }
+    }
+
+    #[test]
+    fn repeat_wraps_and_shuffle_never_replays_the_current_track() {
+        let tracks = alloc::vec![local_song(1), local_song(2), local_song(3)];
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(tracks.clone()));
+
+        app.mode = PlaybackMode::RepeatAll;
+        app.update(Action::SelectSong(tracks[2].clone()));
+        app.update(Action::Next);
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(1));
+        app.update(Action::Previous);
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(3));
+
+        app.mode = PlaybackMode::Shuffle;
+        for _ in 0..32 {
+            let before = app.player.current.as_ref().map(|song| song.id);
+            assert!(app.has_next());
+            app.update(Action::Next);
+            assert_ne!(app.player.current.as_ref().map(|song| song.id), before);
+        }
     }
 
     #[test]

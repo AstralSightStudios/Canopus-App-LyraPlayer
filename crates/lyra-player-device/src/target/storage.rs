@@ -92,15 +92,17 @@ pub fn load_library() -> Result<Vec<lyra_player_core::Song>, i32> {
 }
 
 pub fn validate_lvgl_v9_image(path: &str, width: u16, height: u16) -> bool {
-    let Some(path) = resolve_path(path) else {
-        return false;
-    };
-    let Ok(path) = c_path(&path) else {
-        return false;
-    };
+    lvgl_v9_image_size(path) == Some((width, height))
+}
+
+/// Dimensions of a well-formed ARGB8888 LVGL v9 BIN whose length matches its
+/// header, or `None` for anything else.
+pub fn lvgl_v9_image_size(path: &str) -> Option<(u16, u16)> {
+    let path = resolve_path(path)?;
+    let path = c_path(&path).ok()?;
     let fd = unsafe { nuttx_open(path.as_ptr(), O_RDONLY) };
     if fd < 0 {
-        return false;
+        return None;
     }
     let mut header = [0u8; 12];
     let mut read = 0usize;
@@ -114,21 +116,23 @@ pub fn validate_lvgl_v9_image(path: &str, width: u16, height: u16) -> bool {
         };
         if count <= 0 {
             let _ = unsafe { nuttx_close(fd) };
-            return false;
+            return None;
         }
         read += count as usize;
     }
     let length = unsafe { nuttx_lseek(fd, 0, 2) };
     let close = unsafe { nuttx_close(fd) };
-    let stride = width.checked_mul(4);
+    let width = u16::from_le_bytes([header[4], header[5]]);
+    let height = u16::from_le_bytes([header[6], header[7]]);
     let expected = 12i64 + i64::from(width) * i64::from(height) * 4;
-    close >= 0
+    let valid = close >= 0
         && length == expected
         && header[0..4] == [0x19, 0x10, 0, 0]
-        && u16::from_le_bytes([header[4], header[5]]) == width
-        && u16::from_le_bytes([header[6], header[7]]) == height
-        && stride.is_some_and(|stride| u16::from_le_bytes([header[8], header[9]]) == stride)
-        && header[10..12] == [0, 0]
+        && width
+            .checked_mul(4)
+            .is_some_and(|stride| u16::from_le_bytes([header[8], header[9]]) == stride)
+        && header[10..12] == [0, 0];
+    valid.then_some((width, height))
 }
 
 fn map_error(error: lyra_player_core::persistence::PersistenceError<i32>) -> i32 {

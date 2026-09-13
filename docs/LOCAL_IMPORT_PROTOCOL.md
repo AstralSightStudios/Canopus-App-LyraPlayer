@@ -78,7 +78,7 @@ manifest schema 中 `cover_url` 与 `background_url` 都可以为空；旧版 ma
 - 分片校验：默认 IEEE CRC-32，小写 8 位十六进制；用户显式选择无校验时省略 `crc32` 字段以减少开销，但仍保留 Base64、长度、资源、seq、offset、ACK 和 staging 校验
 - 音频上限：64 MiB
 - 封面上限：4 MiB；新插件会把 JPEG/PNG 预处理为未压缩 LVGL v9 ARGB8888 BIN，固定为 180×180（129612 字节）
-- 背景上限：698892 字节；新插件从封面生成混色模糊 LVGL v9 ARGB8888 BIN，固定为 336×520，底部 40px 透明渐隐
+- 背景上限：698892 字节；新插件从封面生成混色模糊 LVGL v9 ARGB8888 BIN，高 520，宽度按目标设备名选择：小米手环 11 为 212（440972 字节），小米手环 10 Pro 及无法识别的设备为 336（698892 字节）；底部 40px 透明渐隐
 - 歌词上限：2 MiB
 - 必须包含一个 `audio` asset；`cover`、`background` 和 `lyrics` 可选且各最多一个；顺序固定为 `audio → cover → background → lyrics`
 
@@ -103,9 +103,12 @@ manifest schema 中 `cover_url` 与 `background_url` 都可以为空；旧版 ma
   "chunkModes":["crc32","none","none-48k"],
   "assets":["audio","cover","background","lyrics"],
   "maxAssets":4,
-  "imageFormats":["lvgl-v9-argb8888-bin"]
+  "imageFormats":["lvgl-v9-argb8888-bin"],
+  "backgroundWidths":[336,212]
 }
 ```
+
+`backgroundWidths` 列出快应用接受的背景宽度。未声明该字段的旧快应用只接受 336；插件准备的背景宽度不在列表内时，只省略 `background`，封面、音频和歌词照常导入。
 
 旧版快应用未声明 `background` 与 `imageFormats` 时，插件必须省略预处理的 `cover`/`background` BIN，只发送音频和歌词（若有）。新快应用仍接受旧插件发送的 JPG/PNG `cover`，因此升级接收端不会破坏旧插件导入。
 

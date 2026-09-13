@@ -369,6 +369,7 @@ pub fn prepare(
     song: &CloudSong,
     cookie: &str,
     audio_bitrate: u32,
+    profile: artwork::DeviceProfile,
 ) -> Result<PreparedCloud, String> {
     let audio_bitrate = normalized_audio_bitrate(audio_bitrate);
     let nonce = SystemTime::now()
@@ -411,23 +412,22 @@ pub fn prepare(
     } else {
         let source_path = directory.join("cover-source.jpg");
         match download(&song.cover_url, &source_path, MAX_COVER_BYTES) {
-            Ok(size) => match artwork::prepare(&source_path, &directory) {
+            Ok(size) => match artwork::prepare(&source_path, &directory, profile) {
                 Ok(prepared) => {
                     tracing::info!(
                         song_id = song.id,
                         source_bytes = size,
                         cover_bytes = prepared.cover_size,
-                        background_bytes = prepared.background_size.unwrap_or(0),
+                        background_bytes = prepared.background.as_ref().map_or(0, |item| item.size),
+                        ?profile,
                         "NetEase artwork prepared"
                     );
                     assets.push(ImportAsset::cover_bin(
                         prepared.cover_path,
                         prepared.cover_size,
                     ));
-                    if let (Some(path), Some(size)) =
-                        (prepared.background_path, prepared.background_size)
-                    {
-                        assets.push(ImportAsset::background_bin(path, size));
+                    if let Some(background) = prepared.background {
+                        assets.push(ImportAsset::background_bin(background));
                     }
                 }
                 Err(error) => tracing::warn!(
