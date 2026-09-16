@@ -16,7 +16,10 @@ use super::storage;
 
 static EMPTY_TEXT: [u8; 1] = [0];
 const REFRESH_PERIOD_MS: u32 = 100;
-const PLAYER_LAYOUT: PlayerLayout = if cfg!(feature = "target-xiaomi-band-11-4-100-139") {
+const PLAYER_LAYOUT: PlayerLayout = if cfg!(any(
+    feature = "target-xiaomi-band-11-4-100-139",
+    feature = "target-xiaomi-band-11-4-100-155"
+)) {
     PlayerLayout::BAND_11
 } else {
     PlayerLayout::BAND_10_PRO
@@ -41,9 +44,15 @@ const CONTROL_ANIMATION_STEPS: u32 = 8;
 const ROW_IMAGE_BUTTON: u8 = 4;
 const EVENT_ALL: u32 = 0;
 const EVENT_PRESSED: u32 = 1;
-#[cfg(feature = "target-xiaomi-band-11-4-100-139")]
+#[cfg(any(
+    feature = "target-xiaomi-band-11-4-100-139",
+    feature = "target-xiaomi-band-11-4-100-155"
+))]
 const EVENT_RELEASED: u32 = 8; // .139 native switch event body 0xc6a0f90.
-#[cfg(not(feature = "target-xiaomi-band-11-4-100-139"))]
+#[cfg(not(any(
+    feature = "target-xiaomi-band-11-4-100-139",
+    feature = "target-xiaomi-band-11-4-100-155"
+)))]
 const EVENT_RELEASED: u32 = 2;
 const EVENT_PRESS_LOST: u32 = 3;
 const CONTROL_PREVIOUS_ICON: &[u8] = b"/data/canopus/lyra-previous.bin\0";
@@ -959,7 +968,10 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     if created_now
                         && (is_player_title
                             || (is_player_author
-                                && cfg!(feature = "target-xiaomi-band-11-4-100-139")))
+                                && cfg!(any(
+                                    feature = "target-xiaomi-band-11-4-100-139",
+                                    feature = "target-xiaomi-band-11-4-100-155"
+                                ))))
                     {
                         // Circular scroll needs a fixed width to scroll within,
                         // which the explicit set_size below provides.
@@ -973,7 +985,11 @@ pub fn apply_snapshot(page_index: usize, snapshot: &Snapshot) -> i32 {
                     }
                     let height = if is_player_title {
                         PLAYER_TITLE_HEIGHT
-                    } else if is_player_author && cfg!(feature = "target-xiaomi-band-11-4-100-139")
+                    } else if is_player_author
+                        && cfg!(any(
+                            feature = "target-xiaomi-band-11-4-100-139",
+                            feature = "target-xiaomi-band-11-4-100-155"
+                        ))
                     {
                         PLAYER_LAYOUT.author_height
                     } else {
