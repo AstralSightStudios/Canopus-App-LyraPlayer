@@ -38,7 +38,8 @@ pub enum DeviceProfile {
 impl DeviceProfile {
     pub const ALL: [Self; 2] = [Self::Band10Pro, Self::Band11];
 
-    /// Identifies the device from the name AstroBox reports.
+    /// Identifies the device from the name AstroBox reports. Whitespace and
+    /// letter case are ignored, so "小米手环 11" matches "小米手环11".
     pub fn from_device_name(name: &str) -> Self {
         const BAND_11: [&str; 3] = ["小米手环11", "小米手環11", "Xiaomi Smart Band 11"];
         const BAND_10_PRO: [&str; 3] = [
@@ -46,9 +47,14 @@ impl DeviceProfile {
             "小米手環10 Pro",
             "Xiaomi Smart Band 10 Pro",
         ];
-        if BAND_11.iter().any(|key| name.contains(key)) {
+        let name = normalized_device_name(name);
+        let matches = |keys: &[&str]| {
+            keys.iter()
+                .any(|key| name.contains(&normalized_device_name(key)))
+        };
+        if matches(&BAND_11) {
             Self::Band11
-        } else if BAND_10_PRO.iter().any(|key| name.contains(key)) {
+        } else if matches(&BAND_10_PRO) {
             Self::Band10Pro
         } else {
             Self::default()
@@ -65,6 +71,13 @@ impl DeviceProfile {
     pub const fn background_bin_bytes(self) -> u64 {
         lvgl_v9_bin_bytes(self.background_width(), BACKGROUND_HEIGHT)
     }
+}
+
+fn normalized_device_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 pub const fn lvgl_v9_bin_bytes(width: u32, height: u32) -> u64 {
@@ -382,9 +395,14 @@ mod tests {
         for name in [
             "小米手环11",
             "小米手环11 A1B2",
+            "小米手环 11",
+            "小米手环\u{3000}11",
             "小米手環11",
+            "小米手環 11 NFC",
             "Xiaomi Smart Band 11",
             "Xiaomi Smart Band 11 NFC",
+            "XIAOMI SMART BAND 11",
+            "Xiaomi  Smart Band11",
         ] {
             assert_eq!(
                 DeviceProfile::from_device_name(name),
@@ -394,8 +412,10 @@ mod tests {
         }
         for name in [
             "小米手环10 Pro",
+            "小米手环 10 Pro",
             "小米手環10 Pro 5C3D",
             "Xiaomi Smart Band 10 Pro",
+            "xiaomi smart band 10 pro",
             "",
             "Xiaomi Watch S4",
         ] {
