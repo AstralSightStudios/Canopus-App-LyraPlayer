@@ -13,10 +13,10 @@ crate-type = ["staticlib"]
 default = []
 device = ["dep:canopus-target-private"]
 target-xiaomi-band-10-pro-3-101-036 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-036"]
-target-xiaomi-band-9-pro-3-1-175 = ["device", "canopus-target-private/target-xiaomi-band-9-pro-3-1-175"]
 target-xiaomi-band-10-pro-3-101-043 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-043"]
 target-xiaomi-band-11-4-100-139 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-139"]
 target-xiaomi-band-11-4-100-155 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-155"]
+target-xiaomi-band-11-4-100-177 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-177"]
 
 [dependencies]
 lyra-player-core = { path = "../lyra-player-core", default-features = false }
