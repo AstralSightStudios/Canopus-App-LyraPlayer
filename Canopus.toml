@@ -21,6 +21,9 @@ allowed_constants = [
   "0x0c000f06",
   "0x0c000000",
   "0x0c59011a",
+  "0x0c070201",
+  "0x0c092603",
+  "0x0c010101",
 ]
 
 [targets]
@@ -30,4 +33,13 @@ include = [
   "xiaomi-band-11-4.100.139",
   "xiaomi-band-11-4.100.155",
   "xiaomi-band-11-4.100.177",
+]
+
+[resources]
+files = [
+  "watchfaces/lyra-player/appicon_lyra.bin",
+  "watchfaces/lyra-player/lyra-previous.bin",
+  "watchfaces/lyra-player/lyra-play.bin",
+  "watchfaces/lyra-player/lyra-pause.bin",
+  "watchfaces/lyra-player/lyra-next.bin",
 ]
