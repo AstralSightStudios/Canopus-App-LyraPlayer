@@ -134,9 +134,19 @@ impl ImportStore for DeviceStore {
     fn stage_commit(&mut self, id: u64) -> Result<(), Status> {
         self.open = None;
         let target = format!("tracks/{id}");
-        self.remove_dir_contents(&target);
-        let _ = fs::remove(self.ctx, &target);
-        fs::rename(self.ctx, "stage", &target).map_err(status_of)
+        mkdir(self.ctx, &target).map_err(status_of)?;
+        // The firmware nests a renamed directory inside an existing target.
+        for asset in Self::ASSETS {
+            let destination = format!("{target}/{}", asset.file_name());
+            if fs::exists(self.ctx, &destination) {
+                fs::remove(self.ctx, &destination).map_err(status_of)?;
+            }
+            let source = format!("stage/{}", asset.file_name());
+            if fs::exists(self.ctx, &source) {
+                fs::rename(self.ctx, &source, &destination).map_err(status_of)?;
+            }
+        }
+        Ok(())
     }
 
     fn stage_abort(&mut self) {
