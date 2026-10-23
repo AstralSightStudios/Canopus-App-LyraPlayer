@@ -11,6 +11,6 @@ default = ["std"]
 std = ["serde/std", "serde_json/std"]
 
 [dependencies]
-lyra-protocol = { path = "../lyra-protocol", default-features = false }
+canopus-ui-core = { path = "../../../Canopus/sdk/rust/canopus-ui-core" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

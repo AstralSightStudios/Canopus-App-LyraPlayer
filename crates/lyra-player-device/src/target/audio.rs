@@ -298,21 +298,7 @@ fn find_mp3_seek_point(fd: i32, target_ms: u32) -> Result<(u64, u32), i32> {
     }
 }
 
-/// Bytes per millisecond a dry-run "sink" swallows: 128 kbit/s, so the
-/// emulated playback runs at the speed of a 128 kbit/s MP3.
-const DRY_BYTES_PER_MS: u64 = 16;
-
-/// A sink that plays nothing. Mirage has no Bluetooth audio sink, so the
-/// emulator tests switch it on with a `dry-run` file in the module directory.
-#[derive(Clone, Copy)]
-struct DryRun {
-    volume: u32,
-    credit: u64,
-    last_ms: u64,
-}
-
 pub struct AudioDevice {
-    dry: Option<DryRun>,
     fd: i32,
     local_fd: i32,
     last_stage: u8,
@@ -323,7 +309,6 @@ pub struct AudioDevice {
 impl AudioDevice {
     pub const fn new() -> Self {
         Self {
-            dry: None,
             fd: -1,
             local_fd: -1,
             last_stage: STAGE_NONE,
@@ -415,14 +400,6 @@ impl AudioDevice {
     }
 
     fn ioctl_value(&mut self, command: u32, argument: usize) -> Result<(), i32> {
-        if let Some(dry) = &mut self.dry {
-            match command {
-                IOC_GET_VOLUME => unsafe { (argument as *mut u32).write(dry.volume) },
-                IOC_SET_VOLUME => dry.volume = unsafe { (argument as *const u32).read() },
-                _ => {}
-            }
-            return Ok(());
-        }
         self.last_stage = Self::ioctl_stage(command);
         let fd = self.ensure_open()?;
         let result = unsafe { nuttx_ioctl(fd, command, argument) };
@@ -474,15 +451,7 @@ impl AudioDevice {
 
     pub fn start_local(&mut self, path: &str, player: &mut Player) -> Result<(), i32> {
         self.close_local();
-        self.dry = storage::dry_run_enabled().then(|| DryRun {
-            volume: self.dry.map_or(100, |dry| dry.volume),
-            credit: 0,
-            last_ms: monotonic_ms().unwrap_or(0),
-        });
-        if !storage::is_module_path(path) {
-            return Err(-2);
-        }
-        let resolved = path;
+        let resolved = storage::resolve_path(path).ok_or(-2)?;
         let mut c_path = Vec::with_capacity(resolved.len() + 1);
         c_path.extend_from_slice(resolved.as_bytes());
         c_path.push(0);
@@ -628,15 +597,6 @@ impl AudioSink for AudioDevice {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
-        if let Some(dry) = &mut self.dry {
-            let now = monotonic_ms().unwrap_or(dry.last_ms);
-            dry.credit = (dry.credit + now.saturating_sub(dry.last_ms) * DRY_BYTES_PER_MS)
-                .min(64 * 1024);
-            dry.last_ms = now;
-            let accepted = (bytes.len() as u64).min(dry.credit);
-            dry.credit -= accepted;
-            return Ok(accepted as usize);
-        }
         self.last_stage = STAGE_AUDIO_WRITE;
         let fd = self.ensure_open()?;
         let count = u32::try_from(bytes.len()).map_err(|_| -1)?;

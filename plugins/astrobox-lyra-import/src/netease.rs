@@ -158,6 +158,8 @@ struct ArtistWire {
 
 #[derive(Default, Deserialize)]
 struct AlbumWire {
+    #[serde(default)]
+    id: u64,
     #[serde(default, deserialize_with = "string_or_empty")]
     name: String,
     #[serde(default, alias = "picUrl", deserialize_with = "string_or_empty")]
@@ -207,7 +209,6 @@ struct QrCheckEnvelope {
 
 pub struct PreparedCloud {
     pub song: CloudSong,
-    pub palette: artwork::Palette,
     pub assets: Vec<ImportAsset>,
 }
 
@@ -285,6 +286,7 @@ fn cloud_song(song: SongWire) -> CloudSong {
         name: song.name,
         artists: song.ar.into_iter().map(|artist| artist.name).collect(),
         album: song.al.name,
+        album_id: song.al.id,
         duration_ms: song.dt,
         cover_url: song.al.pic_url,
     }
@@ -367,6 +369,7 @@ pub fn prepare(
     song: &CloudSong,
     cookie: &str,
     audio_bitrate: u32,
+    profile: artwork::DeviceProfile,
 ) -> Result<PreparedCloud, String> {
     let audio_bitrate = normalized_audio_bitrate(audio_bitrate);
     let nonce = SystemTime::now()
@@ -401,25 +404,31 @@ pub fn prepare(
     }
 
     let audio_path = directory.join("audio.mp3");
-    download(&url, &audio_path, MAX_AUDIO_BYTES)?;
-    let mut assets = vec![ImportAsset::audio(path_text(&audio_path)?)];
+    let audio_size = download(&url, &audio_path, MAX_AUDIO_BYTES)?;
+    let mut assets = vec![ImportAsset::audio(path_text(&audio_path)?, audio_size)];
 
-    let mut palette = artwork::Palette::default();
     if song.cover_url.is_empty() {
         tracing::warn!(song_id = song.id, "NetEase song has no album cover URL");
     } else {
         let source_path = directory.join("cover-source.jpg");
         match download(&song.cover_url, &source_path, MAX_COVER_BYTES) {
-            Ok(size) => match artwork::prepare(&source_path, &directory) {
+            Ok(size) => match artwork::prepare(&source_path, &directory, profile) {
                 Ok(prepared) => {
                     tracing::info!(
                         song_id = song.id,
                         source_bytes = size,
                         cover_bytes = prepared.cover_size,
+                        background_bytes = prepared.background.as_ref().map_or(0, |item| item.size),
+                        ?profile,
                         "NetEase artwork prepared"
                     );
-                    palette = prepared.palette;
-                    assets.push(ImportAsset::cover(prepared.cover_path));
+                    assets.push(ImportAsset::cover_bin(
+                        prepared.cover_path,
+                        prepared.cover_size,
+                    ));
+                    if let Some(background) = prepared.background {
+                        assets.push(ImportAsset::background_bin(background));
+                    }
                 }
                 Err(error) => tracing::warn!(
                     song_id = song.id,
@@ -443,12 +452,15 @@ pub fn prepare(
     if lyrics.len() <= 2 * 1024 * 1024 {
         let lyrics_path = directory.join("lyrics.json");
         fs::write(&lyrics_path, &lyrics).map_err(|error| format!("无法保存歌词：{error}"))?;
-        assets.push(ImportAsset::lyrics(path_text(&lyrics_path)?, "json"));
+        assets.push(ImportAsset::lyrics(
+            path_text(&lyrics_path)?,
+            lyrics.len() as u64,
+            "json",
+        ));
     }
 
     Ok(PreparedCloud {
         song: song.clone(),
-        palette,
         assets,
     })
 }

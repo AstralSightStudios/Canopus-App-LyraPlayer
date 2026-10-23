@@ -1,9 +1,0 @@
-// Plugin side of CanopusConnect (API level 4); see astrobox-psys-host-v4.wit.
-package astrobox:psys-plugin-v4;
-
-interface canopusconnect {
-    use astrobox:psys-host-v4/canopusconnect.{payload};
-
-    // A module sent `payload`; the plugin must have called `listen` for it.
-    on-message: func(device-addr: string, module-id: string, payload: payload) -> future;
-}

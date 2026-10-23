@@ -1,0 +1,1095 @@
+<template>
+  <div class="page">
+    <div class="content">
+      <text class="title">Lyra Import</text>
+      <text class="status">{{statusText}}</text>
+
+      <div class="progress-shell">
+        <div class="progress-fill" style="width: {{progress}}%;"></div>
+      </div>
+      <text class="percent">{{progress}}%</text>
+
+      <div class="summary">
+        <text class="track">{{trackName}}</text>
+        <text class="detail">{{detailText}}</text>
+      </div>
+
+      <div class="warning">
+        <text class="warning-title">请注意</text>
+        <text class="warning-text">音乐导入完成后请勿删除该快应用，删除该快应用也将一并删除导入的音乐。</text>
+      </div>
+
+      <text class="hint">导入时请保持此页面打开、屏幕亮起</text>
+    </div>
+  </div>
+</template>
+
+<style>
+.page {
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: #000000;
+}
+.content {
+  width: 94%;
+  flex-direction: column;
+  align-items: center;
+}
+.title {
+  width: 100%;
+  color: #ffffff;
+  font-size: 26px;
+  font-weight: bold;
+  text-align: center;
+}
+.status {
+  width: 100%;
+  color: #d1d5db;
+  font-size: 17px;
+  lines: 2;
+  text-overflow: ellipsis;
+  text-align: center;
+  margin-top: 12px;
+}
+.progress-shell {
+  width: 100%;
+  height: 10px;
+  border-radius: 5px;
+  background-color: #262626;
+  margin-top: 16px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 10px;
+  border-radius: 5px;
+  background-color: #3b82f6;
+}
+.percent {
+  width: 100%;
+  color: #ffffff;
+  font-size: 19px;
+  text-align: center;
+  margin-top: 6px;
+}
+.summary {
+  width: 100%;
+  padding: 10px 10px 10px 10px;
+  margin-top: 14px;
+  border-radius: 10px;
+  background-color: #171717;
+  flex-direction: column;
+  justify-content: center;
+}
+.track {
+  width: 100%;
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: bold;
+  lines: 1;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+.detail {
+  width: 100%;
+  color: #a3a3a3;
+  font-size: 14px;
+  lines: 1;
+  text-overflow: ellipsis;
+  text-align: center;
+  margin-top: 5px;
+}
+.warning {
+  width: 100%;
+  padding: 10px 10px 10px 10px;
+  margin-top: 12px;
+  border-width: 1px;
+  border-color: #a16207;
+  border-radius: 8px;
+  background-color: #1c1917;
+  flex-direction: column;
+}
+.warning-title {
+  width: 100%;
+  color: #fbbf24;
+  font-size: 20px;
+  font-weight: bold;
+}
+.warning-text {
+  width: 100%;
+  color: #e5e5e5;
+  font-size: 16px;
+  line-height: 22px;
+  margin-top: 4px;
+}
+.hint {
+  width: 100%;
+  color: #FF1100;
+  font-size: 16px;
+  text-align: center;
+  margin-top: 12px;
+}
+</style>
+
+<script>
+import interconnect from '@system.interconnect'
+import file from '@system.file'
+import brightness from '@system.brightness'
+
+const ROOT = 'internal://files/lyra'
+const STAGING = ROOT + '/staging'
+const TRACKS = ROOT + '/tracks'
+const LIBRARY = ROOT + '/library.json'
+const LIBRARY_TMP = ROOT + '/library.json.tmp'
+const LIBRARY_BACKUP = ROOT + '/library.json.backup'
+const DELETE_JOURNAL = ROOT + '/library-delete.pending.json'
+const DELETING = ROOT + '/deleting'
+const PHYSICAL_ROOT = '/data/files/com.canopus.lyraimport/lyra'
+const LEGACY_PHYSICAL_ROOT = '/data/quickapp/files/com.canopus.lyraimport/lyra'
+const PROTOCOL_VERSION = 2
+// Keep the serialized Base64/JSON chunk below the 48 KiB host-to-watch frame cap.
+const CRC32_CHUNK_BYTES = 35 * 1024
+const FAST_CHUNK_BYTES = 36608
+const ULTRA_CHUNK_BYTES = 36753
+const MAX_CHUNK_BYTES = ULTRA_CHUNK_BYTES
+const MAX_CHUNK_RETRIES = 2
+// Player background widths (Band 10 Pro, Band 11); the height is always 520.
+const BACKGROUND_WIDTHS = [336, 212]
+const DECODE_QUARTETS_PER_SLICE = 512
+const CRC_BYTES_PER_SLICE = 4096
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+const BASE64_LOOKUP = (() => {
+  const table = new Array(128).fill(-1)
+  for (let index = 0; index < BASE64_ALPHABET.length; index += 1) {
+    table[BASE64_ALPHABET.charCodeAt(index)] = index
+  }
+  return table
+})()
+
+export default {
+  private: {
+    connect: null,
+    active: null,
+    operation: null,
+    statusText: '等待 AstroBox 连接',
+    trackName: '尚未开始导入',
+    detailText: '音频 · 封面 · 背景 · 歌词',
+    progress: 0
+  },
+
+  onInit() {
+    this.operation = Promise.resolve()
+    this.connect = interconnect.instance()
+    this.connect.onopen = (data) => {
+      this.statusText = data && data.isReconnected ? '已重新连接' : '已连接，等待导入'
+    }
+    this.connect.onclose = (data) => {
+      this.statusText = '连接已断开'
+      this.detailText = data && data.data ? String(data.data) : '请保持快应用打开'
+    }
+    this.connect.onerror = (data) => {
+      this.statusText = '连接出现错误'
+      this.detailText = data && data.data ? String(data.data) : '请稍后重试'
+    }
+    this.connect.onmessage = (event) => {
+      const payload = event && event.data !== undefined ? event.data : event
+      this.operation = this.operation
+        .then(() => this.handleMessage(payload))
+        .catch((error) => {
+          const reason = error && error.message ? error.message : String(error)
+          if (this.active) return this.failActive('io-error', reason)
+          this.sendError('', 'io-error', reason)
+        })
+    }
+  },
+
+  onReady() {
+    interconnect.getReadyState({
+      success: (data) => {
+        this.statusText = data.status === 1 ? '已连接，等待导入' : '等待 AstroBox 连接'
+      },
+      fail: () => {
+        this.statusText = '等待 AstroBox 连接'
+      }
+    })
+    this.ensureDirectories()
+      .then(() => this.recoverPendingDelete())
+      .then((recovered) => {
+        if (!recovered) throw new Error('无法恢复未完成的音乐删除事务')
+        return this.repairLibraryPaths()
+      })
+      .catch((error) => {
+        this.statusText = '无法准备音乐库'
+        this.detailText = String(error)
+      })
+    brightness.setKeepScreenOn({
+        keepScreenOn: true
+    })
+  },
+
+  yieldEventLoop() {
+    return new Promise((resolve) => setTimeout(resolve, 0))
+  },
+
+  async handleMessage(payload) {
+    let message = payload
+    if (typeof message === 'string') {
+      message = JSON.parse(message)
+    }
+    if (!message || typeof message !== 'object') {
+      throw new Error('invalid message')
+    }
+    switch (message.tag) {
+      case 'lyra-library-list':
+        await this.listLibrary(message)
+        return
+      case 'lyra-library-move':
+        await this.moveLibraryTrack(message)
+        return
+      case 'lyra-library-delete':
+        await this.deleteLibraryTrack(message)
+        return
+      case 'lyra-import-hello':
+        this.send({
+          tag: 'lyra-import-hello',
+          version: PROTOCOL_VERSION,
+          maxChunkBytes: MAX_CHUNK_BYTES,
+          window: 1,
+          encodings: ['base64'],
+          checksums: ['crc32', 'none'],
+          chunkModes: ['crc32', 'none', 'none-48k'],
+          assets: ['audio', 'cover', 'background', 'lyrics'],
+          maxAssets: 4,
+          imageFormats: ['lvgl-v9-argb8888-bin'],
+          backgroundWidths: BACKGROUND_WIDTHS
+        })
+        return
+      case 'lyra-import-begin':
+        await this.beginImport(message)
+        return
+      case 'lyra-import-chunk':
+        await this.writeChunk(message)
+        return
+      case 'lyra-import-asset-end':
+        await this.endAsset(message)
+        return
+      case 'lyra-import-commit':
+        await this.commitImport(message)
+        return
+      case 'lyra-import-cancel':
+        await this.cancelImport(message.id)
+        return
+      default:
+        this.sendError(message.id, 'invalid-request', 'unknown message tag')
+    }
+  },
+
+  async listLibrary(message) {
+    const offset = Number(message.offset)
+    const requestedLimit = Number(message.limit)
+    if (message.version !== 1 || !this.validId(message.requestId) || this.active || !Number.isInteger(offset) || offset < 0 || !Number.isInteger(requestedLimit) || requestedLimit < 1) {
+      this.send({ tag: 'lyra-library-error', requestId: message.requestId || '', code: this.active ? 'busy' : 'invalid-request' })
+      return
+    }
+    try {
+      const library = await this.readLibraryStrict()
+      if (!library) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'invalid-library' })
+        return
+      }
+      const limit = Math.min(12, requestedLimit)
+      const tracks = library.tracks.slice(offset, offset + limit).map((track) => ({
+        id: Number(track.id) || 0,
+        name: String(track.name || '').slice(0, 96),
+        artists: Array.isArray(track.artists) ? track.artists.map((artist) => String(artist.name || '').slice(0, 64)).filter(Boolean).slice(0, 4) : [],
+        album: String(track.album && track.album.name || '').slice(0, 96),
+        durationMs: Number(track.duration_ms) || 0
+      }))
+      const response = { tag: 'lyra-library-page', version: 1, requestId: message.requestId, revision: this.libraryRevision(library), offset, total: library.tracks.length, tracks }
+      while (response.tracks.length > 1 && this.utf8Length(JSON.stringify(response)) > 7800) {
+        response.tracks.pop()
+      }
+      if (this.utf8Length(JSON.stringify(response)) > 7800) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'response-too-large' })
+        return
+      }
+      this.send(response)
+    } catch (_) {
+      this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'io-error' })
+    }
+  },
+
+  async deleteLibraryTrack(message) {
+    const trackId = Number(message.trackId)
+    if (message.version !== 1 || !this.validId(message.requestId) || this.active || typeof message.revision !== 'string' || !Number.isSafeInteger(trackId) || trackId <= 0) {
+      this.send({ tag: 'lyra-library-error', requestId: message.requestId || '', code: this.active ? 'busy' : 'invalid-request' })
+      return
+    }
+
+    try {
+      if (!(await this.recoverPendingDelete())) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'io-error' })
+        return
+      }
+      const library = await this.readLibraryStrict()
+      if (!library) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'invalid-library' })
+        return
+      }
+      const currentRevision = this.libraryRevision(library)
+      if (message.revision !== currentRevision) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'conflict' })
+        return
+      }
+      const target = this.validateDeleteTarget(library, trackId)
+      if (!target) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'invalid-library' })
+        return
+      }
+      if (!target.track) {
+        this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'not-found' })
+        return
+      }
+
+      const nextLibrary = {
+        ...library,
+        tracks: library.tracks.filter((track) => Number(track.id) !== trackId)
+      }
+      const nextRevision = this.libraryRevision(nextLibrary)
+      const journal = {
+        version: 1,
+        transactionId: target.transactionId,
+        trackId,
+        oldRevision: currentRevision,
+        newRevision: nextRevision
+      }
+      await this.writeText(DELETE_JOURNAL, JSON.stringify(journal))
+      await this.publishLibraryForDelete(nextLibrary)
+
+      const source = TRACKS + '/' + target.transactionId
+      const quarantine = DELETING + '/' + target.transactionId
+      try {
+        if (await this.pathExists(quarantine)) {
+          throw new Error('delete quarantine already exists')
+        }
+        await this.move(source, quarantine)
+      } catch (error) {
+        try {
+          const sourceStillExists = await this.pathExists(source)
+          const quarantineStillExists = await this.pathExists(quarantine)
+          if (sourceStillExists && !quarantineStillExists) await this.restoreDeleteManifest()
+        } catch (_) {}
+        throw error
+      }
+
+      let cleanupPending = false
+      try {
+        await this.removeDirectoryStrict(quarantine)
+      } catch (_) {
+        cleanupPending = true
+      }
+      try {
+        await this.removeFileStrict(LIBRARY_BACKUP)
+      } catch (_) {
+        cleanupPending = true
+      }
+      if (!cleanupPending) {
+        try {
+          await this.removeFileStrict(DELETE_JOURNAL)
+        } catch (_) {
+          cleanupPending = true
+        }
+      }
+      this.send({ tag: 'lyra-library-deleted', version: 1, requestId: message.requestId, revision: nextRevision, trackId, cleanupPending })
+    } catch (_) {
+      this.send({ tag: 'lyra-library-error', requestId: message.requestId, code: 'io-error' })
+    }
+  },
+
+  utf8Length(value) {
+    let bytes = 0
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index)
+      if (code < 0x80) bytes += 1
+      else if (code < 0x800) bytes += 2
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length && value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+        bytes += 4
+        index += 1
+      } else bytes += 3
+    }
+    return bytes
+  },
+
+  libraryRevision(library) {
+    let hash = 0x811c9dc5
+    const orderedIds = library.tracks.map((track) => String(Number(track.id) || 0)).join(',')
+    const source = `${library.tracks.length}:${orderedIds}`
+    for (let index = 0; index < source.length; index += 1) {
+      hash ^= source.charCodeAt(index)
+      hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+    return `${library.tracks.length}-${hash.toString(16).padStart(8, '0')}`
+  },
+
+  async readLibraryStrict() {
+    const text = await this.readText(LIBRARY)
+    if (!text) return { version: 1, tracks: [] }
+    try {
+      const library = JSON.parse(text)
+      return library && library.version === 1 && Array.isArray(library.tracks) && library.tracks.every((track) => track && Number.isFinite(Number(track.id))) ? library : null
+    } catch (_) { return null }
+  },
+
+  validateDeleteTarget(library, trackId) {
+    if (!library || library.version !== 1 || !Array.isArray(library.tracks)) return null
+    const seenIds = {}
+    const seenDirectories = {}
+    let target = null
+    let targetTransactionId = ''
+    for (const track of library.tracks) {
+      const id = Number(track && track.id)
+      if (!track || !Number.isSafeInteger(id) || id <= 0 || seenIds[id]) return null
+      seenIds[id] = true
+      const audio = this.parseLibraryPath(track.local_path, ['audio.mp3'])
+      if (!audio || seenDirectories[audio.transactionId]) return null
+      seenDirectories[audio.transactionId] = true
+      const album = track.album && typeof track.album === 'object' ? track.album : {}
+      const resources = [
+        { value: album.cover_url, names: ['cover.jpg', 'cover.jpeg', 'cover.png', 'cover.bin'] },
+        { value: album.background_url, names: ['background.bin'] },
+        { value: track.lyrics_path, names: ['lyrics.lrc', 'lyrics.json'] }
+      ]
+      for (const resource of resources) {
+        if (resource.value === undefined || resource.value === null || resource.value === '') continue
+        const parsed = this.parseLibraryPath(resource.value, resource.names)
+        if (!parsed || parsed.transactionId !== audio.transactionId) return null
+      }
+      if (id === trackId) {
+        target = track
+        targetTransactionId = audio.transactionId
+      }
+    }
+    return { track: target, transactionId: targetTransactionId }
+  },
+
+  parseLibraryPath(path, allowedNames) {
+    if (typeof path !== 'string' || !path || path.includes('\\') || /[\x00-\x1f\x7f]/.test(path)) return null
+    let relative = ''
+    const roots = [PHYSICAL_ROOT, LEGACY_PHYSICAL_ROOT]
+    for (const root of roots) {
+      if (path.startsWith(root + '/')) {
+        relative = path.slice(root.length + 1)
+        break
+      }
+    }
+    if (!relative) return null
+    const parts = relative.split('/')
+    if (parts.length !== 3 || parts[0] !== 'tracks' || !this.validId(parts[1]) || !allowedNames.includes(parts[2])) return null
+    return { transactionId: parts[1], fileName: parts[2] }
+  },
+
+  async recoverPendingDelete() {
+    const text = await this.readText(DELETE_JOURNAL)
+    if (!text) return true
+    let journal
+    try {
+      journal = JSON.parse(text)
+    } catch (_) {
+      return false
+    }
+    const trackId = Number(journal && journal.trackId)
+    if (!journal || journal.version !== 1 || !this.validId(journal.transactionId) || !Number.isSafeInteger(trackId) || trackId <= 0 || typeof journal.oldRevision !== 'string' || typeof journal.newRevision !== 'string') {
+      return false
+    }
+    const source = TRACKS + '/' + journal.transactionId
+    const quarantine = DELETING + '/' + journal.transactionId
+    const sourceExists = await this.pathExists(source)
+    const quarantineExists = await this.pathExists(quarantine)
+    if (sourceExists && quarantineExists) return false
+
+    const currentText = await this.readText(LIBRARY)
+    if (!currentText) {
+      const backup = await this.readText(LIBRARY_BACKUP)
+      if (!backup || (!sourceExists && !quarantineExists)) return false
+      await this.move(LIBRARY_BACKUP, LIBRARY)
+      if (!sourceExists && quarantineExists) await this.move(quarantine, source)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    const library = await this.readLibraryStrict()
+    if (!library) {
+      const backup = await this.readText(LIBRARY_BACKUP)
+      if (!backup || (!sourceExists && !quarantineExists)) return false
+      await this.removeFileStrict(LIBRARY)
+      await this.move(LIBRARY_BACKUP, LIBRARY)
+      if (!sourceExists && quarantineExists) await this.move(quarantine, source)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    const revision = this.libraryRevision(library)
+    const hasTarget = library.tracks.some((track) => Number(track.id) === trackId)
+    if (revision === journal.oldRevision && hasTarget) {
+      if (!sourceExists && quarantineExists) await this.move(quarantine, source)
+      else if (!sourceExists || quarantineExists) return false
+      await this.removeFileStrict(LIBRARY_BACKUP)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    if (revision !== journal.newRevision || hasTarget) return false
+    if (!sourceExists && !quarantineExists) {
+      await this.removeFileStrict(LIBRARY_BACKUP)
+      await this.removeFileStrict(DELETE_JOURNAL)
+      return true
+    }
+    if (sourceExists) await this.move(source, quarantine)
+    if (!(await this.pathExists(quarantine))) return false
+    try {
+      await this.removeDirectoryStrict(quarantine)
+    } catch (_) {
+      return false
+    }
+    await this.removeFileStrict(LIBRARY_BACKUP)
+    await this.removeFileStrict(DELETE_JOURNAL)
+    return true
+  },
+
+  async publishLibraryForDelete(library) {
+    await this.writeText(LIBRARY_TMP, JSON.stringify(library))
+    const hadLibrary = Boolean(await this.readText(LIBRARY))
+    await this.removeFileStrict(LIBRARY_BACKUP)
+    if (hadLibrary) {
+      await this.move(LIBRARY, LIBRARY_BACKUP)
+    } else {
+      await this.removeFileStrict(LIBRARY)
+    }
+    try {
+      await this.move(LIBRARY_TMP, LIBRARY)
+    } catch (error) {
+      if (hadLibrary) await this.move(LIBRARY_BACKUP, LIBRARY)
+      throw error
+    }
+  },
+
+  async restoreDeleteManifest() {
+    const backup = await this.readText(LIBRARY_BACKUP)
+    if (!backup) throw new Error('delete manifest backup missing')
+    let library
+    try {
+      library = JSON.parse(backup)
+    } catch (_) {
+      throw new Error('delete manifest backup invalid')
+    }
+    await this.publishLibrary(library)
+    await this.removeFileStrict(DELETE_JOURNAL)
+  },
+
+  async publishLibrary(library) {
+    await this.writeText(LIBRARY_TMP, JSON.stringify(library))
+    const hadLibrary = Boolean(await this.readText(LIBRARY))
+    await this.removeFile(LIBRARY_BACKUP)
+    if (hadLibrary) {
+      await this.move(LIBRARY, LIBRARY_BACKUP)
+    } else {
+      await this.removeFile(LIBRARY)
+    }
+    try {
+      await this.move(LIBRARY_TMP, LIBRARY)
+    } catch (error) {
+      if (hadLibrary) await this.move(LIBRARY_BACKUP, LIBRARY)
+      throw error
+    }
+    await this.removeFile(LIBRARY_BACKUP)
+  },
+
+  async beginImport(message) {
+    if (message.version !== PROTOCOL_VERSION) {
+      this.sendError(message.id, 'unsupported-version', 'protocol v2 required')
+      return
+    }
+    if (this.active) {
+      this.sendError(message.id, 'busy', 'another import is active')
+      return
+    }
+    const id = this.validId(message.id)
+    const track = this.normalizeTrack(message.track)
+    const assets = this.normalizeAssets(message.assets)
+    const requestedChecksum = message.checksum
+    const checksum = requestedChecksum === 'none' || requestedChecksum === 'crc32' ? requestedChecksum : (requestedChecksum === undefined ? 'crc32' : null)
+    const requestedMode = message.chunkMode
+    const chunkMode = requestedMode === 'none-48k' || requestedMode === 'none' || requestedMode === 'crc32'
+      ? requestedMode
+      : (requestedMode === undefined ? checksum : null)
+    if (!id || !track || !assets || !checksum || !chunkMode || (chunkMode === 'none-48k' && checksum !== 'none')) {
+      this.sendError(message.id, 'invalid-request', 'invalid import metadata')
+      return
+    }
+    await this.ensureDirectories()
+    const stagingDir = STAGING + '/' + id
+    await this.removeDirectory(stagingDir)
+    await this.mkdir(stagingDir)
+    this.active = {
+      id,
+      track,
+      assets,
+      checksum,
+      chunkMode,
+      chunkBytes: chunkMode === 'none-48k' ? ULTRA_CHUNK_BYTES : (chunkMode === 'none' ? FAST_CHUNK_BYTES : CRC32_CHUNK_BYTES),
+      assetIndex: 0,
+      nextSeq: 0,
+      nextOffset: 0,
+      retrySeq: -1,
+      retryCount: 0,
+      receivedTotal: 0,
+      totalBytes: assets.reduce((total, asset) => total + asset.size, 0),
+      stagingDir
+    }
+    this.trackName = track.name
+    this.statusText = '正在接收音频'
+    this.detailText = this.assetLabel(assets[0].kind)
+    this.setProgress(0)
+    this.sendReady()
+  },
+
+  async writeChunk(message) {
+    const active = this.requireActive(message.id)
+    if (!active) return
+    const asset = active.assets[active.assetIndex]
+    const expectedSeq = active.nextSeq
+    const expectedOffset = active.nextOffset
+    const cursorStillValid = () => this.active === active && active.assets[active.assetIndex] === asset && active.nextSeq === expectedSeq && active.nextOffset === expectedOffset
+    if (!asset || message.asset !== asset.kind || message.seq !== expectedSeq || message.offset !== expectedOffset) {
+      await this.failActive('out-of-order', 'unexpected chunk sequence')
+      return
+    }
+    if (message.encoding !== 'base64' || typeof message.data !== 'string') {
+      await this.failActive('invalid-request', 'base64 chunk required')
+      return
+    }
+    const encoded = message.data
+    const maxEncodedLength = Math.ceil(active.chunkBytes / 3) * 4
+    if (!encoded || encoded.length % 4 !== 0 || encoded.length > maxEncodedLength) {
+      await this.requestChunkRetry(active, asset, 'invalid-base64')
+      return
+    }
+    const expectedChecksum = message.crc32
+    await this.yieldEventLoop()
+    const bytes = await this.decodeBase64Async(encoded, active.chunkBytes)
+    if (!bytes || bytes.length === 0 || bytes.length > active.chunkBytes || !cursorStillValid()) {
+      if (cursorStillValid()) await this.requestChunkRetry(active, asset, 'invalid-base64')
+      return
+    }
+    const hasChecksum = typeof expectedChecksum === 'string'
+    let checksumValid = active.checksum === 'none' ? !hasChecksum : false
+    if (active.checksum !== 'none' && hasChecksum) {
+      checksumValid = (await this.crc32HexAsync(bytes)) === expectedChecksum
+    }
+    if (!checksumValid || !cursorStillValid()) {
+      if (cursorStillValid()) await this.requestChunkRetry(active, asset, 'checksum-mismatch')
+      return
+    }
+    if (expectedOffset + bytes.length > asset.size) {
+      await this.requestChunkRetry(active, asset, 'checksum-mismatch')
+      return
+    }
+    await this.writeBuffer(active.stagingDir + '/' + asset.fileName + '.part', bytes, expectedOffset)
+    if (!cursorStillValid()) return
+    active.retrySeq = -1
+    active.retryCount = 0
+    active.nextSeq += 1
+    active.nextOffset += bytes.length
+    active.receivedTotal += bytes.length
+    this.setProgress(active.totalBytes === 0 ? 0 : Math.floor(active.receivedTotal * 100 / active.totalBytes))
+    this.send({
+      tag: 'lyra-import-ack',
+      id: active.id,
+      asset: asset.kind,
+      nextSeq: active.nextSeq,
+      nextOffset: active.nextOffset,
+      receivedBytes: active.receivedTotal,
+      totalBytes: active.totalBytes
+    })
+  },
+
+  async requestChunkRetry(active, asset, reason) {
+    if (active.retrySeq !== active.nextSeq) {
+      active.retrySeq = active.nextSeq
+      active.retryCount = 0
+    }
+    active.retryCount += 1
+    if (active.retryCount > MAX_CHUNK_RETRIES) {
+      await this.failActive('checksum-mismatch', 'chunk failed after 2 retries')
+      return
+    }
+    this.statusText = '分片校验失败，正在请求重传'
+    this.detailText = '第 ' + active.retryCount + '/2 次重传'
+    this.send({
+      tag: 'lyra-import-retry',
+      id: active.id,
+      asset: asset.kind,
+      seq: active.nextSeq,
+      offset: active.nextOffset,
+      reason,
+      attempt: active.retryCount
+    })
+  },
+
+  async endAsset(message) {
+    const active = this.requireActive(message.id)
+    if (!active) return
+    const asset = active.assets[active.assetIndex]
+    if (!asset || message.asset !== asset.kind || active.nextOffset !== asset.size) {
+      await this.failActive('length-mismatch', 'asset length mismatch')
+      return
+    }
+    const source = active.stagingDir + '/' + asset.fileName + '.part'
+    const destination = active.stagingDir + '/' + asset.fileName
+    await this.removeFile(destination)
+    await this.move(source, destination)
+    active.assetIndex += 1
+    active.nextSeq = 0
+    active.nextOffset = 0
+    if (active.assetIndex < active.assets.length) {
+      this.statusText = '正在接收' + this.assetLabel(active.assets[active.assetIndex].kind)
+      this.detailText = this.assetLabel(active.assets[active.assetIndex].kind)
+      this.sendReady()
+    } else {
+      this.statusText = '正在校验导入内容'
+      this.detailText = '准备写入音乐库'
+      this.send({ tag: 'lyra-import-assets-done', id: active.id })
+    }
+  },
+
+  async commitImport(message) {
+    const active = this.requireActive(message.id)
+    if (!active) return
+    if (active.assetIndex !== active.assets.length) {
+      this.sendError(active.id, 'invalid-request', 'assets are incomplete')
+      return
+    }
+    const finalDir = TRACKS + '/' + active.id
+    await this.removeDirectory(finalDir)
+    await this.move(active.stagingDir, finalDir)
+
+    const audio = active.assets.find((asset) => asset.kind === 'audio')
+    const cover = active.assets.find((asset) => asset.kind === 'cover')
+    const background = active.assets.find((asset) => asset.kind === 'background')
+    const lyrics = active.assets.find((asset) => asset.kind === 'lyrics')
+    const physicalDir = PHYSICAL_ROOT + '/tracks/' + active.id
+    const record = {
+      id: active.track.id,
+      name: active.track.name,
+      artists: active.track.artists.map((name) => ({ id: 0, name })),
+      album: {
+        id: active.track.albumId || 0,
+        name: active.track.album || '',
+        cover_url: cover ? physicalDir + '/' + cover.fileName : '',
+        background_url: background ? physicalDir + '/' + background.fileName : ''
+      },
+      duration_ms: active.track.durationMs || 0,
+      local_path: physicalDir + '/' + audio.fileName,
+      lyrics_path: lyrics ? physicalDir + '/' + lyrics.fileName : null
+    }
+    const library = await this.readLibrary()
+    library.tracks = library.tracks.filter((track) => track.id !== record.id)
+    library.tracks.push(record)
+    await this.publishLibrary(library)
+
+    this.active = null
+    this.setProgress(100)
+    this.statusText = '导入完成'
+    this.detailText = 'Lyra Player 将自动刷新音乐库'
+    this.send({ tag: 'lyra-import-done', id: message.id, track: record })
+  },
+
+  async cancelImport(id) {
+    if (this.active && (!id || id === this.active.id)) {
+      const active = this.active
+      this.active = null
+      await this.removeDirectory(active.stagingDir)
+    }
+    this.statusText = '导入已取消'
+    this.detailText = '可以从 AstroBox 重新开始'
+    this.setProgress(0)
+    this.send({ tag: 'lyra-import-cancelled', id: id || '' })
+  },
+
+  async failActive(code, reason) {
+    const active = this.active
+    this.active = null
+    if (active) await this.removeDirectory(active.stagingDir)
+    this.statusText = '导入失败'
+    this.detailText = reason
+    this.sendError(active ? active.id : '', code, reason)
+  },
+
+  sendReady() {
+    const active = this.active
+    const asset = active.assets[active.assetIndex]
+    this.send({
+      tag: 'lyra-import-ready',
+      id: active.id,
+      asset: asset.kind,
+      nextSeq: 0,
+      nextOffset: 0,
+      maxChunkBytes: active.chunkBytes,
+      checksum: active.checksum,
+      chunkMode: active.chunkMode,
+      window: 1
+    })
+  },
+
+  send(message) {
+    if (!this.connect) return
+    this.connect.send({
+      data: message,
+      fail: (data, code) => {
+        this.statusText = '回复 AstroBox 失败'
+        this.detailText = String(data || code)
+      }
+    })
+  },
+
+  sendError(id, code, message) {
+    this.send({ tag: 'lyra-import-error', id: id || '', code, message })
+  },
+
+  requireActive(id) {
+    if (!this.active || id !== this.active.id) {
+      this.sendError(id, 'invalid-request', 'no matching import')
+      return null
+    }
+    return this.active
+  },
+
+  validId(id) {
+    return typeof id === 'string' && /^[A-Za-z0-9_-]{8,48}$/.test(id) ? id : null
+  },
+
+  normalizeTrack(track) {
+    if (!track || typeof track.name !== 'string' || !track.name.trim() || track.name.length > 160) return null
+    const artists = Array.isArray(track.artists) ? track.artists.map((artist) => String(artist).trim()).filter(Boolean).slice(0, 16) : []
+    return {
+      id: Number(track.id) || 0,
+      name: track.name.trim(),
+      artists,
+      album: typeof track.album === 'string' ? track.album.slice(0, 160) : '',
+      albumId: Number(track.albumId) || 0,
+      durationMs: Math.max(0, Number(track.durationMs) || 0)
+    }
+  },
+
+  normalizeAssets(assets) {
+    if (!Array.isArray(assets) || assets.length === 0 || assets.length > 4) return null
+    const seen = {}
+    const limits = { audio: 67108864, cover: 4194304, background: 698892, lyrics: 2097152 }
+    const names = { audio: 'audio.mp3', cover: 'cover.jpg', background: 'background.bin', lyrics: 'lyrics.lrc' }
+    const order = { audio: 0, cover: 1, background: 2, lyrics: 3 }
+    const output = []
+    let previousOrder = 0
+    for (let index = 0; index < assets.length; index += 1) {
+      const source = assets[index]
+      const kind = source && source.kind
+      if (!limits[kind] || seen[kind] || order[kind] < previousOrder) return null
+      const size = Number(source.size)
+      if (!Number.isInteger(size) || size <= 0 || size > limits[kind]) return null
+      let fileName = names[kind]
+      if (kind === 'cover' && source.format === 'lvgl-v9-argb8888-bin') {
+        if (source.extension !== 'bin' || source.width !== 180 || source.height !== 180 || size !== 129612) return null
+        fileName = 'cover.bin'
+      } else if (kind === 'cover' && source.extension === 'png') {
+        fileName = 'cover.png'
+      } else if (kind === 'cover' && source.extension !== 'jpg' && source.extension !== 'jpeg' && source.extension !== undefined) {
+        return null
+      }
+      if (kind === 'background') {
+        // Band 10 Pro 336x520, Band 11 212x520; the size must match the header.
+        if (source.format !== 'lvgl-v9-argb8888-bin' || source.extension !== 'bin' || BACKGROUND_WIDTHS.indexOf(source.width) < 0 || source.height !== 520 || size !== 12 + source.width * 520 * 4) return null
+      }
+      if (kind === 'lyrics' && source.format === 'json') fileName = 'lyrics.json'
+      output.push({ kind, size, fileName })
+      seen[kind] = true
+      previousOrder = order[kind]
+    }
+    if (!seen.audio || assets[0].kind !== 'audio') return null
+    return output
+  },
+
+  assetLabel(kind) {
+    if (kind === 'audio') return '音频'
+    if (kind === 'cover') return '封面'
+    if (kind === 'background') return '播放页背景'
+    if (kind === 'lyrics') return '歌词'
+    return '文件'
+  },
+
+  setProgress(value) {
+    this.progress = Math.max(0, Math.min(100, value))
+  },
+
+  async decodeBase64Async(input, maxBytes) {
+    if (!input || input.length % 4 !== 0) return null
+    const maxEncodedLength = Math.ceil(maxBytes / 3) * 4
+    if (input.length > maxEncodedLength) return null
+    let padding = 0
+    if (input.endsWith('==')) padding = 2
+    else if (input.endsWith('=')) padding = 1
+    const outputLength = input.length / 4 * 3 - padding
+    if (outputLength <= 0 || outputLength > maxBytes) return null
+    const output = new Uint8Array(outputLength)
+    let cursor = 0
+    await this.yieldEventLoop()
+    for (let index = 0; index < input.length; index += 4) {
+      const lastQuartet = index + 4 === input.length
+      const c0 = input.charCodeAt(index)
+      const c1 = input.charCodeAt(index + 1)
+      const c2 = input.charCodeAt(index + 2)
+      const c3 = input.charCodeAt(index + 3)
+      const v0 = c0 < 128 ? BASE64_LOOKUP[c0] : -1
+      const v1 = c1 < 128 ? BASE64_LOOKUP[c1] : -1
+      if (v0 < 0 || v1 < 0) return null
+      if (c2 === 61) {
+        if (!lastQuartet || c3 !== 61 || (v1 & 15) !== 0) return null
+      } else if (c3 === 61 && !lastQuartet) {
+        return null
+      }
+      const v2 = c2 === 61 ? 0 : (c2 < 128 ? BASE64_LOOKUP[c2] : -1)
+      const v3 = c3 === 61 ? 0 : (c3 < 128 ? BASE64_LOOKUP[c3] : -1)
+      if (v2 < 0 || v3 < 0) return null
+      if (c3 === 61 && c2 !== 61 && (v2 & 3) !== 0) return null
+      const word = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+      if (cursor < outputLength) output[cursor++] = word >>> 16 & 255
+      if (cursor < outputLength) output[cursor++] = word >>> 8 & 255
+      if (cursor < outputLength) output[cursor++] = word & 255
+      if ((index / 4 + 1) % DECODE_QUARTETS_PER_SLICE === 0) await this.yieldEventLoop()
+    }
+    return output
+  },
+
+  async crc32HexAsync(bytes) {
+    let crc = 0xffffffff
+    for (let index = 0; index < bytes.length; index += 1) {
+      crc ^= bytes[index]
+      for (let bit = 0; bit < 8; bit += 1) {
+        crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0)
+      }
+      if ((index + 1) % CRC_BYTES_PER_SLICE === 0) await this.yieldEventLoop()
+    }
+    return ('00000000' + ((crc ^ 0xffffffff) >>> 0).toString(16)).slice(-8)
+  },
+
+  async ensureDirectories() {
+    await this.mkdir(ROOT)
+    await this.mkdir(STAGING)
+    await this.mkdir(TRACKS)
+    await this.mkdir(DELETING)
+  },
+
+  pathExists(uri) {
+    return new Promise((resolve, reject) => file.access({
+      uri,
+      success: () => resolve(true),
+      fail: (data, code) => Number(code) === 301 ? resolve(false) : reject(new Error('access ' + code + ': ' + data))
+    }))
+  },
+
+  mkdir(uri) {
+    return new Promise((resolve, reject) => file.access({
+      uri,
+      success: resolve,
+      fail: () => file.mkdir({
+        uri,
+        recursive: true,
+        success: resolve,
+        fail: (data, code) => reject(new Error('mkdir ' + code + ': ' + data))
+      })
+    }))
+  },
+
+  writeBuffer(uri, buffer, position) {
+    return new Promise((resolve, reject) => file.writeArrayBuffer({
+      uri,
+      buffer,
+      position,
+      success: resolve,
+      fail: (data, code) => reject(new Error('write ' + code + ': ' + data))
+    }))
+  },
+
+  writeText(uri, text) {
+    return new Promise((resolve, reject) => file.writeText({
+      uri,
+      text,
+      encoding: 'utf-8',
+      success: resolve,
+      fail: (data, code) => reject(new Error('writeText ' + code + ': ' + data))
+    }))
+  },
+
+  readText(uri) {
+    return new Promise((resolve, reject) => file.readText({
+      uri,
+      encoding: 'utf-8',
+      success: (data) => resolve(data.text),
+      fail: (data, code) => code === 301 ? resolve('') : reject(new Error('readText ' + code + ': ' + data))
+    }))
+  },
+
+  async repairLibraryPaths() {
+    const text = await this.readText(LIBRARY)
+    if (!text || text.indexOf(LEGACY_PHYSICAL_ROOT) < 0) return false
+    const repaired = text.split(LEGACY_PHYSICAL_ROOT).join(PHYSICAL_ROOT)
+    const value = JSON.parse(repaired)
+    if (!value || value.version !== 1 || !Array.isArray(value.tracks)) {
+      throw new Error('invalid library.json')
+    }
+    await this.publishLibrary(value)
+    this.detailText = '已修复已有音乐库路径'
+    return true
+  },
+
+  async readLibrary() {
+    const text = await this.readText(LIBRARY)
+    if (!text) return { version: 1, tracks: [] }
+    const value = JSON.parse(text)
+    return value && value.version === 1 && Array.isArray(value.tracks) ? value : { version: 1, tracks: [] }
+  },
+
+  move(srcUri, dstUri) {
+    return new Promise((resolve, reject) => file.move({
+      srcUri,
+      dstUri,
+      success: resolve,
+      fail: (data, code) => reject(new Error('move ' + code + ': ' + data))
+    }))
+  },
+
+  removeFile(uri) {
+    return new Promise((resolve) => file.delete({ uri, success: resolve, fail: resolve }))
+  },
+
+  removeDirectory(uri) {
+    return new Promise((resolve) => file.rmdir({ uri, recursive: true, success: resolve, fail: resolve }))
+  },
+
+  async removeFileStrict(uri) {
+    if (!(await this.pathExists(uri))) return
+    await new Promise((resolve, reject) => file.delete({
+      uri,
+      success: resolve,
+      fail: (data, code) => reject(new Error('delete ' + code + ': ' + data))
+    }))
+  },
+
+  async removeDirectoryStrict(uri) {
+    if (!(await this.pathExists(uri))) return
+    await new Promise((resolve, reject) => file.rmdir({
+      uri,
+      recursive: true,
+      success: resolve,
+      fail: (data, code) => reject(new Error('rmdir ' + code + ': ' + data))
+    }))
+  }
+}
+</script>

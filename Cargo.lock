@@ -28,24 +28,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "canopus-ui-core"
+version = "0.1.0"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "lyra-mirage-import"
-version = "0.1.1"
-dependencies = [
- "lyra-protocol",
- "lyra-transfer",
-]
-
-[[package]]
 name = "lyra-player-core"
 version = "0.1.1"
 dependencies = [
- "lyra-protocol",
+ "canopus-ui-core",
  "serde",
  "serde_json",
 ]
@@ -57,20 +53,8 @@ dependencies = [
  "canopus-abi",
  "canopus-runtime",
  "canopus-target-private",
+ "canopus-ui-core",
  "lyra-player-core",
- "lyra-protocol",
-]
-
-[[package]]
-name = "lyra-protocol"
-version = "0.1.1"
-
-[[package]]
-name = "lyra-transfer"
-version = "0.1.1"
-dependencies = [
- "lyra-player-core",
- "lyra-protocol",
 ]
 
 [[package]]

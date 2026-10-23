@@ -1,16 +1,10 @@
 use canopus_abi::*;
 use canopus_runtime::{status_put_u32, status_writer_publish};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 static LAST_ERROR: AtomicU32 = AtomicU32::new(0);
-/// The Supervisor's service context, kept for the module's lifetime.
-static CONTEXT: AtomicPtr<CanopusContext> = AtomicPtr::new(core::ptr::null_mut());
-
-pub fn context() -> *const CanopusContext {
-    CONTEXT.load(Ordering::Acquire)
-}
 
 const MAGIC: u32 = 0x4C59_5241;
 
@@ -42,8 +36,7 @@ const CANOPUS_DEVICE_PATH: &[u8] = b"/dev/canopus\0";
 const TARGET_ID: &[u8] = b"host-test";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_prepare(ctx: *const ContextV1) -> i32 {
-    CONTEXT.store(ctx as *mut CanopusContext, Ordering::Release);
+pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
     ACTIVE.store(false, Ordering::Release);
     RESIDENT.store(false, Ordering::Release);
     LAST_ERROR.store(0, Ordering::Release);
@@ -54,10 +47,7 @@ pub extern "C" fn canopus_mod_prepare(ctx: *const ContextV1) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
-    if !ctx.is_null() {
-        CONTEXT.store(ctx as *mut CanopusContext, Ordering::Release);
-    }
+pub extern "C" fn canopus_mod_activate(_ctx: *const ContextV1) -> i32 {
     #[cfg(feature = "device")]
     let result = {
         crate::target::prepare();

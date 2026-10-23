@@ -2,10 +2,11 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     Song,
-    lyrics::Lyrics,
-    persistence::Library,
-    playback::{PlaybackMode, PlaybackState, Player},
+    playback::{PlaybackMode, Player},
 };
+
+/// Rows the firmware list widget can hold on one library page.
+pub const LIBRARY_PAGE_SIZE: usize = 20;
 
 /// Cheap deterministic spread for shuffle. The device has no RNG we can rely
 /// on, so the step is derived from the track id and the library generation:
@@ -21,6 +22,7 @@ fn shuffle_noise(id: u64, generation: u32) -> u32 {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Route {
     #[default]
+    Home,
     Library,
     Player,
 }
@@ -28,15 +30,17 @@ pub enum Route {
 impl Route {
     pub const fn page_index(self) -> usize {
         match self {
-            Self::Library => 0,
-            Self::Player => 1,
+            Self::Home => 0,
+            Self::Library => 1,
+            Self::Player => 2,
         }
     }
 
     pub const fn from_page_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(Self::Library),
-            1 => Some(Self::Player),
+            0 => Some(Self::Home),
+            1 => Some(Self::Library),
+            2 => Some(Self::Player),
             _ => None,
         }
     }
@@ -46,91 +50,80 @@ impl Route {
 pub enum Effect {
     StreamAudio { path: String },
     StopAudio,
-    LoadLyrics { id: u64, path: String },
     Navigate(Route),
 }
 
 #[derive(Clone, Debug)]
 pub enum Action {
-    Boot(Library),
+    Boot(Vec<Song>),
     Open(Route),
     Back,
-    ReloadLibrary(Library),
+    ReloadLibrary(Vec<Song>),
     SelectSong(Song),
-    /// Start a track without leaving the current page (remote control).
-    Play(Song),
     Previous,
     Next,
     Tick(u32),
     /// Advance the repeat/shuffle mode by one step.
     CycleMode,
+    /// Move the library list one page forward (`true`) or back (`false`).
+    LibraryPage(bool),
     /// The queue ran out with nothing left to play.
     PlaybackExhausted,
-    /// The lyrics file of track `id` was read; `None` when it has none.
-    LyricsLoaded { id: u64, lyrics: Option<Lyrics> },
 }
 
 #[derive(Clone, Debug)]
 pub struct LyraApp {
     pub route: Route,
     pub history: Vec<Route>,
-    pub library: Library,
+    pub local_tracks: Vec<Song>,
     pub player: Player,
     pub error: Option<String>,
     pub generation: u32,
     pub mode: PlaybackMode,
-    /// Lyrics of the current track, with the id they belong to so a late
-    /// answer for a skipped track is dropped.
-    pub lyrics: Lyrics,
-    pub lyrics_for: Option<u64>,
+    /// Zero-based page of the library list; the list widget can only hold
+    /// `LIBRARY_PAGE_SIZE` rows at once.
+    pub library_page: usize,
 }
 
 impl Default for LyraApp {
     fn default() -> Self {
         Self {
-            route: Route::Library,
+            route: Route::Home,
             history: Vec::new(),
-            library: Library::default(),
+            local_tracks: Vec::new(),
             player: Player::default(),
             error: None,
             generation: 1,
             mode: PlaybackMode::default(),
-            lyrics: Lyrics::default(),
-            lyrics_for: None,
+            library_page: 0,
         }
     }
 }
 
 impl LyraApp {
-    pub fn tracks(&self) -> &[Song] {
-        &self.library.tracks
-    }
-
     pub fn update(&mut self, action: Action) -> Vec<Effect> {
         let mut effects = Vec::new();
         match action {
-            Action::Boot(library) => {
-                if self.library == library {
+            Action::Boot(tracks) => {
+                if self.local_tracks == tracks {
                     return effects;
                 }
-                self.library = library;
+                self.local_tracks = tracks;
             }
-            Action::ReloadLibrary(library) => {
-                if self.library == library {
+            Action::ReloadLibrary(tracks) => {
+                if self.local_tracks == tracks {
                     return effects;
                 }
                 let current_id = self.player.current.as_ref().map(|song| song.id);
                 let current_removed =
-                    current_id.is_some_and(|id| !library.tracks.iter().any(|song| song.id == id));
-                self.library = library;
+                    current_id.is_some_and(|id| !tracks.iter().any(|song| song.id == id));
+                self.local_tracks = tracks;
                 if current_removed {
                     self.player.clear();
-                    self.lyrics = Lyrics::default();
-                    self.lyrics_for = None;
                     self.error = Some(String::from("当前歌曲已从音乐库删除"));
                     effects.push(Effect::StopAudio);
                 } else if let Some(id) = current_id {
-                    if let Some(updated) = self.library.tracks.iter().find(|song| song.id == id) {
+                    if let Some(updated) = self.local_tracks.iter().find(|song| song.id == id) {
                         self.player.current = Some(updated.clone());
                         self.player.duration_ms = updated.duration_ms;
                     }
@@ -146,7 +139,6 @@ impl LyraApp {
                 self.navigate(Route::Player, &mut effects);
                 self.play(song, &mut effects);
             }
-            Action::Play(song) => self.play(song, &mut effects),
             // Track changes never navigate. Besides the player page's own
             // buttons, they come from headset gestures and from a track
             // finishing, both handled on the Bluetooth thread, where the page
@@ -164,17 +156,17 @@ impl LyraApp {
             }
             Action::Tick(ms) => self.player.tick(ms),
             Action::CycleMode => self.mode = self.mode.next(),
+            Action::LibraryPage(forward) => {
+                let last = self.library_page_count().saturating_sub(1);
+                self.library_page = if forward {
+                    self.library_page.saturating_add(1).min(last)
+                } else {
+                    self.library_page.saturating_sub(1)
+                };
+            }
             Action::PlaybackExhausted => {
                 self.player.clear();
-                self.lyrics = Lyrics::default();
-                self.lyrics_for = None;
-                self.player.state = PlaybackState::Finished;
-            }
-            Action::LyricsLoaded { id, lyrics } => {
-                if self.player.current.as_ref().map(|song| song.id) == Some(id) {
-                    self.lyrics = lyrics.unwrap_or_default();
-                    self.lyrics_for = Some(id);
-                }
+                self.player.state = crate::playback::PlaybackState::Finished;
             }
         }
         self.touch();
@@ -189,19 +181,29 @@ impl LyraApp {
         self.adjacent_song(true).is_some()
     }
 
-    /// The line of the current track's lyrics being sung right now.
-    pub fn active_lyric(&self) -> Option<usize> {
-        if self.lyrics_for != self.player.current.as_ref().map(|song| song.id) {
-            return None;
-        }
-        self.lyrics.active_index(self.player.position_ms)
+    /// Number of library pages, at least one so an empty library still renders.
+    pub fn library_page_count(&self) -> usize {
+        self.local_tracks.len().div_ceil(LIBRARY_PAGE_SIZE).max(1)
+    }
+
+    /// The slice of the library shown on the current page.
+    pub fn library_page_songs(&self) -> &[Song] {
+        let start = self.library_page.saturating_mul(LIBRARY_PAGE_SIZE);
+        let end = start
+            .saturating_add(LIBRARY_PAGE_SIZE)
+            .min(self.local_tracks.len());
+        self.local_tracks.get(start..end).unwrap_or(&[])
+    }
+
+    /// Resolves a library row on the current page to its song.
+    pub fn library_song_at(&self, row: usize) -> Option<Song> {
+        self.library_page_songs().get(row).cloned()
     }
 
     fn adjacent_song(&self, next: bool) -> Option<Song> {
         let id = self.player.current.as_ref()?.id;
-        let tracks = self.tracks();
-        let index = tracks.iter().position(|song| song.id == id)?;
-        let count = tracks.len();
+        let index = self.local_tracks.iter().position(|song| song.id == id)?;
+        let count = self.local_tracks.len();
         if count == 0 {
             return None;
         }
@@ -232,21 +234,19 @@ impl LyraApp {
                 (index + step) % count
             }
         };
-        tracks.get(adjacent).cloned()
+        self.local_tracks.get(adjacent).cloned()
     }
 
     fn play(&mut self, song: Song, effects: &mut Vec<Effect>) {
         self.player.select(song.clone(), core::iter::empty());
         self.error = None;
-        self.lyrics = Lyrics::default();
-        self.lyrics_for = None;
-        match song.lyrics_path() {
-            Some(path) => effects.push(Effect::LoadLyrics { id: song.id, path }),
-            None => self.lyrics_for = Some(song.id),
+        match song.local_path {
+            Some(path) => effects.push(Effect::StreamAudio { path }),
+            None => {
+                self.player.state = crate::playback::PlaybackState::Failed;
+                self.error = Some(String::from("歌曲缺少本地音频文件"));
+            }
         }
-        effects.push(Effect::StreamAudio {
-            path: song.audio_path(),
-        });
     }
 
     fn navigate(&mut self, route: Route, effects: &mut Vec<Effect>) {
@@ -266,133 +266,143 @@ impl LyraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Assets, lyrics::parse_lrc};
 
-    fn song(id: u64) -> Song {
+    fn local_song(id: u64) -> Song {
         Song {
             id,
             name: alloc::format!("Track {id}"),
-            assets: Assets(Assets::LYRICS),
+            local_path: Some(alloc::format!(
+                "/data/files/com.canopus.lyraimport/lyra/tracks/{id}/audio.mp3"
+            )),
             ..Song::default()
         }
     }
 
-    fn library(ids: &[u64]) -> Library {
-        Library {
-            revision: 1,
-            tracks: ids.iter().map(|id| song(*id)).collect(),
-        }
-    }
-
-    fn streams(effects: &[Effect]) -> bool {
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
-    }
-
     #[test]
-    fn selecting_a_song_navigates_streams_and_asks_for_lyrics() {
+    fn selection_only_emits_local_effects() {
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1, 2])));
-        let effects = app.update(Action::SelectSong(song(1)));
-        assert!(streams(&effects));
+        app.update(Action::Boot(alloc::vec![local_song(1), local_song(2)]));
+        let effects = app.update(Action::SelectSong(local_song(1)));
         assert!(
             effects
                 .iter()
-                .any(|effect| matches!(effect, Effect::Navigate(Route::Player)))
+                .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
         );
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::LoadLyrics { id: 1, .. }))
-        );
-        assert_eq!(app.route, Route::Player);
+        assert!(!effects.iter().any(
+            |effect| matches!(effect, Effect::StreamAudio { path } if path.starts_with("http"))
+        ));
     }
 
     #[test]
-    fn previous_and_next_follow_library_order_without_wrapping() {
+    fn previous_and_next_follow_local_library_order_without_wrapping() {
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[10, 20, 30])));
-        app.update(Action::SelectSong(song(10)));
+        let tracks = alloc::vec![local_song(10), local_song(20), local_song(30)];
+        app.update(Action::Boot(tracks.clone()));
+
+        app.update(Action::SelectSong(tracks[0].clone()));
         assert!(!app.has_previous());
         assert!(app.has_next());
         assert!(app.update(Action::Previous).is_empty());
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(10));
 
-        assert!(streams(&app.update(Action::Next)));
+        let effects = app.update(Action::Next);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
+        );
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(20));
+        assert!(app.has_previous());
+        assert!(app.has_next());
+
         app.update(Action::Next);
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(30));
+        assert!(app.has_previous());
         assert!(!app.has_next());
         assert!(app.update(Action::Next).is_empty());
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(30));
     }
 
     #[test]
     fn completed_track_can_still_select_previous_library_track() {
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1, 2, 3])));
-        app.update(Action::SelectSong(song(3)));
-        app.player.state = PlaybackState::Draining;
-        assert!(streams(&app.update(Action::Previous)));
+        let tracks = alloc::vec![local_song(1), local_song(2), local_song(3)];
+        app.update(Action::Boot(tracks.clone()));
+        app.update(Action::SelectSong(tracks[2].clone()));
+        app.player.state = crate::playback::PlaybackState::Draining;
+
+        let effects = app.update(Action::Previous);
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
+        );
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(2));
         assert_eq!(app.player.position_ms, 0);
-        assert_eq!(app.player.state, PlaybackState::Resolving);
+        assert_eq!(app.player.state, crate::playback::PlaybackState::Resolving);
     }
 
     #[test]
     fn reloading_library_clears_deleted_current_song_and_stops_audio() {
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1, 2])));
-        app.update(Action::SelectSong(song(1)));
-        app.player.state = PlaybackState::Playing;
-        let effects = app.update(Action::ReloadLibrary(library(&[2])));
+        let tracks = alloc::vec![local_song(1), local_song(2)];
+        app.update(Action::Boot(tracks.clone()));
+        app.update(Action::SelectSong(tracks[0].clone()));
+        app.player.state = crate::playback::PlaybackState::Playing;
+
+        let effects = app.update(Action::ReloadLibrary(alloc::vec![tracks[1].clone()]));
+
         assert!(
             effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::StopAudio))
         );
-        assert_eq!(app.player.state, PlaybackState::Idle);
+        assert_eq!(app.player.state, crate::playback::PlaybackState::Idle);
         assert!(app.player.current.is_none());
-        assert_eq!(app.tracks().len(), 1);
+        assert!(app.player.queue.is_empty());
+        assert_eq!(app.local_tracks.len(), 1);
     }
 
     #[test]
     fn reloading_library_without_current_song_keeps_playback() {
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1, 2])));
-        app.update(Action::SelectSong(song(1)));
-        app.player.state = PlaybackState::Playing;
-        let reloaded = Library {
-            revision: 2,
-            ..library(&[1])
-        };
-        let effects = app.update(Action::ReloadLibrary(reloaded));
+        let tracks = alloc::vec![local_song(1), local_song(2)];
+        app.update(Action::Boot(tracks.clone()));
+        app.update(Action::SelectSong(tracks[0].clone()));
+        app.player.state = crate::playback::PlaybackState::Playing;
+
+        let effects = app.update(Action::ReloadLibrary(alloc::vec![tracks[0].clone()]));
+
         assert!(
             !effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::StopAudio))
         );
-        assert_eq!(app.player.state, PlaybackState::Playing);
+        assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(1));
+        assert_eq!(app.player.state, crate::playback::PlaybackState::Playing);
     }
 
-    /// The mode toggle lives on the player page, but a track ends while the
-    /// user may be anywhere. The automatic advance runs on the Bluetooth thread
-    /// and must not ask for navigation, which would drive the page manager from
-    /// that thread.
+    /// The mode row lives on the home page, so after switching to repeat or
+    /// shuffle the user is usually not on the player page when a track ends.
+    /// The automatic advance runs on the Bluetooth thread and must not ask for
+    /// navigation, which would drive the page manager from that thread.
     #[test]
     fn track_changes_in_every_mode_stay_on_the_current_page() {
+        let tracks = alloc::vec![local_song(1), local_song(2), local_song(3)];
         for mode in [
             PlaybackMode::ListOnce,
             PlaybackMode::RepeatAll,
             PlaybackMode::Shuffle,
         ] {
             let mut app = LyraApp::default();
-            app.update(Action::Boot(library(&[1, 2, 3])));
-            app.update(Action::SelectSong(song(2)));
+            app.update(Action::Boot(tracks.clone()));
+            app.update(Action::SelectSong(tracks[1].clone()));
             app.update(Action::Back);
             app.mode = mode;
-            assert_eq!(app.route, Route::Library);
+            assert_eq!(app.route, Route::Home);
             let history = app.history.clone();
+
             for action in [Action::Next, Action::Previous] {
                 let effects = app.update(action);
                 assert!(
@@ -401,8 +411,13 @@ mod tests {
                         .any(|effect| matches!(effect, Effect::Navigate(_))),
                     "{mode:?} track change must not navigate"
                 );
-                assert!(streams(&effects), "{mode:?} track change must start audio");
-                assert_eq!(app.route, Route::Library);
+                assert!(
+                    effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::StreamAudio { .. })),
+                    "{mode:?} track change must start audio"
+                );
+                assert_eq!(app.route, Route::Home);
                 assert_eq!(app.history, history);
             }
         }
@@ -410,10 +425,12 @@ mod tests {
 
     #[test]
     fn repeat_wraps_and_shuffle_never_replays_the_current_track() {
+        let tracks = alloc::vec![local_song(1), local_song(2), local_song(3)];
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1, 2, 3])));
+        app.update(Action::Boot(tracks.clone()));
+
         app.mode = PlaybackMode::RepeatAll;
-        app.update(Action::SelectSong(song(3)));
+        app.update(Action::SelectSong(tracks[2].clone()));
         app.update(Action::Next);
         assert_eq!(app.player.current.as_ref().map(|song| song.id), Some(1));
         app.update(Action::Previous);
@@ -431,46 +448,10 @@ mod tests {
     #[test]
     fn unchanged_library_does_not_invalidate_ui() {
         let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1])));
+        let tracks = alloc::vec![local_song(1)];
+        app.update(Action::Boot(tracks.clone()));
         let generation = app.generation;
-        assert!(app.update(Action::ReloadLibrary(library(&[1]))).is_empty());
+        assert!(app.update(Action::ReloadLibrary(tracks)).is_empty());
         assert_eq!(app.generation, generation);
-    }
-
-    #[test]
-    fn lyrics_follow_the_position_and_drop_answers_for_skipped_tracks() {
-        let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1, 2])));
-        app.update(Action::SelectSong(song(1)));
-        assert_eq!(app.active_lyric(), None);
-
-        let lyrics = parse_lrc("[00:01.00]a\n[00:05.00]b");
-        app.update(Action::LyricsLoaded {
-            id: 2,
-            lyrics: Some(lyrics.clone()),
-        });
-        assert!(app.lyrics.is_empty(), "an answer for another track is dropped");
-
-        app.update(Action::LyricsLoaded {
-            id: 1,
-            lyrics: Some(lyrics),
-        });
-        app.player.position_ms = 6_000;
-        assert_eq!(app.active_lyric(), Some(1));
-
-        app.update(Action::Next);
-        assert!(app.lyrics.is_empty());
-        assert_eq!(app.active_lyric(), None);
-    }
-
-    #[test]
-    fn exhausting_the_queue_reports_nothing_left_to_play() {
-        let mut app = LyraApp::default();
-        app.update(Action::Boot(library(&[1])));
-        app.update(Action::SelectSong(song(1)));
-        app.player.state = PlaybackState::Draining;
-        app.update(Action::PlaybackExhausted);
-        assert_eq!(app.player.state, PlaybackState::Finished);
-        assert!(app.player.current.is_none());
     }
 }
