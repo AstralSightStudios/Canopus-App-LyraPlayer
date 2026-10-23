@@ -6,7 +6,7 @@
 //! Commands: `hello`, `list`, `import --id N --audio F [--cover F] [--lyrics F] [--name S]
 //! [--artist S]... [--duration-ms N] [--palette 0xTOP,0xBOTTOM] [--pipeline N]`, `delete ID`, `move ID up|down`,
 //! `play ID`, `control toggle|next|previous`, `bench BYTES COUNT DEPTH` (time COUNT `DATA` frames with
-//! DEPTH host-queued calls; smoke still executes them serially), `listen` (print the watch's messages for a while).
+//! DEPTH sends in flight), `listen` (print the watch's messages for a while).
 
 use std::{
     fs::File,
@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lyra_protocol::{Asset, Control, Incoming, MODULE_ID, Reply, Request, Status, TrackMeta, VERSION};
+use lyra_protocol::{Asset, Control, Incoming, MODULE_ID, Reply, Request, TrackMeta, VERSION};
 use lyra_transfer::{Sender, Source, State, specs};
 
 struct Bridge {
@@ -62,18 +62,13 @@ impl Bridge {
         let stdout = child.stdout.take().unwrap();
         let (result_tx, results) = mpsc::channel();
         let (frame_tx, frames) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut ready = false;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.contains("\"type\":\"ready\"") {
-                    ready = true;
-                    let _ = ready_tx.send(());
-                } else if line.contains("\"type\":\"connect\"") {
+                if line.contains("\"type\":\"connect\"") {
                     if let Some(data) = field(&line, "dataHex") {
                         let _ = frame_tx.send(unhex(data));
                     }
-                } else if ready && line.contains("\"type\":\"result\"") {
+                } else if line.contains("\"type\":\"result\"") {
                     let _ = result_tx.send(line.contains("\"ok\":true"));
                     if !line.contains("\"ok\":true") {
                         eprintln!("bridge: {line}");
@@ -83,11 +78,6 @@ impl Bridge {
                 }
             }
         });
-        if ready_rx.recv_timeout(Duration::from_secs(200)).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("bridge did not finish connecting (rebuild smoke if it has no ready marker)");
-        }
         Self { child, stdin, results, frames, in_flight: 0 }
     }
 
@@ -102,7 +92,7 @@ impl Bridge {
         self.call("connectSend", &format!("{{\"module\":\"{MODULE_ID}\",\"dataHex\":\"{}\"}}", hex(frame)))
     }
 
-    /// Queues at most `depth` host calls; smoke still waits for each device response.
+    /// Queues a frame without waiting for its result; keeps at most `depth` calls in flight.
     fn send_pipelined(&mut self, frame: &[u8], depth: usize) -> bool {
         while self.in_flight >= depth {
             if !self.results.recv_timeout(Duration::from_secs(120)).unwrap_or(false) {
@@ -215,24 +205,15 @@ fn number(text: &str) -> u32 {
 }
 
 fn request_reply(bridge: &mut Bridge, request: Request) -> Option<Reply> {
-    let frame = request.encode().unwrap();
-    let expected = [frame[0] | 0x80, frame[1], frame[2]];
-    assert!(bridge.send(&frame), "send failed");
+    assert!(bridge.send(&request.encode().unwrap()), "send failed");
     let deadline = Instant::now() + Duration::from_secs(20);
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        let frame = bridge.wait_frame(left)?;
-        if frame.starts_with(&expected)
-            && let Ok(Incoming::Reply(reply)) = Incoming::decode(&frame)
-        {
-            return Some(reply);
+        match Incoming::decode(&bridge.wait_frame(left)?) {
+            Ok(Incoming::Reply(reply)) => return Some(reply),
+            _ => continue,
         }
     }
     None
-}
-
-fn ack_ok(reply: Option<Reply>) -> bool {
-    println!("{reply:?}");
-    matches!(reply, Some(Reply::Ack { status: Status::Ok, .. }))
 }
 
 fn import(bridge: &mut Bridge, args: &[String]) -> bool {
@@ -263,10 +244,6 @@ fn import(bridge: &mut Bridge, args: &[String]) -> bool {
     let mut last_report = Instant::now();
     let mut frames = 0u32;
     let depth: usize = option(args, "--pipeline").map_or(1, |v| v.parse().unwrap());
-    assert!(depth > 0, "host queue depth must be positive");
-    if depth > 1 {
-        eprintln!("smoke executes requests serially; --pipeline only changes the host queue depth");
-    }
     while !sender.is_finished() {
         // Everything the watch said since the last frame.
         while let Ok(frame) = bridge.frames.try_recv() {
@@ -293,7 +270,7 @@ fn import(bridge: &mut Bridge, args: &[String]) -> bool {
             eprintln!("  {} / {} KiB", sender.confirmed_bytes() / 1024, total / 1024);
         }
     }
-    let drained = bridge.drain();
+    bridge.drain();
     let seconds = started.elapsed().as_secs_f64();
     println!(
         "import {:?}: {} bytes in {:.1}s ({:.1} KiB/s, {} frames, {} resumes)",
@@ -304,7 +281,7 @@ fn import(bridge: &mut Bridge, args: &[String]) -> bool {
         frames,
         sender.resumes()
     );
-    drained && sender.state() == State::Done
+    sender.state() == State::Done
 }
 
 fn main() {
@@ -320,13 +297,13 @@ fn main() {
         Some("hello") => {
             let reply = request_reply(&mut bridge, Request::Hello { req: 1, version: VERSION });
             println!("{reply:?}");
-            ok = matches!(reply, Some(Reply::Hello { status: Status::Ok, .. }));
+            ok = reply.is_some();
         }
         Some("list") => {
             let mut offset = 0u16;
             loop {
                 match request_reply(&mut bridge, Request::List { req: 2, offset, max: 8 }) {
-                    Some(Reply::List { status: Status::Ok, total, entries, .. }) => {
+                    Some(Reply::List { total, entries, .. }) => {
                         for entry in &entries {
                             println!("{} {:>7} ms  {}  /  {}", entry.id, entry.duration_ms, entry.name, entry.artist);
                         }
@@ -351,10 +328,6 @@ fn main() {
             let size: usize = command[1].parse().unwrap();
             let count: usize = command[2].parse().unwrap();
             let depth: usize = command[3].parse().unwrap();
-            assert!(depth > 0, "host queue depth must be positive");
-            if depth > 1 {
-                eprintln!("smoke executes requests serially; this is not transport concurrency");
-            }
             let frame = Request::Data { asset: Asset::Audio, offset: 0, bytes: vec![0x5A; size] }.encode().unwrap();
             let started = Instant::now();
             for _ in 0..count {
@@ -363,7 +336,7 @@ fn main() {
             ok &= bridge.drain();
             let seconds = started.elapsed().as_secs_f64();
             println!(
-                "bench {count} x {size} B, host queue {depth}: {:.2}s, {:.1} ms/frame, {:.1} KiB/s",
+                "bench {count} x {size} B, depth {depth}: {:.2}s, {:.1} ms/frame, {:.1} KiB/s",
                 seconds,
                 seconds * 1000.0 / count as f64,
                 (count * size) as f64 / 1024.0 / seconds
@@ -371,16 +344,16 @@ fn main() {
         }
         Some("delete") => {
             let id = command[1].parse().unwrap();
-            ok = ack_ok(request_reply(&mut bridge, Request::Delete { req: 3, id }));
+            println!("{:?}", request_reply(&mut bridge, Request::Delete { req: 3, id }));
         }
         Some("move") => {
             let id = command[1].parse().unwrap();
             let up = command[2] == "up";
-            ok = ack_ok(request_reply(&mut bridge, Request::Move { req: 4, id, up }));
+            println!("{:?}", request_reply(&mut bridge, Request::Move { req: 4, id, up }));
         }
         Some("play") => {
             let id = command[1].parse().unwrap();
-            ok = ack_ok(request_reply(&mut bridge, Request::Play { req: 5, id }));
+            println!("{:?}", request_reply(&mut bridge, Request::Play { req: 5, id }));
         }
         Some("control") => {
             let command = match command[1].as_str() {
@@ -388,7 +361,7 @@ fn main() {
                 "previous" => Control::Previous,
                 _ => Control::Toggle,
             };
-            ok = ack_ok(request_reply(&mut bridge, Request::Control { req: 6, command }));
+            println!("{:?}", request_reply(&mut bridge, Request::Control { req: 6, command }));
         }
         Some("listen") => {
             let until = Instant::now() + Duration::from_secs(20);
