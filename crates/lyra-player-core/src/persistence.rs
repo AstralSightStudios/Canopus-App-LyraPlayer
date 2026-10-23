@@ -1,12 +1,11 @@
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::Song;
+use crate::{ROOT, Song};
 
-pub const QUICKAPP_PACKAGE: &str = "com.canopus.lyraimport";
-pub const IMPORT_ROOT: &str = "/data/files/com.canopus.lyraimport/lyra";
-pub const LIBRARY_PATH: &str = "/data/files/com.canopus.lyraimport/lyra/library.json";
-const LEGACY_IMPORT_ROOT: &str = "/data/quickapp/files/com.canopus.lyraimport/lyra";
+pub const LIBRARY_FILE: &str = "library.json";
+pub const LIBRARY_PATH: &str = "/data/canopus/m.lyra_player/library.json";
+const FORMAT_VERSION: u8 = 2;
 
 pub trait Store {
     type Error;
@@ -18,7 +17,15 @@ pub trait Store {
 struct LibraryFile {
     version: u8,
     #[serde(default)]
+    revision: u32,
+    #[serde(default)]
     tracks: Vec<Song>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Library {
+    pub revision: u32,
+    pub tracks: Vec<Song>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,112 +33,48 @@ pub enum PersistenceError<E> {
     Storage(E),
     Json,
     Version,
-    UnsafePath,
 }
 
-pub fn load_library<S: Store>(store: &mut S) -> Result<Vec<Song>, PersistenceError<S::Error>> {
+pub fn load_library<S: Store>(store: &mut S) -> Result<Library, PersistenceError<S::Error>> {
     let Some(bytes) = store
         .read(LIBRARY_PATH)
         .map_err(PersistenceError::Storage)?
     else {
-        return Ok(Vec::new());
+        return Ok(Library::default());
     };
-    let mut file: LibraryFile =
-        serde_json::from_slice(&bytes).map_err(|_| PersistenceError::Json)?;
-    if file.version != 1 {
+    let file: LibraryFile = serde_json::from_slice(&bytes).map_err(|_| PersistenceError::Json)?;
+    if file.version != FORMAT_VERSION {
         return Err(PersistenceError::Version);
     }
-    for track in &mut file.tracks {
-        if let Some(path) = &mut track.local_path {
-            normalize_legacy_path(path);
-        }
-        if !track.album.cover_url.is_empty() {
-            normalize_legacy_path(&mut track.album.cover_url);
-        }
-        if !track.album.background_url.is_empty() {
-            normalize_legacy_path(&mut track.album.background_url);
-        }
-        if let Some(path) = &mut track.lyrics_path {
-            normalize_legacy_path(path);
-        }
-    }
-    if file.tracks.iter().any(|track| {
-        !track.local_path.as_deref().is_some_and(is_safe_audio_path)
-            || !track.album.cover_url.is_empty() && !is_safe_cover_path(&track.album.cover_url)
-            || !track.album.background_url.is_empty()
-                && !is_safe_background_path(&track.album.background_url)
-            || track
-                .lyrics_path
-                .as_deref()
-                .is_some_and(|path| !is_safe_lyrics_path(path))
-    }) {
-        return Err(PersistenceError::UnsafePath);
-    }
-    Ok(file.tracks)
+    Ok(Library {
+        revision: file.revision,
+        tracks: file.tracks,
+    })
 }
 
-fn normalize_legacy_path(path: &mut String) {
-    let Some(relative) = path
-        .strip_prefix(LEGACY_IMPORT_ROOT)
-        .and_then(|path| path.strip_prefix('/'))
-    else {
-        return;
+pub fn encode_library(library: &Library) -> Vec<u8> {
+    let file = LibraryFile {
+        version: FORMAT_VERSION,
+        revision: library.revision,
+        tracks: library.tracks.clone(),
     };
-    *path = alloc::format!("{IMPORT_ROOT}/{relative}");
+    serde_json::to_vec(&file).unwrap_or_default()
 }
 
-pub fn is_safe_audio_path(path: &str) -> bool {
-    is_safe_import_path(path, &[".mp3"])
+/// A track id is a plain decimal directory name; nothing the phone sends is
+/// ever spliced into a path except through this check.
+pub fn is_valid_asset_name(name: &str) -> bool {
+    matches!(name, "audio.mp3" | "cover.bin" | "lyrics.lrc")
 }
 
-pub fn is_safe_cover_path(path: &str) -> bool {
-    is_safe_import_path(path, &[".jpg", ".jpeg", ".png", ".bin"])
-}
-
-pub fn is_safe_background_path(path: &str) -> bool {
-    is_safe_import_path(path, &[".bin"])
-}
-
-pub fn is_safe_lyrics_path(path: &str) -> bool {
-    is_safe_import_path(path, &[".lrc", ".json", ".txt"])
-}
-
-fn is_safe_import_path(path: &str, extensions: &[&str]) -> bool {
-    let Some(relative) = path
-        .strip_prefix(IMPORT_ROOT)
-        .and_then(|path| path.strip_prefix('/'))
-    else {
-        return false;
-    };
-    !relative.is_empty()
-        && relative.len() <= 240
-        && !relative.starts_with('.')
-        && !relative.contains("..")
-        && !relative
-            .bytes()
-            .any(|byte| matches!(byte, b'\\' | 0) || byte.is_ascii_control())
-        && extensions
-            .iter()
-            .any(|extension| relative.to_ascii_lowercase().ends_with(extension))
-}
-
-pub fn physical_path(relative: &str) -> Option<String> {
-    if relative.is_empty()
-        || relative.starts_with('/')
-        || relative.starts_with('.')
-        || relative.contains("..")
-        || relative
-            .bytes()
-            .any(|byte| matches!(byte, b'\\' | 0) || byte.is_ascii_control())
-    {
-        return None;
-    }
-    Some(alloc::format!("{IMPORT_ROOT}/{relative}"))
+pub fn staging_dir() -> String {
+    alloc::format!("{ROOT}/stage")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Assets, Palette, Rgb};
     use alloc::collections::BTreeMap;
 
     #[derive(Default)]
@@ -143,90 +86,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn quickapp_library_round_trips() {
-        let song = Song {
+    fn song() -> Song {
+        Song {
             id: 7,
             name: "Local".into(),
-            local_path: Some(alloc::format!("{IMPORT_ROOT}/tracks/7/audio.mp3")),
-            lyrics_path: Some(alloc::format!("{IMPORT_ROOT}/tracks/7/lyrics.lrc")),
-            album: crate::AlbumRef {
-                background_url: alloc::format!("{IMPORT_ROOT}/tracks/7/background.bin"),
-                ..crate::AlbumRef::default()
+            artists: alloc::vec!["A".into(), "B".into()],
+            album: "Album".into(),
+            duration_ms: 123_000,
+            assets: Assets(Assets::COVER | Assets::LYRICS),
+            palette: Palette {
+                top: Rgb(0xFF8800),
+                bottom: Rgb(0x101010),
             },
-            ..Song::default()
-        };
-        let bytes = serde_json::to_vec(&LibraryFile {
-            version: 1,
-            tracks: alloc::vec![song.clone()],
-        })
-        .unwrap();
-        let mut store = MemoryStore::default();
-        store.0.insert(LIBRARY_PATH.into(), bytes);
-        assert_eq!(load_library(&mut store).unwrap(), alloc::vec![song]);
+        }
     }
 
     #[test]
-    fn legacy_manifest_paths_are_normalized_to_real_storage_root() {
-        let legacy_audio = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/audio.mp3");
-        let legacy_cover = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/cover.jpg");
-        let legacy_background = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/background.bin");
-        let legacy_lyrics = alloc::format!("{LEGACY_IMPORT_ROOT}/tracks/7/lyrics.json");
-        let song = Song {
-            id: 7,
-            name: "Legacy".into(),
-            local_path: Some(legacy_audio),
-            lyrics_path: Some(legacy_lyrics),
-            album: crate::AlbumRef {
-                cover_url: legacy_cover,
-                background_url: legacy_background,
-                ..crate::AlbumRef::default()
-            },
-            ..Song::default()
+    fn library_round_trips() {
+        let library = Library {
+            revision: 9,
+            tracks: alloc::vec![song()],
         };
-        let bytes = serde_json::to_vec(&LibraryFile {
-            version: 1,
-            tracks: alloc::vec![song],
-        })
-        .unwrap();
         let mut store = MemoryStore::default();
-        store.0.insert(LIBRARY_PATH.into(), bytes);
-        let loaded = load_library(&mut store).unwrap();
-        assert_eq!(
-            loaded[0].local_path.as_deref(),
-            Some("/data/files/com.canopus.lyraimport/lyra/tracks/7/audio.mp3")
-        );
-        assert_eq!(
-            loaded[0].album.cover_url,
-            "/data/files/com.canopus.lyraimport/lyra/tracks/7/cover.jpg"
-        );
-        assert_eq!(
-            loaded[0].album.background_url,
-            "/data/files/com.canopus.lyraimport/lyra/tracks/7/background.bin"
-        );
-        assert_eq!(
-            loaded[0].lyrics_path.as_deref(),
-            Some("/data/files/com.canopus.lyraimport/lyra/tracks/7/lyrics.json")
-        );
+        store.0.insert(LIBRARY_PATH.into(), encode_library(&library));
+        assert_eq!(load_library(&mut store).unwrap(), library);
     }
 
     #[test]
-    fn rejects_paths_outside_quickapp_sandbox() {
-        assert!(is_safe_audio_path(&alloc::format!(
-            "{IMPORT_ROOT}/tracks/1/audio.mp3"
-        )));
-        assert!(!is_safe_audio_path("/data/canopus/audio.mp3"));
-        assert!(!is_safe_audio_path(&alloc::format!(
-            "{IMPORT_ROOT}/../escape.mp3"
-        )));
-        assert!(!is_safe_cover_path(&alloc::format!(
-            "{IMPORT_ROOT}/tracks/1/audio.mp3"
-        )));
-        assert!(is_safe_background_path(&alloc::format!(
-            "{IMPORT_ROOT}/tracks/1/background.bin"
-        )));
-        assert!(!is_safe_background_path(&alloc::format!(
-            "{IMPORT_ROOT}/tracks/1/background.jpg"
-        )));
+    fn missing_library_is_empty_and_old_versions_are_rejected() {
+        let mut store = MemoryStore::default();
+        assert_eq!(load_library(&mut store).unwrap(), Library::default());
+        store
+            .0
+            .insert(LIBRARY_PATH.into(), br#"{"version":1,"tracks":[]}"#.to_vec());
+        assert_eq!(load_library(&mut store), Err(PersistenceError::Version));
+    }
+
+    #[test]
+    fn track_paths_stay_inside_the_module_directory() {
+        let song = song();
+        assert_eq!(
+            song.audio_path(),
+            "/data/canopus/m.lyra_player/tracks/7/audio.mp3"
+        );
+        assert!(song.cover_path().unwrap().ends_with("/7/cover.bin"));
+        assert!(song.lyrics_path().unwrap().ends_with("/7/lyrics.lrc"));
+        let bare = Song {
+            assets: Assets::default(),
+            ..song
+        };
+        assert!(bare.cover_path().is_none() && bare.lyrics_path().is_none());
+        assert!(is_valid_asset_name("audio.mp3"));
+        assert!(!is_valid_asset_name("../audio.mp3"));
     }
 }

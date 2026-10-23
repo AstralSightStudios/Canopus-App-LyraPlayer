@@ -39,13 +39,14 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "astrobox-plugin-lyra-import"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "base64",
  "cipher",
- "crc32fast",
  "image",
+ "lyra-protocol",
+ "lyra-transfer",
  "md-5",
  "mp3-duration",
  "num-bigint",
@@ -422,6 +423,17 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "lyra-protocol"
+version = "0.1.1"
+
+[[package]]
+name = "lyra-transfer"
+version = "0.1.1"
+dependencies = [
+ "lyra-protocol",
+]
 
 [[package]]
 name = "md-5"

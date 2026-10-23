@@ -30,7 +30,6 @@ pub struct CloudSong {
     pub name: String,
     pub artists: Vec<String>,
     pub album: String,
-    pub album_id: u64,
     pub duration_ms: u32,
     pub cover_url: String,
 }
@@ -61,14 +60,6 @@ pub enum NeteaseView {
     PlaylistTracks,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TransferMode {
-    #[default]
-    Crc32,
-    Fast,
-    Ultra,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
     pub root: Option<String>,
@@ -85,15 +76,12 @@ pub struct UiState {
     pub sent: u64,
     pub total: u64,
     pub speed_bytes_per_second: u64,
-    pub transfer_mode: TransferMode,
     pub active: bool,
     pub device_library: Vec<DeviceLibraryTrack>,
-    pub library_request_id: String,
     pub library_revision: String,
     pub library_total: usize,
     pub library_busy: bool,
     pub library_target: Option<u64>,
-    pub library_nonce: u64,
     pub netease_cookie: String,
     pub netease_view: NeteaseView,
     pub netease_audio_bitrate: u32,
@@ -112,10 +100,7 @@ static STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
 pub fn with_state<R>(f: impl FnOnce(&mut UiState) -> R) -> R {
     let mut state = STATE
         .get_or_init(|| {
-            Mutex::new(UiState {
-                transfer_mode: TransferMode::Crc32,
-                ..UiState::default()
-            })
+            Mutex::new(UiState::default())
         })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

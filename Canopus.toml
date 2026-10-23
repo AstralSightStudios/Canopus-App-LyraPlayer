@@ -2,7 +2,7 @@ schema = 1
 
 [module]
 id = "lyra_player"
-version = "0.1.1"
+version = "0.2.0"
 version_code = 1
 kind = "target"
 language = "rust"
@@ -32,14 +32,5 @@ include = [
   "xiaomi-band-10-pro-3.101.043",
   "xiaomi-band-11-4.100.139",
   "xiaomi-band-11-4.100.155",
-  "xiaomi-band-11-4.100.177",
-]
-
-[resources]
-files = [
-  "watchfaces/lyra-player/appicon_lyra.bin",
-  "watchfaces/lyra-player/lyra-previous.bin",
-  "watchfaces/lyra-player/lyra-play.bin",
-  "watchfaces/lyra-player/lyra-pause.bin",
-  "watchfaces/lyra-player/lyra-next.bin",
+  "xiaomi-band-11-4.100.179",
 ]

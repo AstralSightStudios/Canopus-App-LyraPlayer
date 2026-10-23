@@ -1,41 +1,46 @@
 # AstroBox Lyra Import
 
-AstroBox NG API level 3 插件，用于把本地 MP3 或网易云音乐导入 Vela 快应用 `com.canopus.lyraimport`。
+AstroBox NG API level 4 插件：把本地 MP3 或网易云音乐通过 CanopusConnect 直接导入手表上的 Lyra Player
+（Canopus 模块 `lyra_player`）。音乐以二进制数据流写入手表，不需要快应用，也不经过 interconnect。
+
+需要手表固件的 Canopus 目标提供 `ctx->connect`：Band 11 `.155`、`.179` 与 Band 10 Pro `.043` 已在 Mirage 验证。
+其他固件（`.036`、`.139`）按 ADR-CAN-009 没有它，播放器照常运行，但不能导入。
 
 ## 功能
 
-- 选择已连接的小米穿戴设备；
-- 本地导入 MP3，并可附带 JPG/PNG 封面和 LRC/JSON/TXT 歌词；封面会在插件内预处理为 180×180 LVGL v9 ARGB8888 BIN，并从同一封面生成混色模糊背景（底部 40px 透明渐隐），尺寸按所选设备名决定：小米手环 11 为 212×520，小米手环 10 Pro 及无法识别的设备为 336×520；
-- 本地文件按内容识别类型，不依赖文件名后缀（安卓选择器只提供无后缀的 content URI 名称）：MP3 以 MPEG Layer III 帧头判断（跳过 ID3v2 标签），封面以 JPEG/PNG 文件头判断，歌词按内容区分 JSON 与 LRC；选择 MP3 后从 ID3v2/ID3v1 标签预填曲名、歌手和专辑；
-- 网易云扫码登录，并将登录状态保存在插件私有目录；
-- 搜索网易云歌曲，并以卡片列表直接选择导入；
-- 加载个人歌单，查看歌单歌曲并直接导入；
-- 下载歌曲音频、专辑封面和原文/翻译歌词；
-- 按 `LOCAL_IMPORT_PROTOCOL.md` v2 使用 Base64 分片：CRC32 模式 35 KiB、无校验高速模式 36608 原始字节、无校验超高速模式 36753 原始字节（48 KiB 单包上限）；默认启用 CRC32，损坏块最多原位重传 2 次；插件 UI 按 ACK 确认字节显示实时 `k/s` 速度；
-- AstroBox 与手表快应用两端同时显示实时总进度；
-- 分页读取手表当前音乐库，并通过带修订值校验的“上移/下移”操作调整 Lyra 播放顺序；
-- 只向 `com.canopus.lyraimport` 发送并监听消息，不再使用系统 FetchBridge 包名。
+- 选择已连接的小米穿戴设备，连接后向模块 `lyra_player` 发 `HELLO`，读到手表屏幕尺寸与曲库修订号；
+- 本地导入 MP3，并可附带 JPG/PNG 封面和 LRC/JSON/TXT 歌词。文件按内容识别类型，不依赖后缀
+  （安卓选择器只给无后缀的 content URI 名称）：MP3 以 MPEG Layer III 帧头判断（跳过 ID3v2），
+  封面以 JPEG/PNG 文件头判断，歌词按内容区分 JSON 与 LRC；选择 MP3 后从 ID3v2/ID3v1 预填曲名、歌手、专辑；
+- 封面在插件内缩放为 176×176 圆角 LVGL v9 ARGB8888 BIN，并取封面上下两种颜色作为播放页背景渐变的色标；
+  MP3 时长由 `mp3-duration` 读取；
+- 网易云扫码登录，登录状态保存在插件私有目录；搜索歌曲、加载个人歌单并直接导入；
+  下载歌曲音频、专辑封面和原文/翻译歌词（翻译行合并进 LRC）；
+- 传输由 `crates/lyra-transfer` 的发送状态机完成：16 KiB 窗口、手表每 4 KiB 回报进度、乱序时按手表给出的偏移回退重发、
+  每份资源 CRC32 校验；界面显示总进度和实时速度，手表 45 秒没有回报进度就判为停滞并取消；
+- “手表音乐”分页读取手表曲库（`LIST`），可上移/下移（`MOVE`，带修订号校验，冲突时不覆盖）、删除（`DELETE`）。
 
 ## 数据流
 
 ```text
 本地文件 / 网易云 API（WEAPI 登录、EAPI 数据接口）
           ↓
-AstroBox Lyra Import WASM 插件
-          ↓ interconnect (com.canopus.lyraimport)
-Vela Lyra Import 快应用
-          ↓ internal://files/lyra
-Lyra Player 原生只读播放器
+AstroBox Lyra Import WASM 插件（权限 canopusconnect.send / canopusconnect.listen / device）
+          ↓ CanopusConnect 二进制消息，每条 ≤ 480 字节
+Canopus Supervisor → lyra_player 模块 → /data/canopus/m.lyra_player/
 ```
 
-WASI 文件选择器会先把本地文件复制到插件的 `media/` 目录。网络音频使用 Waki 分块读取并写入临时文件，再由导入状态机增量发送；不会把完整 MP3 常驻内存。JPEG/PNG 只在生成固定尺寸的 BIN 时解码，旧版快应用未声明图片能力时会自动省略这些图片资源。
+WASI 文件选择器会先把本地文件复制到插件的 `media/` 目录。网络音频用 Waki 分块读取并写入临时文件，
+再增量发送；不会把完整 MP3 常驻内存。JPEG/PNG 只在生成固定尺寸的 BIN 时解码。
 
-“手表音乐”使用独立的 `lyra-library-*` v1 管理协议，每页请求 8 首且不传输文件路径。排序请求携带最近一次完整读取的有序列表修订值；发生冲突时不会覆盖手表音乐库，用户刷新后即可重试。排序需要同时安装最新版插件和快应用。
+协议细节见仓库的 [docs/CONNECT_PROTOCOL.md](../../docs/CONNECT_PROTOCOL.md)。
 
 ## 构建
 
 ```sh
-python3 scripts/build_dist.py --release --package
+python3 scripts/build_dist.py --release --package        # wasm32-wasip2，输出 dist/*.abp
+cargo test --target aarch64-apple-darwin                 # 主机测试（把目标换成本机三元组）
 ```
 
-输出位于 `dist/`。
+输出位于 `dist/`。插件的 WIT 在 `wit/`：`deps/astrobox-psys-host-v4.wit` 与 `astrobox-psys-plugin-v4.wit`
+定义了 `canopusconnect` 接口（`send` / `listen` / `unlisten` 与 `on-message` 回调）。

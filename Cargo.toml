@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/lyra-protocol",
+  "crates/lyra-transfer",
+  "tools/lyra-mirage-import",
   "crates/lyra-player-core",
   "crates/lyra-player-device",
 ]

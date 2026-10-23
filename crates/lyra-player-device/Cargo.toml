@@ -16,11 +16,12 @@ target-xiaomi-band-10-pro-3-101-036 = ["device", "canopus-target-private/target-
 target-xiaomi-band-10-pro-3-101-043 = ["device", "canopus-target-private/target-xiaomi-band-10-pro-3-101-043"]
 target-xiaomi-band-11-4-100-139 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-139"]
 target-xiaomi-band-11-4-100-155 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-155"]
-target-xiaomi-band-11-4-100-177 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-177"]
+target-xiaomi-band-11-4-100-179 = ["device", "canopus-target-private/target-xiaomi-band-11-4-100-179"]
 
 [dependencies]
 lyra-player-core = { path = "../lyra-player-core", default-features = false }
+lyra-protocol = { path = "../lyra-protocol", default-features = false }
 canopus-abi = { path = "../../../Canopus/sdk/rust/canopus-abi" }
 canopus-runtime = { path = "../../../Canopus/sdk/rust/canopus-runtime" }
-canopus-ui-core = { path = "../../../Canopus/sdk/rust/canopus-ui-core" }
+
 canopus-target-private = { path = "../../../Canopus/sdk/rust/canopus-target-private", optional = true, default-features = false }

@@ -1,0 +1,26 @@
+// Host side of CanopusConnect (API level 4), written from ADR-CAN-009 of the Canopus
+// framework: AstroBox's pluginsystem exposes `send`, `listen` and `unlisten`, and the
+// plugin may export `canopusconnect.on-message` to receive what the module sends back.
+// A module is addressed by its Canopus module id (ADR-CAN-003: `[a-z][a-z0-9_]{0,15}`).
+// Permissions: `canopusconnect.send` and `canopusconnect.listen`, confirmed per plugin
+// and module on first use; `unlisten` needs none.
+package astrobox:psys-host-v4;
+
+interface canopusconnect {
+    // One message is one frame of at most 480 bytes.
+    variant payload {
+        text(string),
+        binary(list<u8>),
+    }
+
+    // Delivers the message to the module's listener on the device. Resolves once the
+    // module has taken it (the Supervisor answered), so the caller may send the next.
+    send: func(device-addr: string, module-id: string, payload: payload) -> future<result<_, string>>;
+
+    // Asks the device to push the module's messages to this phone session. The device
+    // forgets the registration when the link drops; the host registers again after it
+    // reconnects.
+    listen: func(device-addr: string, module-id: string) -> future<result<_, string>>;
+
+    unlisten: func(device-addr: string, module-id: string) -> future;
+}

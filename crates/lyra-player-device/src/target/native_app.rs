@@ -8,28 +8,42 @@ use core::sync::atomic::Ordering;
 use canopus_target_private::*;
 
 use super::runtime::*;
-use super::ui_backend;
+use super::ui;
 
 pub const APP_ID: u16 = 0x00CC;
-pub const PAGE_COUNT: usize = 4;
-pub const PAGE_OVERVIEW: usize = 0;
-pub const PAGE_LIBRARY: usize = 1;
-pub const PAGE_PLAYER: usize = 2;
+pub const PAGE_COUNT: usize = 2;
+pub const PAGE_LIBRARY: usize = 0;
+pub const PAGE_PLAYER: usize = 1;
 
 pub const PACKAGE_NAME: &[u8] = b"com.canopus.lyra-player\0";
 pub const DISPLAY_NAME: &[u8] = b"Lyra\0";
-pub const LAUNCHER_ICON: &[u8] = b"/data/canopus/appicon_lyra.bin\0";
-const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [
-    b"lyra_home\0",
-    b"lyra_library\0",
-    b"lyra_player\0",
-    b"lyra_lyrics\0",
-];
+pub const LAUNCHER_ICON: &[u8] = b"/data/canopus/m.lyra_player/appicon.bin\0";
+const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [b"lyra_library\0", b"lyra_player\0"];
 
 static mut APP_DESCRIPTOR: core::mem::MaybeUninit<launcher_app_descriptor> =
     core::mem::MaybeUninit::uninit();
 static mut PAGE_DESCRIPTORS: core::mem::MaybeUninit<[firmware_page_descriptor; PAGE_COUNT]> =
     core::mem::MaybeUninit::uninit();
+
+/// The descriptor the firmware itself passes to a page's callbacks. It need
+/// not be the registered copy, and `page_finish` only recognises its own.
+static mut LIVE_PAGES: [*mut firmware_page_descriptor; PAGE_COUNT] =
+    [core::ptr::null_mut(); PAGE_COUNT];
+
+fn remember_live_page(index: usize, page: *mut firmware_page_descriptor) {
+    // SAFETY: page callbacks run on the UI thread.
+    unsafe { (*core::ptr::addr_of_mut!(LIVE_PAGES))[index] = page };
+}
+
+pub fn live_page_ptr(index: usize) -> *mut firmware_page_descriptor {
+    // SAFETY: as above.
+    let live = unsafe { (*core::ptr::addr_of!(LIVE_PAGES))[index] };
+    if live.is_null() {
+        page_descriptor_ptr(index)
+    } else {
+        live
+    }
+}
 
 pub fn page_descriptor_ptr(index: usize) -> *mut firmware_page_descriptor {
     // SAFETY: PAGE_DESCRIPTORS is initialized by `install` before any page
@@ -103,7 +117,7 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
         #[cfg(not(any(
             feature = "target-xiaomi-band-11-4-100-139",
             feature = "target-xiaomi-band-11-4-100-155",
-            feature = "target-xiaomi-band-11-4-100-177"
+            feature = "target-xiaomi-band-11-4-100-179"
         )))]
         {
             (*descriptor).on_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
@@ -111,7 +125,7 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
         #[cfg(any(
             feature = "target-xiaomi-band-11-4-100-139",
             feature = "target-xiaomi-band-11-4-100-155",
-            feature = "target-xiaomi-band-11-4-100-177"
+            feature = "target-xiaomi-band-11-4-100-179"
         ))]
         {
             (*descriptor).on_ui_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
@@ -127,6 +141,7 @@ pub fn install_stage(stage: u32) -> Result<(), i32> {
     let existing = unsafe { app_lookup(APP_ID) };
 
     if stage == 1 {
+        ui::assets::ensure_launcher_icon();
         if !existing.is_null() {
             // Read the package field using the exact target descriptor layout.
             let package: *const u8 = unsafe {
@@ -242,7 +257,8 @@ extern "C" fn page_on_create(
         return -1;
     }
     runtime().active_page.store(index as u32, Ordering::Release);
-    ui_backend::page_create(index, root)
+    remember_live_page(index, page);
+    ui::page_create(index, root)
 }
 
 extern "C" fn page_on_resume(page: *mut firmware_page_descriptor) -> i32 {
@@ -251,7 +267,8 @@ extern "C" fn page_on_resume(page: *mut firmware_page_descriptor) -> i32 {
         return -1;
     }
     runtime().active_page.store(index as u32, Ordering::Release);
-    ui_backend::page_resume(index)
+    remember_live_page(index, page);
+    ui::page_resume(index)
 }
 
 extern "C" fn page_on_pause(page: *mut firmware_page_descriptor) -> i32 {
@@ -259,7 +276,7 @@ extern "C" fn page_on_pause(page: *mut firmware_page_descriptor) -> i32 {
     if index >= PAGE_COUNT {
         return -1;
     }
-    ui_backend::page_pause(index)
+    ui::page_pause(index)
 }
 
 extern "C" fn page_on_destroy(page: *mut firmware_page_descriptor) -> i32 {
@@ -267,5 +284,5 @@ extern "C" fn page_on_destroy(page: *mut firmware_page_descriptor) -> i32 {
     if index >= PAGE_COUNT {
         return -1;
     }
-    ui_backend::page_destroy(index)
+    ui::page_destroy(index)
 }

@@ -11,7 +11,7 @@ use crate::astrobox::psys_host::{
     dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
     ui_v3 as ui,
 };
-use crate::{artwork, id3, import, interconnect, library, netease, state};
+use crate::{artwork, connect, id3, import, library, netease, state};
 
 const EVENT_PICK_AUDIO: &str = "action:file.audio";
 const EVENT_PICK_COVER: &str = "action:file.cover";
@@ -26,7 +26,6 @@ const EVENT_ALBUM: &str = "input:album";
 const EVENT_DURATION: &str = "input:duration";
 const EVENT_QUERY: &str = "input:netease.query";
 const EVENT_AUDIO_QUALITY: &str = "input:netease.audio-quality";
-const EVENT_CHECKSUM_MODE: &str = "input:transfer.checksum";
 const EVENT_SEARCH_CLOUD: &str = "action:netease.search";
 const EVENT_LOAD_PLAYLISTS: &str = "action:netease.playlists";
 const EVENT_CLOSE_PLAYLIST: &str = "action:netease.playlist.close";
@@ -69,7 +68,7 @@ pub fn on_event(event_id: &str, payload: &str) {
         EVENT_PICK_COVER => pick_asset("cover", &["jpg", "jpeg", "png"]),
         EVENT_PICK_LYRICS => pick_asset("lyrics", &["lrc", "json", "txt"]),
         EVENT_REFRESH => {
-            interconnect::refresh_devices();
+            connect::refresh_devices();
             state::with_state(|state| state.status = "已刷新连接设备。".to_string());
         }
         EVENT_DEVICE => {
@@ -77,7 +76,6 @@ pub fn on_event(event_id: &str, payload: &str) {
                 let selected_addr = payload.value.unwrap_or_default();
                 if state.selected_addr != selected_addr {
                     state.device_library.clear();
-                    state.library_request_id.clear();
                     state.library_revision.clear();
                     state.library_total = 0;
                     state.library_busy = false;
@@ -121,26 +119,6 @@ pub fn on_event(event_id: &str, payload: &str) {
                 .unwrap_or(netease::AUDIO_BITRATE_LOW);
             state::with_state(|state| {
                 state.netease_audio_bitrate = netease::normalized_audio_bitrate(bitrate);
-            });
-        }
-        EVENT_CHECKSUM_MODE => {
-            let mode = match payload.value.as_deref() {
-                Some("none-48k") => state::TransferMode::Ultra,
-                Some("none") => state::TransferMode::Fast,
-                _ => state::TransferMode::Crc32,
-            };
-            state::with_state(|state| {
-                state.transfer_mode = mode;
-                state.status = match mode {
-                    state::TransferMode::Crc32 => "已启用 CRC32 分片校验。".to_string(),
-                    state::TransferMode::Fast => {
-                        "已选择无校验高速模式；损坏分片可能无法被发现。".to_string()
-                    }
-                    state::TransferMode::Ultra => {
-                        "已选择无校验超高速模式（48 KiB 单包上限）；强烈不建议用于重要文件。"
-                            .to_string()
-                    }
-                };
             });
         }
         EVENT_START_LOCAL => start_local(),
@@ -321,19 +299,8 @@ fn pick_asset(kind: &str, extensions: &[&str]) {
     }
 }
 
-/// Artwork is sized for the device the import is sent to.
-fn selected_device_profile(snapshot: &state::UiState) -> artwork::DeviceProfile {
-    snapshot
-        .devices
-        .iter()
-        .find(|device| device.addr == snapshot.selected_addr)
-        .map(|device| artwork::DeviceProfile::from_device_name(&device.name))
-        .unwrap_or_default()
-}
-
 fn start_local() {
     let snapshot = state::snapshot();
-    let profile = selected_device_profile(&snapshot);
     let Some(audio) = snapshot.audio else {
         state::with_state(|state| state.status = "请先选择 MP3。".to_string());
         return;
@@ -342,18 +309,14 @@ fn start_local() {
         state::with_state(|state| state.status = "曲名不能为空。".to_string());
         return;
     }
-    let mut assets = vec![import::ImportAsset::audio(audio.path, audio.size)];
+    let mut assets = vec![import::ImportAsset::audio(audio.path)];
+    let mut palette = artwork::Palette::default();
     if let Some(cover) = snapshot.cover {
         let output = artwork::unique_output_directory("local-artwork");
-        match artwork::prepare(Path::new(&cover.path), &output, profile) {
+        match artwork::prepare(Path::new(&cover.path), &output) {
             Ok(prepared) => {
-                assets.push(import::ImportAsset::cover_bin(
-                    prepared.cover_path,
-                    prepared.cover_size,
-                ));
-                if let Some(background) = prepared.background {
-                    assets.push(import::ImportAsset::background_bin(background));
-                }
+                palette = prepared.palette;
+                assets.push(import::ImportAsset::cover(prepared.cover_path));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "local cover processing skipped");
@@ -364,11 +327,7 @@ fn start_local() {
         }
     }
     if let Some(lyrics) = snapshot.lyrics {
-        assets.push(import::ImportAsset::lyrics(
-            lyrics.path,
-            lyrics.size,
-            lyrics.format,
-        ));
+        assets.push(import::ImportAsset::lyrics(lyrics.path, lyrics.format));
     }
     let artists = if snapshot.artist.trim().is_empty() {
         Vec::new()
@@ -381,8 +340,8 @@ fn start_local() {
         name: snapshot.track_name.trim().to_string(),
         artists,
         album: snapshot.album.trim().to_string(),
-        album_id: 0,
         duration_ms: snapshot.duration_ms,
+        palette,
         assets,
     }));
     if let Err(error) = result {
@@ -476,7 +435,6 @@ fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
         &song,
         &snapshot.netease_cookie,
         snapshot.netease_audio_bitrate,
-        selected_device_profile(&snapshot),
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -490,8 +448,8 @@ fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
         name: prepared.song.name,
         artists: prepared.song.artists,
         album: prepared.song.album,
-        album_id: prepared.song.album_id,
         duration_ms: prepared.song.duration_ms,
+        palette: prepared.palette,
         assets: prepared.assets,
     }));
     if let Err(error) = result {
@@ -554,6 +512,19 @@ fn logout_netease() {
     });
 }
 
+/// The time left at the measured speed, e.g. `剩余约 3 分 20 秒`.
+fn remaining_text(left: u64, speed: u64) -> Option<String> {
+    if left == 0 || speed == 0 {
+        return None;
+    }
+    let seconds = left.div_ceil(speed);
+    Some(if seconds >= 60 {
+        format!("剩余约 {} 分 {} 秒", seconds / 60, seconds % 60)
+    } else {
+        format!("剩余约 {seconds} 秒")
+    })
+}
+
 fn build_root() -> ui::Element {
     let state = state::snapshot();
     let mut root = ui::Element::new(ui::ElementType::Div, None)
@@ -564,7 +535,7 @@ fn build_root() -> ui::Element {
         .gap(18)
         .child(text("Lyra Import", 28, "#f4f4f5"))
         .child(text(
-            "将本地 MP3 或网易云音乐导入 com.canopus.lyraimport 快应用。",
+            "通过 CanopusConnect 把本地 MP3 或网易云音乐直接导入手表上的 Lyra Player。",
             14,
             "#a1a1aa",
         ));
@@ -580,7 +551,6 @@ fn build_root() -> ui::Element {
                 .prop("value", &device.addr),
         );
     }
-    let checksum = checksum_select(state.transfer_mode);
     let device = ui::Element::new(ui::ElementType::Card, None)
         .width_full()
         .padding(18)
@@ -590,12 +560,11 @@ fn build_root() -> ui::Element {
         .gap(10)
         .child(text("目标设备", 18, "#f4f4f5"))
         .child(text(
-            "音乐将传输到所选设备上的 Lyra Import。",
+            "音乐会通过 CanopusConnect 直接传输到所选设备上的 Lyra Player。",
             13,
             "#a1a1aa",
         ))
         .child(device_select)
-        .child(checksum)
         .child(button("刷新设备", EVENT_REFRESH, "#27272a"));
     root = root.child(device);
 
@@ -848,12 +817,16 @@ fn transfer_card(state: &state::UiState) -> ui::Element {
             .min(100);
         let detail = if state.speed_bytes_per_second > 0 {
             let speed_kib = (state.speed_bytes_per_second + 512) / 1024;
+            let remaining = remaining_text(state.total.saturating_sub(state.sent), state.speed_bytes_per_second)
+                .map(|text| format!(" · {text}"))
+                .unwrap_or_default();
             format!(
-                "{}% · {:.2} / {:.2} MiB · {}k/s",
+                "{}% · {:.2} / {:.2} MiB · {}k/s{}",
                 percent,
                 state.sent as f64 / 1_048_576.0,
                 state.total as f64 / 1_048_576.0,
-                speed_kib.max(1)
+                speed_kib.max(1),
+                remaining
             )
         } else {
             format!(
@@ -1019,34 +992,6 @@ fn qr_image_url(value: &str) -> String {
     format!("data:image/svg+xml;base64,{}", BASE64.encode(image))
 }
 
-fn checksum_select(mode: state::TransferMode) -> ui::Element {
-    let value = match mode {
-        state::TransferMode::Crc32 => "crc32",
-        state::TransferMode::Fast => "none",
-        state::TransferMode::Ultra => "none-48k",
-    };
-    ui::Element::new(ui::ElementType::Select, None)
-        .width_full()
-        .prop("default-value", value)
-        .prop("key", EVENT_CHECKSUM_MODE)
-        .on(ui::Event::Change, EVENT_CHECKSUM_MODE)
-        .child(
-            ui::Element::new(ui::ElementType::Option, Some("CRC32 校验（推荐，可靠）"))
-                .prop("value", "crc32"),
-        )
-        .child(
-            ui::Element::new(ui::ElementType::Option, Some("无校验高速（可能损坏文件）"))
-                .prop("value", "none"),
-        )
-        .child(
-            ui::Element::new(
-                ui::ElementType::Option,
-                Some("无校验超高速 · 48 KiB 单包上限（高风险）"),
-            )
-            .prop("value", "none-48k"),
-        )
-}
-
 fn audio_quality_select(bitrate: u32) -> ui::Element {
     ui::Element::new(ui::ElementType::Select, None)
         .width_full()
@@ -1103,6 +1048,14 @@ fn text(content: &str, size: u32, color: &str) -> ui::Element {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remaining_time_rounds_up_and_needs_a_speed() {
+        assert_eq!(remaining_text(0, 10_000), None);
+        assert_eq!(remaining_text(10_000, 0), None);
+        assert_eq!(remaining_text(10_001, 10_000).as_deref(), Some("剩余约 2 秒"));
+        assert_eq!(remaining_text(5 * 1_048_576, 12_000).as_deref(), Some("剩余约 7 分 17 秒"));
+    }
+
     use super::*;
 
     #[test]

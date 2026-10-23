@@ -42,7 +42,14 @@ pub struct Runtime {
     pub last_error: AtomicI32,
     pub active_page: AtomicU32,
     pub timer_ticks: AtomicU32,
-    pub library_poll_tick: AtomicU32,
+    pub ui_ticks: AtomicU32,
+    /// What `connect::start` returned: 0 when the phone can import.
+    pub connect_result: AtomicI32,
+    /// Raised by the importer when it changed the library on disk.
+    pub library_dirty: AtomicBool,
+    pub library_loaded: AtomicBool,
+    /// `storage::library_stamp()` of the file that was last loaded.
+    pub library_stamp: AtomicU32,
     pub player_media_refresh_pending: AtomicBool,
 }
 
@@ -56,7 +63,11 @@ impl Runtime {
             last_error: AtomicI32::new(0),
             active_page: AtomicU32::new(0),
             timer_ticks: AtomicU32::new(0),
-            library_poll_tick: AtomicU32::new(0),
+            ui_ticks: AtomicU32::new(0),
+            connect_result: AtomicI32::new(-38),
+            library_dirty: AtomicBool::new(false),
+            library_loaded: AtomicBool::new(false),
+            library_stamp: AtomicU32::new(0),
             player_media_refresh_pending: AtomicBool::new(false),
         }
     }
