@@ -2,6 +2,7 @@
 //! then follows the transfer with the shared sender (`lyra-transfer`), sending frames
 //! over CanopusConnect and feeding it what the watch answers.
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
@@ -10,10 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lyra_protocol::{Asset, Incoming, Reply, Request, Status, TrackMeta, VERSION};
+use lyra_protocol::{Asset, Incoming, MIN_VERSION, Reply, Request, Status, TrackMeta};
 use lyra_transfer::{Failure, Sender, Source, State, specs};
 
-use crate::{artwork::Palette, astrobox::psys_host::timer, connect, lyrics, state};
+use crate::{artwork::Palette, astrobox::psys_host_v4::timer, connect, lyrics, state};
 
 /// The watch has to answer within this time or the import is given up.
 const STALL: Duration = Duration::from_secs(45);
@@ -240,7 +241,7 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
     });
     let hello = Request::Hello {
         req: HELLO_REQ,
-        version: VERSION,
+        version: MIN_VERSION,
     }
     .encode()
     .map_err(|_| "内部错误".to_string());
@@ -256,14 +257,12 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
         finish_error(&message);
         return Err(message);
     }
-    arm_watchdog().await;
+    arm_watchdog();
     Ok(())
 }
 
-async fn arm_watchdog() {
-    let _ = timer::set_timeout(STALL.as_millis() as u64, STALL_TIMER_PAYLOAD)
-        .into_future()
-        .await;
+fn arm_watchdog() {
+    timer::set_timeout(STALL.as_millis() as u64, STALL_TIMER_PAYLOAD);
 }
 
 /// A frame the Lyra Player module sent; `true` when it belonged to the running import.
@@ -313,8 +312,15 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
     true
 }
 
-/// Sends every frame the sender has ready. Only one call does this at a time; events that
-/// arrive meanwhile are fed in by `on_frame` and picked up by the running loop.
+/// Frames kept on their way to the watch at once. The host lets this many CanopusConnect messages
+/// be in flight per device (it keeps the last slot of the watch's queue for the Manager), so the
+/// round trip of one frame no longer sets the pace: over a real Bluetooth link a frame takes
+/// several connection intervals to be answered, and one answered frame at a time is what held the
+/// transfer under 10 KiB/s.
+const IN_FLIGHT: usize = 3;
+
+/// Sends every frame the sender has ready, [`IN_FLIGHT`] at a time. Only one call does this at a
+/// time; events that arrive meanwhile are fed in by `on_frame` and picked up by the running loop.
 async fn pump() {
     {
         let mut guard = lock();
@@ -324,48 +330,58 @@ async fn pump() {
         }
         active.pumping = true;
     }
+    let mut sends = FuturesUnordered::new();
     loop {
-        let (addr, frame) = {
-            let mut guard = lock();
-            let Some(active) = guard.as_mut() else { return };
-            if !active.greeted {
+        // Top the window up with whatever the sender has ready. The frames are started in the order
+        // the sender made them, and the host queues them to the watch in that order.
+        while sends.len() < IN_FLIGHT {
+            let next = {
+                let mut guard = lock();
+                let Some(active) = guard.as_mut() else { return };
+                if !active.greeted {
+                    active.pumping = false;
+                    return;
+                }
+                publish_progress(active.total, &mut active.speed_mark, &active.sender);
+                match active.sender.state() {
+                    State::Done => {
+                        active.pumping = false;
+                        let seconds = active.started.elapsed().as_secs_f64().max(0.001);
+                        let total = active.total;
+                        *guard = None;
+                        drop(guard);
+                        state::with_state(|state| {
+                            state.active = false;
+                            state.sent = total;
+                            state.speed_bytes_per_second = (total as f64 / seconds) as u64;
+                            state.status = "导入完成，歌曲已出现在手表的 Lyra Player 中。".to_string();
+                        });
+                        crate::library::refresh().await;
+                        return;
+                    }
+                    State::Failed(failure) => {
+                        *guard = None;
+                        drop(guard);
+                        finish_error(&failure_text(failure));
+                        return;
+                    }
+                    _ => {}
+                }
+                active.sender.poll().map(|frame| (active.addr.clone(), frame))
+            };
+            match next {
+                Some((addr, frame)) => sends.push(async move { connect::send(&addr, &frame).await }),
+                None => break,
+            }
+        }
+        if sends.is_empty() {
+            // Nothing to send and nothing on its way: the watch's next frame starts the loop again.
+            if let Some(active) = lock().as_mut() {
                 active.pumping = false;
-                return;
             }
-            publish_progress(active.total, &mut active.speed_mark, &active.sender);
-            match active.sender.state() {
-                State::Done => {
-                    active.pumping = false;
-                    let seconds = active.started.elapsed().as_secs_f64().max(0.001);
-                    let total = active.total;
-                    *guard = None;
-                    drop(guard);
-                    state::with_state(|state| {
-                        state.active = false;
-                        state.sent = total;
-                        state.speed_bytes_per_second = (total as f64 / seconds) as u64;
-                        state.status = "导入完成，歌曲已出现在手表的 Lyra Player 中。".to_string();
-                    });
-                    crate::library::refresh_async().await;
-                    return;
-                }
-                State::Failed(failure) => {
-                    *guard = None;
-                    drop(guard);
-                    finish_error(&failure_text(failure));
-                    return;
-                }
-                _ => {}
-            }
-            match active.sender.poll() {
-                Some(frame) => (active.addr.clone(), frame),
-                None => {
-                    active.pumping = false;
-                    return;
-                }
-            }
-        };
-        if let Err(error) = connect::send(&addr, &frame).await {
+            return;
+        }
+        if let Some(Err(error)) = sends.next().await {
             *lock() = None;
             finish_error(&format!("发送失败：{error}"));
             return;
@@ -419,7 +435,7 @@ fn finish_error(error: &str) {
 
 /// The stall timer fired: give up when the watch has been silent for too long, otherwise
 /// keep watching.
-pub async fn check_stall() {
+pub fn check_stall() {
     let stalled = {
         let guard = lock();
         match guard.as_ref() {
@@ -431,7 +447,7 @@ pub async fn check_stall() {
         *lock() = None;
         finish_error("手表长时间没有响应，导入已中止。");
     } else {
-        arm_watchdog().await;
+        arm_watchdog();
     }
 }
 

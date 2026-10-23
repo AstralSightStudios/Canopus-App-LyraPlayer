@@ -20,9 +20,12 @@ fn shuffle_noise(id: u64, generation: u32) -> u32 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Route {
+    /// The home page: "all songs" and the playlists.
     #[default]
     Library,
     Player,
+    /// The songs of `LyraApp::collection`.
+    Collection,
 }
 
 impl Route {
@@ -30,6 +33,7 @@ impl Route {
         match self {
             Self::Library => 0,
             Self::Player => 1,
+            Self::Collection => 2,
         }
     }
 
@@ -37,6 +41,7 @@ impl Route {
         match index {
             0 => Some(Self::Library),
             1 => Some(Self::Player),
+            2 => Some(Self::Collection),
             _ => None,
         }
     }
@@ -50,6 +55,14 @@ pub enum Effect {
     Navigate(Route),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Collection {
+    #[default]
+    Overview,
+    All,
+    Playlist(u64),
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
     Boot(Library),
@@ -57,17 +70,29 @@ pub enum Action {
     Back,
     ReloadLibrary(Library),
     SelectSong(Song),
+    Browse(Collection),
+    /// Show the songs of a collection on their own page.
+    OpenCollection(Collection),
+    PlayCollection {
+        playlist: Option<u64>,
+        mode: PlaybackMode,
+    },
     /// Start a track without leaving the current page (remote control).
     Play(Song),
     Previous,
     Next,
+    /// The audio driver, not the file reader, has finished draining the track.
+    TrackEnded,
     Tick(u32),
     /// Advance the repeat/shuffle mode by one step.
     CycleMode,
     /// The queue ran out with nothing left to play.
     PlaybackExhausted,
     /// The lyrics file of track `id` was read; `None` when it has none.
-    LyricsLoaded { id: u64, lyrics: Option<Lyrics> },
+    LyricsLoaded {
+        id: u64,
+        lyrics: Option<Lyrics>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +104,10 @@ pub struct LyraApp {
     pub error: Option<String>,
     pub generation: u32,
     pub mode: PlaybackMode,
+    pub collection: Collection,
+    /// A snapshot of the selected collection, never the whole library by accident.
+    pub queue: Vec<u64>,
+    shuffle_seed: u32,
     /// Lyrics of the current track, with the id they belong to so a late
     /// answer for a skipped track is dropped.
     pub lyrics: Lyrics,
@@ -95,6 +124,9 @@ impl Default for LyraApp {
             error: None,
             generation: 1,
             mode: PlaybackMode::default(),
+            collection: Collection::Overview,
+            queue: Vec::new(),
+            shuffle_seed: 0x6d2b_79f5,
             lyrics: Lyrics::default(),
             lyrics_for: None,
         }
@@ -123,6 +155,13 @@ impl LyraApp {
                 let current_removed =
                     current_id.is_some_and(|id| !library.tracks.iter().any(|song| song.id == id));
                 self.library = library;
+                self.queue
+                    .retain(|id| self.library.tracks.iter().any(|song| song.id == *id));
+                if let Collection::Playlist(id) = self.collection {
+                    if !self.library.playlists.iter().any(|list| list.id == id) {
+                        self.collection = Collection::Overview;
+                    }
+                }
                 if current_removed {
                     self.player.clear();
                     self.lyrics = Lyrics::default();
@@ -143,10 +182,57 @@ impl LyraApp {
                 }
             }
             Action::SelectSong(song) => {
+                let playlist = match self.collection {
+                    Collection::Playlist(id) => Some(id),
+                    _ => None,
+                };
+                self.queue = self.library.collection(playlist);
+                if !self.queue.contains(&song.id) {
+                    return effects;
+                }
                 self.navigate(Route::Player, &mut effects);
                 self.play(song, &mut effects);
             }
-            Action::Play(song) => self.play(song, &mut effects),
+            Action::Browse(collection) => {
+                if !self.has_collection(collection) {
+                    return effects;
+                }
+                self.collection = collection;
+            }
+            Action::OpenCollection(collection) => {
+                if collection == Collection::Overview || !self.has_collection(collection) {
+                    return effects;
+                }
+                self.collection = collection;
+                self.navigate(Route::Collection, &mut effects);
+            }
+            Action::PlayCollection { playlist, mode } => {
+                let queue = self.library.collection(playlist);
+                if queue.is_empty() {
+                    return effects;
+                }
+                self.queue = queue;
+                self.mode = mode;
+                let index = if mode == PlaybackMode::Shuffle {
+                    self.shuffle_seed as usize % self.queue.len()
+                } else {
+                    0
+                };
+                if let Some(song) = self
+                    .library
+                    .tracks
+                    .iter()
+                    .find(|song| song.id == self.queue[index])
+                    .cloned()
+                {
+                    self.navigate(Route::Player, &mut effects);
+                    self.play(song, &mut effects);
+                }
+            }
+            Action::Play(song) => {
+                self.queue = self.library.collection(None);
+                self.play(song, &mut effects);
+            }
             // Track changes never navigate. Besides the player page's own
             // buttons, they come from headset gestures and from a track
             // finishing, both handled on the Bluetooth thread, where the page
@@ -160,6 +246,18 @@ impl LyraApp {
             Action::Next => {
                 if let Some(song) = self.adjacent_song(true) {
                     self.play(song, &mut effects);
+                }
+            }
+            Action::TrackEnded => {
+                let following = if self.mode == PlaybackMode::RepeatOne {
+                    self.player.current.clone()
+                } else {
+                    self.adjacent_song(true)
+                };
+                if let Some(song) = following {
+                    self.play(song, &mut effects);
+                } else {
+                    return self.update(Action::PlaybackExhausted);
                 }
             }
             Action::Tick(ms) => self.player.tick(ms),
@@ -181,6 +279,13 @@ impl LyraApp {
         effects
     }
 
+    fn has_collection(&self, collection: Collection) -> bool {
+        match collection {
+            Collection::Overview | Collection::All => true,
+            Collection::Playlist(id) => self.library.playlists.iter().any(|list| list.id == id),
+        }
+    }
+
     pub fn has_previous(&self) -> bool {
         self.adjacent_song(false).is_some()
     }
@@ -199,8 +304,8 @@ impl LyraApp {
 
     fn adjacent_song(&self, next: bool) -> Option<Song> {
         let id = self.player.current.as_ref()?.id;
-        let tracks = self.tracks();
-        let index = tracks.iter().position(|song| song.id == id)?;
+        let tracks = &self.queue;
+        let index = tracks.iter().position(|item| *item == id)?;
         let count = tracks.len();
         if count == 0 {
             return None;
@@ -213,7 +318,7 @@ impl LyraApp {
                     index.checked_sub(1)?
                 }
             }
-            PlaybackMode::RepeatAll => {
+            PlaybackMode::RepeatAll | PlaybackMode::RepeatOne => {
                 if next {
                     (index + 1) % count
                 } else {
@@ -222,20 +327,26 @@ impl LyraApp {
             }
             PlaybackMode::Shuffle => {
                 if count == 1 {
-                    return None;
+                    return self.player.current.clone();
                 }
                 // A whole shuffled ordering would have to survive library
                 // reloads and page changes; stepping to another track by a
                 // rotating offset keeps the queue stateless and never repeats
                 // the track that is already playing.
-                let step = 1 + (shuffle_noise(id, self.generation) as usize) % (count - 1);
+                let step = 1 + (shuffle_noise(id, self.shuffle_seed) as usize) % (count - 1);
                 (index + step) % count
             }
         };
-        tracks.get(adjacent).cloned()
+        let adjacent = tracks.get(adjacent)?;
+        self.library
+            .tracks
+            .iter()
+            .find(|song| song.id == *adjacent)
+            .cloned()
     }
 
     fn play(&mut self, song: Song, effects: &mut Vec<Effect>) {
+        self.shuffle_seed = shuffle_noise(song.id, self.shuffle_seed).max(1);
         self.player.select(song.clone(), core::iter::empty());
         self.error = None;
         self.lyrics = Lyrics::default();
@@ -281,6 +392,7 @@ mod tests {
         Library {
             revision: 1,
             tracks: ids.iter().map(|id| song(*id)).collect(),
+            ..Library::default()
         }
     }
 
@@ -449,7 +561,10 @@ mod tests {
             id: 2,
             lyrics: Some(lyrics.clone()),
         });
-        assert!(app.lyrics.is_empty(), "an answer for another track is dropped");
+        assert!(
+            app.lyrics.is_empty(),
+            "an answer for another track is dropped"
+        );
 
         app.update(Action::LyricsLoaded {
             id: 1,
@@ -464,6 +579,115 @@ mod tests {
     }
 
     #[test]
+    fn single_repeat_is_eof_only_and_never_navigates() {
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(library(&[1, 2, 3])));
+        app.update(Action::SelectSong(song(2)));
+        app.update(Action::Back);
+        app.mode = PlaybackMode::RepeatOne;
+        app.player.position_ms = 50_000;
+        let effects = app.update(Action::TrackEnded);
+        assert!(streams(&effects));
+        assert_eq!(app.player.current.as_ref().unwrap().id, 2);
+        assert_eq!(app.player.position_ms, 0);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Navigate(_)))
+        );
+        app.update(Action::Next);
+        assert_eq!(app.player.current.as_ref().unwrap().id, 3);
+        app.update(Action::Previous);
+        assert_eq!(app.player.current.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn playlist_replaces_queue_and_all_modes_stay_inside_it() {
+        for mode in [
+            PlaybackMode::ListOnce,
+            PlaybackMode::RepeatAll,
+            PlaybackMode::Shuffle,
+            PlaybackMode::RepeatOne,
+        ] {
+            let mut lib = library(&[1, 2, 3, 4]);
+            lib.playlists.push(crate::persistence::Playlist {
+                id: 7,
+                name: "夜间".into(),
+                tracks: alloc::vec![3, 1],
+            });
+            let mut app = LyraApp::default();
+            app.update(Action::Boot(lib));
+            app.update(Action::SelectSong(song(4)));
+            app.update(Action::PlayCollection {
+                playlist: Some(7),
+                mode,
+            });
+            assert_eq!(app.queue, alloc::vec![3, 1]);
+            for _ in 0..20 {
+                let effects = app.update(Action::TrackEnded);
+                assert!(
+                    !effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::Navigate(_)))
+                );
+                if let Some(song) = &app.player.current {
+                    assert!([3, 1].contains(&song.id));
+                } else {
+                    assert_eq!(mode, PlaybackMode::ListOnce);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browsing_does_not_replace_a_running_queue_and_songs_need_no_playlist() {
+        let mut lib = library(&[1, 2, 3]);
+        lib.playlists.push(crate::persistence::Playlist {
+            id: 7,
+            name: "空歌单".into(),
+            tracks: Vec::new(),
+        });
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(lib));
+        app.update(Action::SelectSong(song(2)));
+        let queue = app.queue.clone();
+        app.update(Action::Browse(Collection::Playlist(7)));
+        assert_eq!(app.queue, queue);
+        assert!(
+            app.update(Action::PlayCollection {
+                playlist: Some(7),
+                mode: PlaybackMode::Shuffle
+            })
+            .is_empty()
+        );
+        assert_eq!(app.player.current.as_ref().unwrap().id, 2);
+        app.update(Action::Browse(Collection::All));
+        app.update(Action::SelectSong(song(3)));
+        assert_eq!(app.queue, alloc::vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn shuffled_single_song_and_many_eof_transitions_are_safe() {
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(library(&[1])));
+        app.update(Action::SelectSong(song(1)));
+        app.mode = PlaybackMode::Shuffle;
+        app.update(Action::Back);
+        for _ in 0..1_000 {
+            let effects = app.update(Action::TrackEnded);
+            assert!(streams(&effects));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Navigate(_)))
+            );
+            assert_eq!(app.player.current.as_ref().unwrap().id, 1);
+            assert_eq!(app.history.len(), 0);
+        }
+    }
+
+    #[test]
     fn exhausting_the_queue_reports_nothing_left_to_play() {
         let mut app = LyraApp::default();
         app.update(Action::Boot(library(&[1])));
@@ -472,5 +696,22 @@ mod tests {
         app.update(Action::PlaybackExhausted);
         assert_eq!(app.player.state, PlaybackState::Finished);
         assert!(app.player.current.is_none());
+    }
+
+    #[test]
+    fn shuffle_reaches_every_track_and_never_repeats_the_current_one() {
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(library(&[1, 2, 3, 4, 5])));
+        app.mode = PlaybackMode::Shuffle;
+        app.update(Action::SelectSong(song(1)));
+        let mut seen = alloc::collections::BTreeSet::new();
+        for _ in 0..200 {
+            let before = app.player.current.as_ref().unwrap().id;
+            app.update(Action::TrackEnded);
+            let after = app.player.current.as_ref().unwrap().id;
+            assert_ne!(before, after);
+            seen.insert(after);
+        }
+        assert_eq!(seen.len(), 5, "every track comes up: {seen:?}");
     }
 }

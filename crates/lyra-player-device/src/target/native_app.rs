@@ -11,14 +11,15 @@ use super::runtime::*;
 use super::ui;
 
 pub const APP_ID: u16 = 0x00CC;
-pub const PAGE_COUNT: usize = 2;
+pub const PAGE_COUNT: usize = 3;
 pub const PAGE_LIBRARY: usize = 0;
 pub const PAGE_PLAYER: usize = 1;
+pub const PAGE_COLLECTION: usize = 2;
 
 pub const PACKAGE_NAME: &[u8] = b"com.canopus.lyra-player\0";
 pub const DISPLAY_NAME: &[u8] = b"Lyra\0";
 pub const LAUNCHER_ICON: &[u8] = b"/data/canopus/m.lyra_player/appicon.bin\0";
-const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [b"lyra_library\0", b"lyra_player\0"];
+const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [b"lyra_library\0", b"lyra_player\0", b"lyra_collection\0"];
 
 static mut APP_DESCRIPTOR: core::mem::MaybeUninit<launcher_app_descriptor> =
     core::mem::MaybeUninit::uninit();
@@ -113,14 +114,19 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
         (*descriptor).on_signal = page_on_signal as *const () as *mut core::ffi::c_void;
         (*descriptor).on_create = page_on_create as *const () as *mut core::ffi::c_void;
         (*descriptor).on_resume = page_on_resume as *const () as *mut core::ffi::c_void;
-        (*descriptor).on_pause = page_on_pause as *const () as *mut core::ffi::c_void;
         #[cfg(not(any(
             feature = "target-xiaomi-band-11-4-100-139",
             feature = "target-xiaomi-band-11-4-100-155",
             feature = "target-xiaomi-band-11-4-100-179"
         )))]
         {
-            (*descriptor).on_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
+            // The generated Band 10 field names after +0x54 are stale:
+            // +0x58 is START, +0x5c PAUSE, +0x60 STOP, +0x64 UI_DESTROY.
+            // Registering destroy at +0x5c tears down our timers on screen-off
+            // while the firmware keeps the root alive: wake shows a dead page.
+            (*descriptor).on_destroy = page_on_pause as *const () as *mut core::ffi::c_void;
+            (*descriptor).extension_callback_100 =
+                page_on_destroy as *const () as *mut core::ffi::c_void;
         }
         #[cfg(any(
             feature = "target-xiaomi-band-11-4-100-139",
@@ -128,6 +134,7 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
             feature = "target-xiaomi-band-11-4-100-179"
         ))]
         {
+            (*descriptor).on_pause = page_on_pause as *const () as *mut core::ffi::c_void;
             (*descriptor).on_ui_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
         }
     }

@@ -49,7 +49,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn reply(&mut self, reply: Reply) {
+    pub(crate) fn reply(&mut self, reply: Reply) {
         if let Ok(frame) = reply.encode() {
             self.frames.push(frame);
         }
@@ -61,7 +61,7 @@ impl Outcome {
         }
     }
 
-    fn ack(&mut self, op: u8, req: u16, status: Status, value: u32) {
+    pub(crate) fn ack(&mut self, op: u8, req: u16, status: Status, value: u32) {
         self.reply(Reply::Ack {
             op,
             req,
@@ -75,7 +75,14 @@ impl Outcome {
 pub struct Platform {
     pub width: u16,
     pub height: u16,
+    /// `lyra_protocol::CAP_*` bits this build can honour on this firmware.
+    pub caps: u8,
 }
+
+/// Frames that may arrive ahead of the one the watch expects before the phone is told to resume.
+/// The phone keeps a few frames in flight, and frames of one burst can swap places on their way
+/// (the host queues them concurrently); holding the early ones back is cheaper than a rewind.
+const REORDER_FRAMES: usize = 4;
 
 struct Slot {
     spec: AssetSpec,
@@ -83,6 +90,8 @@ struct Slot {
     crc: Crc32,
     confirmed: u32,
     done: bool,
+    /// Frames ahead of `next`, as `(offset, bytes)`, waiting for the gap to fill.
+    pending: Vec<(u32, Vec<u8>)>,
 }
 
 struct Stage {
@@ -128,6 +137,13 @@ impl Importer {
     ) -> Outcome {
         let mut out = Outcome::default();
         match request {
+            request @ (Request::Playlists { .. }
+            | Request::PlaylistTracks { .. }
+            | Request::PlaylistUpsert { .. }
+            | Request::PlaylistDelete { .. }
+            | Request::PlaylistTrack { .. }) => {
+                return crate::playlist::handle(request, library, store);
+            }
             Request::Hello { req, version } => {
                 let status = if version == 0 || version > VERSION {
                     Status::Unsupported
@@ -144,6 +160,7 @@ impl Importer {
                     revision: library.revision,
                     width: self.platform.width,
                     height: self.platform.height,
+                    caps: self.platform.caps,
                 });
             }
             Request::List { req, offset, max } => {
@@ -212,7 +229,11 @@ impl Importer {
         // A new transfer replaces an unfinished one: the phone only ever has
         // one, and a stale stage would otherwise wedge the next import.
         self.reset(store);
-        let audio = meta.assets.iter().filter(|s| s.kind == Asset::Audio).count();
+        let audio = meta
+            .assets
+            .iter()
+            .filter(|s| s.kind == Asset::Audio)
+            .count();
         let distinct = meta
             .assets
             .iter()
@@ -226,10 +247,7 @@ impl Importer {
             return Status::BadRequest;
         }
         let needed: u64 = meta.assets.iter().map(|spec| u64::from(spec.size)).sum();
-        let replaced = library
-            .tracks
-            .iter()
-            .any(|song| song.id == meta.id);
+        let replaced = library.tracks.iter().any(|song| song.id == meta.id);
         let free = store.free_kib();
         if free != u32::MAX && !replaced && needed / 1024 + 64 > u64::from(free) {
             return Status::NoSpace;
@@ -246,6 +264,7 @@ impl Importer {
                 crc: Crc32::new(),
                 confirmed: 0,
                 done: false,
+                pending: Vec::new(),
             })
             .collect();
         self.stage = Some(Stage { meta, slots });
@@ -277,8 +296,8 @@ impl Importer {
             });
             return;
         };
-        if slot.done || offset != slot.next {
-            // Lost or repeated data: say where the watch is so the phone resumes.
+        if slot.done || offset < slot.next {
+            // Repeated data: say where the watch is so the phone resumes.
             out.event(Event::Progress {
                 asset,
                 next_offset: slot.next,
@@ -286,32 +305,34 @@ impl Importer {
             });
             return;
         }
-        let end = u64::from(offset) + bytes.len() as u64;
-        if end > u64::from(slot.spec.size) {
-            out.event(Event::Progress {
-                asset,
-                next_offset: slot.next,
-                status: Status::BadRequest,
-            });
+        if offset > slot.next {
+            // Ahead of where the watch is. A frame that merely overtook its neighbours is kept
+            // until they have arrived; anything further (or too many) means data was lost.
+            let reach = (REORDER_FRAMES * DATA_MAX) as u32;
+            let fits = offset - slot.next <= reach
+                && slot.pending.len() < REORDER_FRAMES
+                && !slot.pending.iter().any(|(held, _)| *held == offset);
+            if fits {
+                slot.pending.push((offset, bytes.to_vec()));
+            } else {
+                slot.pending.clear();
+                out.event(Event::Progress {
+                    asset,
+                    next_offset: slot.next,
+                    status: Status::Sequence,
+                });
+            }
             return;
         }
-        if let Err(status) = store.stage_write(asset, offset, bytes) {
-            out.event(Event::Progress {
-                asset,
-                next_offset: slot.next,
-                status,
-            });
+        if !write_in_order(slot, asset, offset, bytes, store, out) {
             return;
         }
-        slot.crc.update(bytes);
-        slot.next = end as u32;
-        if slot.next - slot.confirmed >= PROGRESS_STEP || slot.next == slot.spec.size {
-            slot.confirmed = slot.next;
-            out.event(Event::Progress {
-                asset,
-                next_offset: slot.next,
-                status: Status::Ok,
-            });
+        // Frames that were waiting for this one follow at once.
+        while let Some(index) = slot.pending.iter().position(|(held, _)| *held == slot.next) {
+            let (held, held_bytes) = slot.pending.swap_remove(index);
+            if !write_in_order(slot, asset, held, &held_bytes, store, out) {
+                return;
+            }
         }
     }
 
@@ -376,17 +397,60 @@ impl Importer {
     }
 }
 
+/// Writes the frame the watch expects next and reports progress. `false` after a refusal (an event
+/// went out; whatever was waiting is dropped, the phone resumes from `next`).
+fn write_in_order<S: ImportStore>(
+    slot: &mut Slot,
+    asset: Asset,
+    offset: u32,
+    bytes: &[u8],
+    store: &mut S,
+    out: &mut Outcome,
+) -> bool {
+    let end = u64::from(offset) + bytes.len() as u64;
+    let refused = if end > u64::from(slot.spec.size) {
+        Some(Status::BadRequest)
+    } else {
+        store.stage_write(asset, offset, bytes).err()
+    };
+    if let Some(status) = refused {
+        slot.pending.clear();
+        out.event(Event::Progress {
+            asset,
+            next_offset: slot.next,
+            status,
+        });
+        return false;
+    }
+    slot.crc.update(bytes);
+    slot.next = end as u32;
+    if slot.next - slot.confirmed >= PROGRESS_STEP || slot.next == slot.spec.size {
+        slot.confirmed = slot.next;
+        out.event(Event::Progress {
+            asset,
+            next_offset: slot.next,
+            status: Status::Ok,
+        });
+    }
+    true
+}
+
 fn delete<S: ImportStore>(id: u64, library: &mut Library, store: &mut S) -> Status {
     let Some(index) = library.tracks.iter().position(|song| song.id == id) else {
         return Status::NotFound;
     };
-    library.tracks.remove(index);
-    library.revision = library.revision.wrapping_add(1);
+    let mut candidate = library.clone();
+    candidate.tracks.remove(index);
+    for list in &mut candidate.playlists {
+        list.tracks.retain(|track| *track != id);
+    }
+    candidate.revision = candidate.revision.wrapping_add(1);
     // The library goes first: a crash between the two steps leaves orphan
     // files, never a listed track without audio.
-    if let Err(status) = store.save_library(library) {
+    if let Err(status) = store.save_library(&candidate) {
         return status;
     }
+    *library = candidate;
     let _ = store.remove_track(id);
     Status::Ok
 }
@@ -502,6 +566,7 @@ mod tests {
         Importer::new(Platform {
             width: 212,
             height: 520,
+            caps: 0,
         })
     }
 
@@ -546,24 +611,30 @@ mod tests {
     fn acks(out: &Outcome) -> Vec<(u8, Status)> {
         out.frames
             .iter()
-            .filter_map(|frame| match lyra_protocol::Incoming::decode(frame).unwrap() {
-                lyra_protocol::Incoming::Reply(Reply::Ack { op, status, .. }) => Some((op, status)),
-                _ => None,
-            })
+            .filter_map(
+                |frame| match lyra_protocol::Incoming::decode(frame).unwrap() {
+                    lyra_protocol::Incoming::Reply(Reply::Ack { op, status, .. }) => {
+                        Some((op, status))
+                    }
+                    _ => None,
+                },
+            )
             .collect()
     }
 
     fn progress(out: &Outcome) -> Vec<(u32, Status)> {
         out.frames
             .iter()
-            .filter_map(|frame| match lyra_protocol::Incoming::decode(frame).unwrap() {
-                lyra_protocol::Incoming::Event(Event::Progress {
-                    next_offset,
-                    status,
-                    ..
-                }) => Some((next_offset, status)),
-                _ => None,
-            })
+            .filter_map(
+                |frame| match lyra_protocol::Incoming::decode(frame).unwrap() {
+                    lyra_protocol::Incoming::Event(Event::Progress {
+                        next_offset,
+                        status,
+                        ..
+                    }) => Some((next_offset, status)),
+                    _ => None,
+                },
+            )
             .collect()
     }
 
@@ -595,7 +666,11 @@ mod tests {
 
     #[test]
     fn a_whole_track_is_imported_and_listed() {
-        let (audio, cover, lyrics) = (payload(20_000, 1), payload(3_000, 2), b"[00:01.00]hi".to_vec());
+        let (audio, cover, lyrics) = (
+            payload(20_000, 1),
+            payload(3_000, 2),
+            b"[00:01.00]hi".to_vec(),
+        );
         let mut importer = importer();
         let mut library = Library::default();
         let mut store = Memory::default();
@@ -610,12 +685,34 @@ mod tests {
         );
         assert_eq!(acks(&out), vec![(op::BEGIN, Status::Ok)]);
 
-        let events = send_asset(&mut importer, &mut library, &mut store, Asset::Audio, &audio);
+        let events = send_asset(
+            &mut importer,
+            &mut library,
+            &mut store,
+            Asset::Audio,
+            &audio,
+        );
         // Progress at least every PROGRESS_STEP bytes and once at the end.
-        assert!(events.windows(2).all(|w| w[1].0 - w[0].0 <= PROGRESS_STEP + DATA_MAX as u32));
+        assert!(
+            events
+                .windows(2)
+                .all(|w| w[1].0 - w[0].0 <= PROGRESS_STEP + DATA_MAX as u32)
+        );
         assert_eq!(events.last(), Some(&(audio.len() as u32, Status::Ok)));
-        send_asset(&mut importer, &mut library, &mut store, Asset::Cover, &cover);
-        send_asset(&mut importer, &mut library, &mut store, Asset::Lyrics, &lyrics);
+        send_asset(
+            &mut importer,
+            &mut library,
+            &mut store,
+            Asset::Cover,
+            &cover,
+        );
+        send_asset(
+            &mut importer,
+            &mut library,
+            &mut store,
+            Asset::Lyrics,
+            &lyrics,
+        );
 
         let out = importer.handle(Request::Commit { req: 2, id: 77 }, &mut library, &mut store);
         assert_eq!(acks(&out), vec![(op::COMMIT, Status::Ok)]);
@@ -631,21 +728,31 @@ mod tests {
         assert_eq!(library.revision, 1);
     }
 
-    #[test]
-    fn data_out_of_order_is_answered_with_the_expected_offset() {
-        let audio = payload(2_000, 3);
+    /// A watch with `audio` staged for track 5, and a helper that sends the 100-byte frame at
+    /// `offset`.
+    fn staged_audio(
+        audio: &[u8],
+    ) -> (
+        Importer,
+        Library,
+        Memory,
+        impl Fn(&mut Importer, &mut Library, &mut Memory, u32) -> Outcome + '_,
+    ) {
         let mut importer = importer();
         let mut library = Library::default();
         let mut store = Memory::default();
         importer.handle(
             Request::Begin {
                 req: 1,
-                meta: meta(5, &audio, None, None),
+                meta: meta(5, audio, None, None),
             },
             &mut library,
             &mut store,
         );
-        let send = |importer: &mut Importer, library: &mut Library, store: &mut Memory, offset: u32| {
+        let send = move |importer: &mut Importer,
+                         library: &mut Library,
+                         store: &mut Memory,
+                         offset: u32| {
             importer.handle(
                 Request::Data {
                     asset: Asset::Audio,
@@ -656,15 +763,53 @@ mod tests {
                 store,
             )
         };
+        (importer, library, store, send)
+    }
+
+    #[test]
+    fn a_frame_that_overtook_its_neighbour_waits_for_it() {
+        let audio = payload(2_000, 3);
+        let (mut importer, mut library, mut store, send) = staged_audio(&audio);
         assert!(progress(&send(&mut importer, &mut library, &mut store, 0)).is_empty());
-        // 100 was skipped: the watch asks for it.
-        let skipped = send(&mut importer, &mut library, &mut store, 200);
-        assert_eq!(progress(&skipped), vec![(100, Status::Sequence)]);
-        // A repeat of old data is also refused, and nothing was appended twice.
+        // 100 is late: 200 is kept, nothing is asked for.
+        let early = send(&mut importer, &mut library, &mut store, 200);
+        assert!(progress(&early).is_empty());
+        assert_eq!(store.staged[&(Asset::Audio as u8)].len(), 100);
+        // When it arrives both are written, in order.
+        assert!(progress(&send(&mut importer, &mut library, &mut store, 100)).is_empty());
+        assert_eq!(store.staged[&(Asset::Audio as u8)], audio[..300]);
+        // A repeat of old data is refused, and nothing was appended twice.
         let repeat = send(&mut importer, &mut library, &mut store, 0);
-        assert_eq!(progress(&repeat), vec![(100, Status::Sequence)]);
+        assert_eq!(progress(&repeat), vec![(300, Status::Sequence)]);
+        assert_eq!(store.staged[&(Asset::Audio as u8)].len(), 300);
+    }
+
+    #[test]
+    fn lost_data_is_answered_with_the_expected_offset() {
+        let audio = payload(10_000, 3);
+        let (mut importer, mut library, mut store, send) = staged_audio(&audio);
+        assert!(progress(&send(&mut importer, &mut library, &mut store, 0)).is_empty());
+        // Far beyond what a swap explains: the watch asks for what it is missing.
+        let skipped = send(&mut importer, &mut library, &mut store, 5_000);
+        assert_eq!(progress(&skipped), vec![(100, Status::Sequence)]);
         assert_eq!(store.staged[&(Asset::Audio as u8)].len(), 100);
         // Resuming at the named offset works.
+        assert!(progress(&send(&mut importer, &mut library, &mut store, 100)).is_empty());
+        assert_eq!(store.staged[&(Asset::Audio as u8)], audio[..200]);
+    }
+
+    #[test]
+    fn too_many_early_frames_mean_lost_data_and_are_dropped() {
+        let audio = payload(10_000, 3);
+        let (mut importer, mut library, mut store, send) = staged_audio(&audio);
+        assert!(progress(&send(&mut importer, &mut library, &mut store, 0)).is_empty());
+        // 100 never comes: four later frames are kept, the fifth is one too many.
+        for offset in [200, 300, 400, 500] {
+            assert!(progress(&send(&mut importer, &mut library, &mut store, offset)).is_empty());
+        }
+        let overflow = send(&mut importer, &mut library, &mut store, 600);
+        assert_eq!(progress(&overflow), vec![(100, Status::Sequence)]);
+        // The held frames were dropped with it: the phone sends everything again from 100.
         assert!(progress(&send(&mut importer, &mut library, &mut store, 100)).is_empty());
         assert_eq!(store.staged[&(Asset::Audio as u8)], audio[..200]);
     }
@@ -742,13 +887,21 @@ mod tests {
         let mut twice = meta(3, &audio, None, None);
         twice.assets.push(twice.assets[0]);
         for bad in [no_audio, zero_id, huge, twice] {
-            let out = importer.handle(Request::Begin { req: 1, meta: bad }, &mut library, &mut store);
+            let out = importer.handle(
+                Request::Begin { req: 1, meta: bad },
+                &mut library,
+                &mut store,
+            );
             assert_eq!(acks(&out), vec![(op::BEGIN, Status::BadRequest)]);
         }
         assert!(store.stage_id.is_none());
         store.free = Some(10);
         let big = meta(4, &payload(50_000, 1), None, None);
-        let out = importer.handle(Request::Begin { req: 1, meta: big }, &mut library, &mut store);
+        let out = importer.handle(
+            Request::Begin { req: 1, meta: big },
+            &mut library,
+            &mut store,
+        );
         assert_eq!(acks(&out), vec![(op::BEGIN, Status::NoSpace)]);
     }
 
@@ -809,8 +962,18 @@ mod tests {
                 &mut library,
                 &mut store,
             );
-            send_asset(&mut importer, &mut library, &mut store, Asset::Audio, &audio);
-            importer.handle(Request::Commit { req: 2, id: *id }, &mut library, &mut store);
+            send_asset(
+                &mut importer,
+                &mut library,
+                &mut store,
+                Asset::Audio,
+                &audio,
+            );
+            importer.handle(
+                Request::Commit { req: 2, id: *id },
+                &mut library,
+                &mut store,
+            );
         }
         (importer, library, store)
     }
@@ -821,10 +984,27 @@ mod tests {
         let audio = payload(500, 9);
         let mut changed = meta(2, &audio, None, None);
         changed.name = "Renamed".into();
-        importer.handle(Request::Begin { req: 1, meta: changed }, &mut library, &mut store);
-        send_asset(&mut importer, &mut library, &mut store, Asset::Audio, &audio);
+        importer.handle(
+            Request::Begin {
+                req: 1,
+                meta: changed,
+            },
+            &mut library,
+            &mut store,
+        );
+        send_asset(
+            &mut importer,
+            &mut library,
+            &mut store,
+            Asset::Audio,
+            &audio,
+        );
         importer.handle(Request::Commit { req: 2, id: 2 }, &mut library, &mut store);
-        let names: Vec<_> = library.tracks.iter().map(|s| (s.id, s.name.as_str())).collect();
+        let names: Vec<_> = library
+            .tracks
+            .iter()
+            .map(|s| (s.id, s.name.as_str()))
+            .collect();
         assert_eq!(names, vec![(1, "Name"), (2, "Renamed"), (3, "Name")]);
         assert_eq!(store.committed[&2][&(Asset::Audio as u8)], audio);
     }
@@ -832,12 +1012,31 @@ mod tests {
     #[test]
     fn delete_and_move_update_the_library_and_the_files() {
         let (mut importer, mut library, mut store) = with_tracks(&[1, 2, 3]);
-        let out = importer.handle(Request::Move { req: 1, id: 3, up: true }, &mut library, &mut store);
+        let out = importer.handle(
+            Request::Move {
+                req: 1,
+                id: 3,
+                up: true,
+            },
+            &mut library,
+            &mut store,
+        );
         assert_eq!(acks(&out), vec![(op::MOVE, Status::Ok)]);
-        assert_eq!(library.tracks.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 3, 2]);
+        assert_eq!(
+            library.tracks.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
         // Moving past either end is a quiet no-op.
         let revision = library.revision;
-        let out = importer.handle(Request::Move { req: 2, id: 1, up: true }, &mut library, &mut store);
+        let out = importer.handle(
+            Request::Move {
+                req: 2,
+                id: 1,
+                up: true,
+            },
+            &mut library,
+            &mut store,
+        );
         assert_eq!(acks(&out), vec![(op::MOVE, Status::Ok)]);
         assert_eq!(library.revision, revision);
         assert!(out.changes.is_empty() || out.changes == vec![Change::Library]);
@@ -853,14 +1052,27 @@ mod tests {
     #[test]
     fn hello_list_play_and_control() {
         let (mut importer, mut library, mut store) = with_tracks(&[10, 20, 30]);
-        let out = importer.handle(Request::Hello { req: 1, version: 1 }, &mut library, &mut store);
-        let Ok(lyra_protocol::Incoming::Reply(Reply::Hello { tracks, width, height, status, .. })) =
-            lyra_protocol::Incoming::decode(&out.frames[0])
+        let out = importer.handle(
+            Request::Hello { req: 1, version: 1 },
+            &mut library,
+            &mut store,
+        );
+        let Ok(lyra_protocol::Incoming::Reply(Reply::Hello {
+            tracks,
+            width,
+            height,
+            status,
+            ..
+        })) = lyra_protocol::Incoming::decode(&out.frames[0])
         else {
             panic!("no hello")
         };
         assert_eq!((tracks, width, height, status), (3, 212, 520, Status::Ok));
-        let out = importer.handle(Request::Hello { req: 1, version: 9 }, &mut library, &mut store);
+        let out = importer.handle(
+            Request::Hello { req: 1, version: 9 },
+            &mut library,
+            &mut store,
+        );
         let Ok(lyra_protocol::Incoming::Reply(Reply::Hello { status, .. })) =
             lyra_protocol::Incoming::decode(&out.frames[0])
         else {
@@ -868,21 +1080,39 @@ mod tests {
         };
         assert_eq!(status, Status::Unsupported);
 
-        let out = importer.handle(Request::List { req: 2, offset: 1, max: 8 }, &mut library, &mut store);
-        let Ok(lyra_protocol::Incoming::Reply(Reply::List { entries, total, offset, .. })) =
-            lyra_protocol::Incoming::decode(&out.frames[0])
+        let out = importer.handle(
+            Request::List {
+                req: 2,
+                offset: 1,
+                max: 8,
+            },
+            &mut library,
+            &mut store,
+        );
+        let Ok(lyra_protocol::Incoming::Reply(Reply::List {
+            entries,
+            total,
+            offset,
+            ..
+        })) = lyra_protocol::Incoming::decode(&out.frames[0])
         else {
             panic!("no list")
         };
         assert_eq!((total, offset), (3, 1));
-        assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![20, 30]);
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
 
         let out = importer.handle(Request::Play { req: 3, id: 20 }, &mut library, &mut store);
         assert_eq!(out.changes, vec![Change::Play(20)]);
         let out = importer.handle(Request::Play { req: 3, id: 99 }, &mut library, &mut store);
         assert_eq!(acks(&out), vec![(op::PLAY, Status::NotFound)]);
         let out = importer.handle(
-            Request::Control { req: 4, command: Control::Next },
+            Request::Control {
+                req: 4,
+                command: Control::Next,
+            },
             &mut library,
             &mut store,
         );
@@ -906,11 +1136,19 @@ mod tests {
             let Reply::List { entries, .. } = list_page(1, offset, 255, &library) else {
                 panic!()
             };
-            assert!(Reply::List { req: 1, status: Status::Ok, total: 50, offset, entries: entries.clone() }
+            assert!(
+                Reply::List {
+                    req: 1,
+                    status: Status::Ok,
+                    total: 50,
+                    offset,
+                    entries: entries.clone()
+                }
                 .encode()
                 .unwrap()
                 .len()
-                <= FRAME_MAX);
+                    <= FRAME_MAX
+            );
             if entries.is_empty() {
                 break;
             }

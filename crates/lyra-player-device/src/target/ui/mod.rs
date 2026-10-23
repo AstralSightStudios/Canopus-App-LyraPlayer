@@ -8,11 +8,13 @@ use core::ffi::c_void;
 
 use canopus_target_private::*;
 
-use super::native_app::{APP_ID, PAGE_COUNT, PAGE_LIBRARY, live_page_ptr};
+use super::native_app::{APP_ID, PAGE_COLLECTION, PAGE_COUNT, PAGE_LIBRARY, live_page_ptr};
 
+pub mod artwork;
 pub mod assets;
 pub mod library;
 pub mod lv;
+pub mod motion;
 pub mod player;
 
 /// The refresh timer ticks every 100 ms: the library poll, the progress bar,
@@ -51,7 +53,7 @@ extern "C" fn refresh_timer(timer: *mut c_void) {
         if slot.active && slot.interactive {
             super::ui_maintenance_tick();
             match index {
-                PAGE_LIBRARY => library::refresh(),
+                PAGE_LIBRARY | PAGE_COLLECTION => library::refresh(index),
                 _ => player::refresh(),
             }
         }
@@ -65,7 +67,7 @@ pub fn page_create(index: usize, root: *mut c_void) -> i32 {
     }
     assets::ensure();
     let result = match index {
-        PAGE_LIBRARY => library::create(root),
+        PAGE_LIBRARY | PAGE_COLLECTION => library::create(index, root),
         _ => player::create(root),
     };
     if result != 0 {
@@ -74,9 +76,7 @@ pub fn page_create(index: usize, root: *mut c_void) -> i32 {
     let slot = slot(index);
     slot.active = true;
     slot.interactive = true;
-    slot.timer = unsafe {
-        lv_timer_start(refresh_timer, REFRESH_PERIOD_MS, index as *mut c_void)
-    };
+    slot.timer = unsafe { lv_timer_start(refresh_timer, REFRESH_PERIOD_MS, index as *mut c_void) };
     if slot.timer.is_null() {
         destroy_page(index);
         return -1;
@@ -101,7 +101,7 @@ pub fn page_resume(index: usize) -> i32 {
         return -1;
     }
     match index {
-        PAGE_LIBRARY => library::resume(),
+        PAGE_LIBRARY | PAGE_COLLECTION => library::resume(index),
         _ => player::resume(),
     }
     0
@@ -112,6 +112,9 @@ pub fn page_pause(index: usize) -> i32 {
         return -1;
     }
     slot(index).interactive = false;
+    if index != PAGE_LIBRARY && index != PAGE_COLLECTION {
+        player::pause();
+    }
     0
 }
 
@@ -132,7 +135,7 @@ fn destroy_page(index: usize) {
         slot.timer = core::ptr::null_mut();
     }
     match index {
-        PAGE_LIBRARY => library::destroy(),
+        PAGE_LIBRARY | PAGE_COLLECTION => library::destroy(index),
         _ => player::destroy(),
     }
 }

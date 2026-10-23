@@ -8,7 +8,10 @@
 //! height by animated `scroll_to_y` calls.
 
 use alloc::{string::String, vec::Vec};
-use core::ffi::c_void;
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use canopus_target_private::*;
 use lyra_player_core::{
@@ -23,12 +26,10 @@ use super::{
     assets::Glyph,
     cookie,
     lv::{self, Obj, align, dir, event, flag, prop, snap},
+    motion::{self, ONE, ease_in, ease_in_out, ease_out, ease_out_back, mix, mix_rgb, progress},
     split_cookie,
 };
-use crate::target::{
-    PlayerFrame,
-    native_app::PAGE_PLAYER,
-};
+use crate::target::{PlayerFrame, native_app::PAGE_PLAYER};
 
 const M: Metrics = if lv::BAND_11 {
     layout::BAND_11
@@ -53,14 +54,45 @@ const BROWSE_HOLD_TICKS: u32 = 40;
 const TOAST_TICKS: u32 = 15;
 /// How much of one 100 ms tick label creation may take: a little while the player page is in
 /// view (the user is pressing buttons), more once the lyric page is being waited for.
-const LINES_BUDGET_HIDDEN_MS: u32 = 16;
-const LINES_BUDGET_VISIBLE_MS: u32 = 56;
+const LINES_BUDGET_HIDDEN_MS: u32 = 6;
+const LINES_BUDGET_VISIBLE_MS: u32 = 24;
 const MAX_LYRIC_LINES: usize = 160;
 
 const WHITE: u32 = 0xFF_FFFF;
+/// A pressed button shows a soft disc behind its glyph; at rest only the glyph is drawn.
+const PRESSED_OPA: u32 = 40;
+/// The artwork floats over the background on a soft drop shadow. The firmware's LVGL draws a
+/// shadow as a solid core with an outward falloff, so the core is shrunk by the drop: it stays
+/// hidden under the artwork and only the falloff shows, strongest below it.
+const COVER_RADIUS: u32 = 26;
+const SHADOW_OPA: u32 = 170;
+const COVER_SHADOW: [(u32, u32); 5] = [
+    (prop::SHADOW_WIDTH, layout::COVER_SHADOW_WIDTH as u32),
+    (prop::SHADOW_COLOR, 0),
+    (prop::SHADOW_OPA, SHADOW_OPA),
+    (prop::SHADOW_OFFSET_Y, layout::COVER_SHADOW_DROP as u32),
+    (prop::SHADOW_SPREAD, -layout::COVER_SHADOW_DROP as u32),
+];
 const FADE_STEPS: [u32; 5] = [255, 150, 100, 70, 50];
 /// 256 is full size; the lines that are not being sung are drawn at 7/8.
 const INACTIVE_SCALE: u32 = 224;
+
+// Motion. A new active lyric line grows on a light spring while the others dim and shrink, and
+// the view glides to it on the same beat. A song change slides the cover and its titles out
+// against the direction of travel and the new ones in, while the background cross-fades.
+const FOCUS_SCALE_MS: u32 = 520;
+const FOCUS_OPA_MS: u32 = 360;
+/// Lines further than this from both the old and the new active line change at once.
+const FOCUS_REACH: usize = 2;
+const SCROLL_MS: u32 = 560;
+const SWAP_OUT_MS: u32 = 140;
+const SWAP_IN_MS: u32 = 340;
+const SWAP_SHIFT: i32 = 28;
+const PALETTE_MS: u32 = 520;
+
+/// Set while the page scrolls the lyric view itself, so the scroll events it causes are not
+/// mistaken for the user browsing.
+static SELF_SCROLL: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct Button {
@@ -75,12 +107,52 @@ impl Button {
     };
 }
 
+/// How a lyric line is drawn: text opacity and scale (256 = full size).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Look {
+    opa: i32,
+    scale: i32,
+}
+
+const HIDDEN_LINE: Look = Look {
+    opa: 0,
+    scale: INACTIVE_SCALE as i32,
+};
+
 struct Line {
     label: Obj,
     translation: Obj,
     /// Layout position inside the lyric view.
     y: i32,
-    opa: u32,
+    /// Where the line is heading (its distance from the active line decides), what it shows
+    /// now, and what it showed when the current focus change began.
+    target: Look,
+    shown: Look,
+    from: Look,
+}
+
+/// A song change in progress.
+struct Swap {
+    start: u32,
+    /// +1: the new song enters from the right (next), -1 from the left (previous).
+    direction: i32,
+    /// The song to show once the old one is out; taken at the midpoint.
+    next: Option<PlayerView>,
+    /// Where the old content was when the swap began (a swap can interrupt another).
+    from_x: i32,
+    from_opa: i32,
+}
+
+struct Scroll {
+    from: i32,
+    to: i32,
+    start: u32,
+}
+
+struct PaletteFade {
+    from: Palette,
+    to: Palette,
+    start: u32,
 }
 
 struct PlayerPage {
@@ -124,13 +196,27 @@ struct PlayerPage {
     toast_until: u32,
     // what is on screen
     shown: Option<PlayerView>,
-    shown_title: String,
+    /// Band 10 Pro: the volume read-out has taken over the title line.
+    title_borrowed: bool,
     glyph_paths: [Option<Glyph>; 7],
     dot_page: usize,
     /// Pulling the first page to the right has already asked to go back.
     back_armed: bool,
     /// The current drag started on the first page.
     pull_from_first: bool,
+    // motion
+    clock: motion::Clock,
+    swap: Option<Swap>,
+    /// Which way the next song change slides; set by the previous / next buttons.
+    direction: i32,
+    /// The cover and title block's horizontal offset and opacity, as drawn.
+    card_x: i32,
+    card_opa: i32,
+    palette: Palette,
+    palette_fade: Option<PaletteFade>,
+    focus_start: Option<u32>,
+    focus_lines: Vec<usize>,
+    scroll: Option<Scroll>,
 }
 
 static mut PAGE: Option<PlayerPage> = None;
@@ -159,14 +245,13 @@ unsafe fn glyph_image(parent: Obj, glyph: Glyph, opa: u32) -> Obj {
     image
 }
 
-/// A translucent glass disc with a white glyph, the shape of the reference
-/// design's buttons.
-unsafe fn glass_button(
+/// A bare white glyph; the round touch area behind it lights up only while pressed.
+unsafe fn icon_button(
     parent: Obj,
     rect: Rect,
     glyph: Glyph,
     widget: usize,
-    fill_opa: u32,
+    glyph_opa: u32,
 ) -> Button {
     let circle = unsafe { lv::container(parent, rect.x, rect.y, rect.w, rect.h) };
     if circle.is_null() {
@@ -178,10 +263,7 @@ unsafe fn glass_button(
             &[
                 (prop::RADIUS, 9999),
                 (prop::BG_COLOR, WHITE),
-                (prop::BG_OPA, fill_opa),
-                (prop::BORDER_WIDTH, 1),
-                (prop::BORDER_COLOR, WHITE),
-                (prop::BORDER_OPA, 70),
+                (prop::BG_OPA, 0),
             ],
         );
         lv::clear_flag(circle, flag::SCROLLABLE);
@@ -192,7 +274,7 @@ unsafe fn glass_button(
         lv::on_event(circle, button_event, event::RELEASED, cookie);
         lv::on_event(circle, button_event, event::PRESS_LOST, cookie);
     }
-    let glyph = unsafe { glyph_image(circle, glyph, 255) };
+    let glyph = unsafe { glyph_image(circle, glyph, glyph_opa) };
     Button { circle, glyph }
 }
 
@@ -235,7 +317,10 @@ unsafe fn text_label(
 
 /// A band that melts into the page background (`from_top`: opaque at its top edge).
 unsafe fn fade(parent: Obj, y: i32, height: i32, from_top: bool, palette: Palette) -> Obj {
-    let color = lv::rgb(background_at(palette, if from_top { y } else { y + height }));
+    let color = lv::rgb(background_at(
+        palette,
+        if from_top { y } else { y + height },
+    ));
     let band = unsafe { lv::container(parent, 0, y, M.width, height) };
     if !band.is_null() {
         unsafe {
@@ -258,11 +343,30 @@ unsafe fn fade(parent: Obj, y: i32, height: i32, from_top: bool, palette: Palett
     band
 }
 
+/// The properties a song change animates, set once at creation (they follow every other local
+/// property of these objects in id order).
+unsafe fn card_style(object: Obj) {
+    if !object.is_null() {
+        unsafe { lv::style(object, &[(prop::OPA, 255), (prop::TRANSLATE_X, 0)]) };
+    }
+}
+
+/// The no-cover square: a lighter shade of the page's own colour.
+fn placeholder_color(palette: Palette) -> lyra_player_core::Rgb {
+    palette.top.mix(lyra_player_core::Rgb(0xFFFFFF), 40)
+}
+
+/// The Band 11 volume level bar, centred in the read-out's slot.
+const fn volume_bar_rect() -> Rect {
+    Rect::new(M.volume.x + 4, M.volume.center_y() - 2, M.volume.w - 8, 4)
+}
+
 /// The page background colour at height `y`: the palette fades top to bottom.
 fn background_at(palette: Palette, y: i32) -> lyra_player_core::Rgb {
-    palette
-        .top
-        .mix(palette.bottom, (y.clamp(0, M.height) * 256 / M.height) as u32)
+    palette.top.mix(
+        palette.bottom,
+        (y.clamp(0, M.height) * 256 / M.height) as u32,
+    )
 }
 
 pub fn create(root: Obj) -> i32 {
@@ -294,9 +398,24 @@ unsafe fn build(root: Obj) -> i32 {
         lvx_object_set_scroll_dir(pager, dir::HOR);
         lvx_object_set_scroll_snap_x(pager, snap::CENTER);
         lvx_object_set_scrollbar_mode(pager, lv::SCROLLBAR_OFF);
-        lv::on_event(pager, pager_event, event::SCROLL, cookie(PAGE_PLAYER, W_PAGER));
-        lv::on_event(pager, pager_event, event::SCROLL_BEGIN, cookie(PAGE_PLAYER, W_PAGER));
-        lv::on_event(pager, pager_event, event::SCROLL_END, cookie(PAGE_PLAYER, W_PAGER));
+        lv::on_event(
+            pager,
+            pager_event,
+            event::SCROLL,
+            cookie(PAGE_PLAYER, W_PAGER),
+        );
+        lv::on_event(
+            pager,
+            pager_event,
+            event::SCROLL_BEGIN,
+            cookie(PAGE_PLAYER, W_PAGER),
+        );
+        lv::on_event(
+            pager,
+            pager_event,
+            event::SCROLL_END,
+            cookie(PAGE_PLAYER, W_PAGER),
+        );
     }
     let page_a = unsafe { lv::container(pager, 0, 0, M.width, M.height) };
     let page_b = unsafe { lv::container(pager, M.width, 0, M.width, M.height) };
@@ -317,13 +436,15 @@ unsafe fn build(root: Obj) -> i32 {
             lv::style(
                 placeholder,
                 &[
-                    (prop::RADIUS, 26),
-                    (prop::BG_COLOR, WHITE),
-                    (prop::BG_OPA, 36),
+                    (prop::RADIUS, COVER_RADIUS),
+                    (prop::BG_COLOR, lv::rgb(placeholder_color(palette))),
+                    (prop::BG_OPA, 255),
                 ],
             );
+            lv::style(placeholder, &COVER_SHADOW);
+            card_style(placeholder);
             lv::clear_flag(placeholder, flag::CLICKABLE | flag::SCROLLABLE);
-            glyph_image(placeholder, Glyph::Note, 120);
+            glyph_image(placeholder, Glyph::Note, 150);
         }
         placeholder
     };
@@ -332,7 +453,12 @@ unsafe fn build(root: Obj) -> i32 {
         if !cover.is_null() {
             lv::resize(cover, M.cover.w, M.cover.h);
             lv::place(cover, M.cover.x, M.cover.y);
-            lv::style(cover, &[(prop::RADIUS, 26), (prop::CLIP_CORNER, 1)]);
+            lv::style(
+                cover,
+                &[(prop::RADIUS, COVER_RADIUS), (prop::CLIP_CORNER, 1)],
+            );
+            lv::style(cover, &COVER_SHADOW);
+            card_style(cover);
             lv::clear_flag(cover, flag::CLICKABLE | flag::SCROLLABLE);
             lv::show(cover, false);
         }
@@ -340,20 +466,28 @@ unsafe fn build(root: Obj) -> i32 {
     };
     let title = unsafe { text_label(page_a, M.title, true, true, true, 255) };
     let artist = unsafe { text_label(page_a, M.artist, false, true, true, 150) };
-    let elapsed = unsafe { text_label(page_a, M.elapsed, false, false, false, 150) };
+    unsafe {
+        card_style(title);
+        card_style(artist);
+    }
+    let elapsed = unsafe { text_label(page_a, M.elapsed, false, false, false, 140) };
     let remaining = unsafe {
-        let label = text_label(page_a, M.remaining, false, false, false, 150);
+        let label = text_label(page_a, M.remaining, false, false, false, 140);
         lv::set_style(label, prop::TEXT_ALIGN, 3);
         label
     };
     let (bar_track, bar_fill) = unsafe {
         let track = lv::container(page_a, M.bar.x, M.bar.y, M.bar.w, M.bar.h);
         let fill = lv::container(page_a, M.bar.x, M.bar.y, 1, M.bar.h);
-        for (object, opa) in [(track, 70), (fill, 235)] {
+        for (object, opa) in [(track, 64), (fill, 240)] {
             if !object.is_null() {
                 lv::style(
                     object,
-                    &[(prop::RADIUS, 3), (prop::BG_COLOR, WHITE), (prop::BG_OPA, opa)],
+                    &[
+                        (prop::RADIUS, 3),
+                        (prop::BG_COLOR, WHITE),
+                        (prop::BG_OPA, opa),
+                    ],
                 );
                 lv::clear_flag(object, flag::CLICKABLE | flag::SCROLLABLE);
             }
@@ -361,18 +495,33 @@ unsafe fn build(root: Obj) -> i32 {
         (track, fill)
     };
     let _ = bar_track;
-    let back = unsafe { glass_button(page_a, M.back, Glyph::Back, W_BACK, 46) };
-    let mode = unsafe { glass_button(page_a, M.mode, Glyph::Once, W_MODE, 46) };
-    let prev = unsafe { glass_button(page_a, M.prev, Glyph::Prev, W_PREV, 56) };
-    let play = unsafe { glass_button(page_a, M.play, Glyph::Play, W_PLAY, 70) };
-    let next = unsafe { glass_button(page_a, M.next, Glyph::Next, W_NEXT, 56) };
-    let vol_down = unsafe { glass_button(page_a, M.volume_down, Glyph::Minus, W_VOL_DOWN, 40) };
-    let vol_up = unsafe { glass_button(page_a, M.volume_up, Glyph::Plus, W_VOL_UP, 40) };
+    let back = unsafe { icon_button(page_a, M.back, Glyph::Back, W_BACK, 230) };
+    let mode = unsafe { icon_button(page_a, M.mode, Glyph::Once, W_MODE, 230) };
+    let prev = unsafe { icon_button(page_a, M.prev, Glyph::Prev, W_PREV, 255) };
+    let play = unsafe { icon_button(page_a, M.play, Glyph::Play, W_PLAY, 255) };
+    let next = unsafe { icon_button(page_a, M.next, Glyph::Next, W_NEXT, 255) };
+    let vol_down = unsafe { icon_button(page_a, M.volume_down, Glyph::Minus, W_VOL_DOWN, 170) };
+    let vol_up = unsafe { icon_button(page_a, M.volume_up, Glyph::Plus, W_VOL_UP, 170) };
+    // Band 11 has a row for the volume: a slim level bar between the two buttons.
     let volume = if lv::BAND_11 {
         unsafe {
-            let label = text_label(page_a, M.volume, false, true, false, 200);
-            lv::show(label, true);
-            label
+            let bar = volume_bar_rect();
+            let track = lv::container(page_a, bar.x, bar.y, bar.w, bar.h);
+            let fill = lv::container(page_a, bar.x, bar.y, bar.w, bar.h);
+            for (object, opa) in [(track, 64), (fill, 200)] {
+                if !object.is_null() {
+                    lv::style(
+                        object,
+                        &[
+                            (prop::RADIUS, 2),
+                            (prop::BG_COLOR, WHITE),
+                            (prop::BG_OPA, opa),
+                        ],
+                    );
+                    lv::clear_flag(object, flag::CLICKABLE | flag::SCROLLABLE);
+                }
+            }
+            fill
         }
     } else {
         lv::NULL
@@ -399,6 +548,7 @@ unsafe fn build(root: Obj) -> i32 {
         if !view.is_null() {
             lvx_object_set_scroll_dir(view, dir::VER);
             lvx_object_set_scrollbar_mode(view, lv::SCROLLBAR_OFF);
+            lv::quiet_scroll_bar(view);
             lv::add_flag(view, flag::CLICKABLE);
             let cookie = cookie(PAGE_PLAYER, W_VIEW);
             for code in [
@@ -439,7 +589,11 @@ unsafe fn build(root: Obj) -> i32 {
             if !dot.is_null() {
                 lv::style(
                     *dot,
-                    &[(prop::RADIUS, 3), (prop::BG_COLOR, WHITE), (prop::BG_OPA, 255)],
+                    &[
+                        (prop::RADIUS, 3),
+                        (prop::BG_COLOR, WHITE),
+                        (prop::BG_OPA, 255),
+                    ],
                 );
                 lv::set_style(*dot, prop::BG_OPA, if index == 0 { 230 } else { 80 });
                 lv::clear_flag(*dot, flag::CLICKABLE | flag::SCROLLABLE);
@@ -487,11 +641,21 @@ unsafe fn build(root: Obj) -> i32 {
             tick: 0,
             toast_until: 0,
             shown: None,
-            shown_title: String::new(),
+            title_borrowed: false,
             glyph_paths: [None; 7],
             dot_page: 0,
             back_armed: false,
             pull_from_first: false,
+            clock: motion::Clock::new(),
+            swap: None,
+            direction: 1,
+            card_x: 0,
+            card_opa: 255,
+            palette,
+            palette_fade: None,
+            focus_start: None,
+            focus_lines: Vec::new(),
+            scroll: None,
         });
     }
     refresh();
@@ -499,13 +663,30 @@ unsafe fn build(root: Obj) -> i32 {
 }
 
 pub fn destroy() {
+    if let Some(page) = page() {
+        page.clock.stop();
+    }
     unsafe { PAGE = None };
+}
+
+pub fn pause() {
+    if let Some(page) = page() {
+        page.clock.stop();
+        page.swap = None;
+        page.palette_fade = None;
+        page.focus_start = None;
+        page.scroll = None;
+        page.held = false;
+        page.hold_until = 0;
+    }
 }
 
 pub fn resume() {
     if let Some(page) = page() {
         page.shown = None;
         page.last_active = None;
+        page.last_scroll_target = None;
+        unsafe { page.place_card(0, 255) };
     }
     refresh();
 }
@@ -535,12 +716,17 @@ extern "C" fn button_event(event: *mut c_void) {
         _ => return,
     };
     match code {
-        event::PRESSED => unsafe { lv::set_style(button.circle, prop::BG_OPA, 150) },
+        event::PRESSED => unsafe { lv::set_style(button.circle, prop::BG_OPA, PRESSED_OPA) },
         event::RELEASED | event::PRESS_LOST => unsafe {
-            lv::set_style(button.circle, prop::BG_OPA, base_opa(widget))
+            lv::set_style(button.circle, prop::BG_OPA, 0)
         },
         event::CLICKED => {
-            unsafe { lv::set_style(button.circle, prop::BG_OPA, base_opa(widget)) };
+            unsafe { lv::set_style(button.circle, prop::BG_OPA, 0) };
+            match widget {
+                W_PREV => page.direction = -1,
+                W_NEXT => page.direction = 1,
+                _ => {}
+            }
             crate::target::handle_player_event(match widget {
                 W_BACK => crate::target::PlayerEvent::Back,
                 W_PREV => crate::target::PlayerEvent::Previous,
@@ -552,19 +738,10 @@ extern "C" fn button_event(event: *mut c_void) {
             });
             if matches!(widget, W_VOL_DOWN | W_VOL_UP) && !lv::BAND_11 {
                 page.toast_until = page.tick + TOAST_TICKS;
-                page.shown_title.clear();
+                page.title_borrowed = true;
             }
         }
         _ => {}
-    }
-}
-
-const fn base_opa(widget: usize) -> u32 {
-    match widget {
-        W_PLAY => 70,
-        W_PREV | W_NEXT => 56,
-        W_VOL_DOWN | W_VOL_UP => 40,
-        _ => 46,
     }
 }
 
@@ -610,12 +787,17 @@ extern "C" fn view_event(event: *mut c_void) {
     let code = unsafe { lvx_event_get_code(event) };
     let Some(page) = page() else { return };
     match code {
-        event::PRESSED => page.held = true,
+        event::PRESSED => {
+            page.held = true;
+            page.scroll = None;
+        }
         event::RELEASED | event::PRESS_LOST => {
             page.held = false;
             page.hold_until = page.tick + BROWSE_HOLD_TICKS;
         }
-        event::SCROLL_END => page.hold_until = page.tick + BROWSE_HOLD_TICKS,
+        event::SCROLL_END if !SELF_SCROLL.load(Ordering::Relaxed) => {
+            page.hold_until = page.tick + BROWSE_HOLD_TICKS
+        }
         _ => {}
     }
 }
@@ -644,11 +826,23 @@ impl PlayerPage {
         };
         let previous = self.shown.clone();
         let changed = |f: &dyn Fn(&PlayerView) -> bool| previous.as_ref().is_none_or(f);
+        // A freshly opened or resumed page shows the song at once; a change while it is open
+        // animates.
         if changed(&|old| old.id != view.id) {
-            unsafe { self.show_track(view) };
+            if previous.is_some() {
+                self.begin_swap(view);
+            } else {
+                unsafe { self.show_track(view) };
+            }
         }
         if changed(&|old| old.palette != view.palette) {
-            unsafe { self.set_palette(view.palette) };
+            if previous.is_some() {
+                self.begin_palette(view.palette);
+            } else {
+                self.palette_fade = None;
+                self.palette = view.palette;
+                unsafe { self.paint(view.palette) };
+            }
         }
         if changed(&|old| old.elapsed != view.elapsed) {
             unsafe { set_text(self.elapsed, &view.elapsed) };
@@ -668,7 +862,13 @@ impl PlayerPage {
             unsafe { self.set_glyph(self.play, 0, glyph) };
         }
         if changed(&|old| old.has_previous != view.has_previous) {
-            unsafe { lv::set_style(self.prev.glyph, prop::IMAGE_OPA, enabled_opa(view.has_previous)) };
+            unsafe {
+                lv::set_style(
+                    self.prev.glyph,
+                    prop::IMAGE_OPA,
+                    enabled_opa(view.has_previous),
+                )
+            };
         }
         if changed(&|old| old.has_next != view.has_next) {
             unsafe { lv::set_style(self.next.glyph, prop::IMAGE_OPA, enabled_opa(view.has_next)) };
@@ -677,11 +877,12 @@ impl PlayerPage {
             let glyph = match view.mode {
                 PlaybackMode::ListOnce => Glyph::Once,
                 PlaybackMode::RepeatAll => Glyph::Repeat,
+                PlaybackMode::RepeatOne => Glyph::RepeatOne,
                 PlaybackMode::Shuffle => Glyph::Shuffle,
             };
             unsafe { self.set_glyph(self.mode, 1, glyph) };
         }
-        if changed(&|old| old.volume != view.volume) || self.toast_active() {
+        if changed(&|old| old.volume != view.volume) || self.toast_active() || self.title_borrowed {
             unsafe { self.show_volume(view) };
         }
         if changed(&|old| old.error != view.error || old.transport != view.transport)
@@ -704,7 +905,6 @@ impl PlayerPage {
             set_text(self.artist, &view.artist);
             set_text(self.ly_title, &join_title(&view.title, &view.artist));
         }
-        self.shown_title = view.title.clone();
         match &view.cover {
             Some(path) => {
                 self.cover_path = lv::c_string(path);
@@ -719,13 +919,23 @@ impl PlayerPage {
                 lv::show(self.cover_placeholder, true);
             },
         }
+        if view.transport == Transport::Failed {
+            if let Some(error) = &view.error {
+                unsafe { set_text(self.artist, error) };
+            }
+        }
         self.last_active = None;
     }
 
-    unsafe fn set_palette(&mut self, palette: Palette) {
+    unsafe fn paint(&mut self, palette: Palette) {
         unsafe {
             lv::set_style(self.bg, prop::BG_COLOR, lv::rgb(palette.top));
             lv::set_style(self.bg, prop::BG_GRAD_COLOR, lv::rgb(palette.bottom));
+            lv::set_style(
+                self.cover_placeholder,
+                prop::BG_COLOR,
+                lv::rgb(placeholder_color(palette)),
+            );
             let top = lv::rgb(background_at(palette, M.lyrics_view.y));
             lv::set_style(self.fade_top, prop::BG_COLOR, top);
             lv::set_style(self.fade_top, prop::BG_GRAD_COLOR, top);
@@ -745,10 +955,14 @@ impl PlayerPage {
     unsafe fn show_volume(&mut self, view: &PlayerView) {
         let text = alloc::format!("{}%", view.volume);
         if lv::BAND_11 {
-            unsafe { set_text(self.volume, &text) };
+            let bar = volume_bar_rect();
+            let width = (bar.w * i32::from(view.volume.min(100)) / 100).max(bar.h);
+            unsafe { lv::resize(self.volume, width, bar.h) };
         } else if self.toast_active() {
             unsafe { set_text(self.title, &alloc::format!("音量 {text}")) };
-        } else {
+        } else if self.title_borrowed {
+            // The read-out is over: the title gets its line back.
+            self.title_borrowed = false;
             unsafe { set_text(self.title, &view.title) };
         }
     }
@@ -819,6 +1033,9 @@ impl PlayerPage {
         self.last_active = None;
         self.last_scroll_target = None;
         self.pending = Vec::new();
+        self.focus_start = None;
+        self.focus_lines.clear();
+        self.scroll = None;
     }
 
     unsafe fn start_lines(&mut self, lyrics: Lyrics) {
@@ -853,7 +1070,11 @@ impl PlayerPage {
     /// and placed them.
     unsafe fn create_more_lines(&mut self) {
         let width = M.lyrics_view.w - 2 * M.lyric_pad_x;
-        let limit = if self.dot_page == 1 { LINES_BUDGET_VISIBLE_MS } else { LINES_BUDGET_HIDDEN_MS };
+        let limit = if self.dot_page == 1 {
+            LINES_BUDGET_VISIBLE_MS
+        } else {
+            LINES_BUDGET_HIDDEN_MS
+        };
         let budget = lv::Budget::start();
         let mut created = 0;
         loop {
@@ -898,7 +1119,9 @@ impl PlayerPage {
                 label,
                 translation: translation_label,
                 y: 0,
-                opa: 0,
+                target: HIDDEN_LINE,
+                shown: HIDDEN_LINE,
+                from: HIDDEN_LINE,
             });
         }
     }
@@ -944,30 +1167,46 @@ impl PlayerPage {
     }
 
     unsafe fn follow(&mut self, active: Option<usize>) {
-        if self.last_active != active || self.lines.iter().any(|line| line.opa == 0) {
+        if self.last_active != active || self.lines.iter().any(|line| line.target.opa == 0) {
+            // Only what the user can see moves; everything else takes its new look at once.
+            let animate = self.dot_page == 1;
+            let previous = self.last_active;
+            self.focus_lines.clear();
             for (index, line) in self.lines.iter_mut().enumerate() {
-                let distance = match active {
-                    Some(active) => index.abs_diff(active),
-                    None => index + 1,
+                let distance = |anchor: Option<usize>| {
+                    anchor.map_or(index + 1, |anchor| index.abs_diff(anchor))
                 };
-                let opa = FADE_STEPS[distance.min(FADE_STEPS.len() - 1)];
-                if line.opa != opa {
-                    line.opa = opa;
-                    let scale = if distance == 0 { 256 } else { INACTIVE_SCALE };
-                    unsafe {
-                        lv::set_style(line.label, prop::TEXT_OPA, opa);
-                        lv::set_style(line.label, prop::TRANSFORM_SCALE_X, scale);
-                        lv::set_style(line.label, prop::TRANSFORM_SCALE_Y, scale);
-                        if !line.translation.is_null() {
-                            lv::set_style(line.translation, prop::TEXT_OPA, opa * 6 / 10);
-                        }
-                    }
+                let from_active = distance(active);
+                line.target = Look {
+                    opa: FADE_STEPS[from_active.min(FADE_STEPS.len() - 1)] as i32,
+                    scale: if from_active == 0 {
+                        256
+                    } else {
+                        INACTIVE_SCALE as i32
+                    },
+                };
+                line.from = line.shown;
+                if line.shown == line.target {
+                    continue;
+                }
+                if animate && (from_active <= FOCUS_REACH || distance(previous) <= FOCUS_REACH) {
+                    self.focus_lines.push(index);
+                } else {
+                    let target = line.target;
+                    unsafe { show_look(line, target) };
                 }
             }
             self.last_active = active;
+            self.focus_start = if self.focus_lines.is_empty() {
+                None
+            } else {
+                self.clock.start(frame);
+                Some(lv::now_ms())
+            };
         }
         if self.held {
             self.last_scroll_target = None;
+            self.scroll = None;
             return;
         }
         if self.tick < self.hold_until {
@@ -979,8 +1218,224 @@ impl PlayerPage {
         };
         if self.last_scroll_target != Some(target) {
             self.last_scroll_target = Some(target);
-            let visible = self.dot_page == 1;
-            unsafe { lvx_object_scroll_to_y(self.ly_view, target, u32::from(visible)) };
+            if self.dot_page == 1 {
+                let from = unsafe { lvx_object_scroll_y(self.ly_view) };
+                self.scroll = Some(Scroll {
+                    from,
+                    to: target,
+                    start: lv::now_ms(),
+                });
+                self.clock.start(frame);
+            } else {
+                self.scroll = None;
+                unsafe { scroll_view(self.ly_view, target) };
+            }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Motion
+// ---------------------------------------------------------------------------
+
+/// Draws a lyric line with `look`, touching only the properties that change.
+unsafe fn show_look(line: &mut Line, look: Look) {
+    let old = core::mem::replace(&mut line.shown, look);
+    unsafe {
+        if old.opa != look.opa {
+            let opa = look.opa.clamp(0, 255) as u32;
+            lv::set_style(line.label, prop::TEXT_OPA, opa);
+            if !line.translation.is_null() {
+                lv::set_style(line.translation, prop::TEXT_OPA, opa * 6 / 10);
+            }
+        }
+        if old.scale != look.scale {
+            lv::set_style(line.label, prop::TRANSFORM_SCALE_X, look.scale as u32);
+            lv::set_style(line.label, prop::TRANSFORM_SCALE_Y, look.scale as u32);
+        }
+    }
+}
+
+unsafe fn scroll_view(view: Obj, y: i32) {
+    SELF_SCROLL.store(true, Ordering::Relaxed);
+    unsafe { lvx_object_scroll_to_y(view, y, 0) };
+    SELF_SCROLL.store(false, Ordering::Relaxed);
+}
+
+extern "C" fn frame(_timer: *mut c_void) {
+    let Some(page) = page() else { return };
+    let now = lv::now_ms();
+    // `|`, not `||`: every animation advances on every frame.
+    let moving = unsafe {
+        page.step_swap(now) | page.step_palette(now) | page.step_focus(now) | page.step_scroll(now)
+    };
+    if !moving {
+        page.clock.stop();
+    }
+}
+
+impl PlayerPage {
+    fn begin_swap(&mut self, view: &PlayerView) {
+        let direction = core::mem::replace(&mut self.direction, 1);
+        match &mut self.swap {
+            // Still on its way out: the newer song takes the waiting one's place.
+            Some(swap) if swap.next.is_some() => swap.next = Some(view.clone()),
+            _ => {
+                self.swap = Some(Swap {
+                    start: lv::now_ms(),
+                    direction,
+                    next: Some(view.clone()),
+                    from_x: self.card_x,
+                    from_opa: self.card_opa,
+                })
+            }
+        }
+        self.clock.start(frame);
+    }
+
+    unsafe fn step_swap(&mut self, now: u32) -> bool {
+        let Some(swap) = &mut self.swap else {
+            return false;
+        };
+        let direction = swap.direction;
+        if swap.next.is_some() {
+            let t = progress(swap.start, now, 0, SWAP_OUT_MS);
+            let (x, opa) = (
+                mix(swap.from_x, -direction * SWAP_SHIFT, ease_in(t)),
+                mix(swap.from_opa, 0, ease_in(t)),
+            );
+            if t == ONE {
+                let next = swap.next.take();
+                swap.start = now;
+                if let Some(view) = next {
+                    unsafe { self.show_track(&view) };
+                }
+                unsafe { self.place_card(direction * SWAP_SHIFT, 0) };
+            } else {
+                unsafe { self.place_card(x, opa) };
+            }
+            return true;
+        }
+        let t = progress(swap.start, now, 0, SWAP_IN_MS);
+        let (x, opa) = (
+            mix(direction * SWAP_SHIFT, 0, ease_out(t)),
+            mix(0, 255, ease_out(t)),
+        );
+        unsafe { self.place_card(x, opa) };
+        if t == ONE {
+            self.swap = None;
+            return false;
+        }
+        true
+    }
+
+    /// Offsets and fades the cover with its title and artist.
+    unsafe fn place_card(&mut self, x: i32, opa: i32) {
+        let opa = opa.clamp(0, 255);
+        let moved = x != self.card_x;
+        let faded = opa != self.card_opa;
+        self.card_x = x;
+        self.card_opa = opa;
+        for object in [self.cover, self.cover_placeholder, self.title, self.artist] {
+            if object.is_null() {
+                continue;
+            }
+            unsafe {
+                if moved {
+                    lv::set_style(object, prop::TRANSLATE_X, x as u32);
+                }
+                if faded {
+                    lv::set_style(object, prop::OPA, opa as u32);
+                }
+            }
+        }
+        if faded {
+            // The shadow's core sits under the artwork; through a half-transparent cover it would
+            // show as a dark inner square, so the shadow fades out much faster than the cover
+            // (OPA scales it once more on top of this).
+            let shadow = SHADOW_OPA * (opa * opa) as u32 / (255 * 255);
+            for object in [self.cover, self.cover_placeholder] {
+                if !object.is_null() {
+                    unsafe { lv::set_style(object, prop::SHADOW_OPA, shadow) };
+                }
+            }
+        }
+    }
+
+    fn begin_palette(&mut self, to: Palette) {
+        self.palette_fade = Some(PaletteFade {
+            from: self.palette,
+            to,
+            start: lv::now_ms(),
+        });
+        self.clock.start(frame);
+    }
+
+    unsafe fn step_palette(&mut self, now: u32) -> bool {
+        let Some(fade) = &self.palette_fade else {
+            return false;
+        };
+        let t = progress(fade.start, now, 0, PALETTE_MS);
+        let e = ease_in_out(t);
+        let palette = Palette {
+            top: lyra_player_core::Rgb(mix_rgb(fade.from.top.0, fade.to.top.0, e)),
+            bottom: lyra_player_core::Rgb(mix_rgb(fade.from.bottom.0, fade.to.bottom.0, e)),
+        };
+        if t == ONE {
+            self.palette_fade = None;
+        }
+        if palette != self.palette {
+            self.palette = palette;
+            unsafe { self.paint(palette) };
+        }
+        t != ONE
+    }
+
+    unsafe fn step_focus(&mut self, now: u32) -> bool {
+        let Some(start) = self.focus_start else {
+            return false;
+        };
+        let scale_t = progress(start, now, 0, FOCUS_SCALE_MS);
+        let opa_t = progress(start, now, 0, FOCUS_OPA_MS);
+        for &index in &self.focus_lines {
+            let Some(line) = self.lines.get_mut(index) else {
+                continue;
+            };
+            // The line coming into focus springs up; the others simply settle.
+            let grows = line.target.scale > line.from.scale;
+            let scale = if grows {
+                ease_out_back(scale_t)
+            } else {
+                ease_out(scale_t)
+            };
+            let look = Look {
+                opa: mix(line.from.opa, line.target.opa, ease_out(opa_t)),
+                scale: mix(line.from.scale, line.target.scale, scale),
+            };
+            unsafe { show_look(line, look) };
+        }
+        if scale_t == ONE && opa_t == ONE {
+            self.focus_start = None;
+            return false;
+        }
+        true
+    }
+
+    unsafe fn step_scroll(&mut self, now: u32) -> bool {
+        let Some(scroll) = &self.scroll else {
+            return false;
+        };
+        if self.held {
+            self.scroll = None;
+            return false;
+        }
+        let t = progress(scroll.start, now, 0, SCROLL_MS);
+        let y = mix(scroll.from, scroll.to, ease_in_out(t));
+        unsafe { scroll_view(self.ly_view, y) };
+        if t == ONE {
+            self.scroll = None;
+            return false;
+        }
+        true
     }
 }

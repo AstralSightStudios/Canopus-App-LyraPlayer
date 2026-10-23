@@ -136,7 +136,11 @@ impl Sender {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.meta.assets.iter().map(|spec| u64::from(spec.size)).sum()
+        self.meta
+            .assets
+            .iter()
+            .map(|spec| u64::from(spec.size))
+            .sum()
     }
 
     /// Bytes the watch has confirmed so far, over all files.
@@ -194,7 +198,7 @@ impl Sender {
     fn stream(&mut self, index: usize) {
         let spec = self.meta.assets[index];
         let mut buffer = [0u8; DATA_MAX];
-        while self.cursor < spec.size && self.cursor - self.confirmed < WINDOW {
+        while self.cursor < spec.size && self.cursor.saturating_sub(self.confirmed) < WINDOW {
             let want = (spec.size - self.cursor).min(DATA_MAX as u32) as usize;
             let read = match self.sources[index].read(self.cursor, &mut buffer[..want]) {
                 Ok(read) if read > 0 => read,
@@ -249,6 +253,13 @@ impl Sender {
         match status {
             Status::Ok => {
                 self.confirmed = self.confirmed.max(next_offset.min(spec.size));
+                // With several frames on their way, a confirmation can outrun the cursor after a
+                // rewind (it describes what the watch stored before the phone stepped back). What the
+                // watch has stored is stored: never send it again.
+                if self.cursor < self.confirmed {
+                    self.cursor = self.confirmed;
+                    self.queue.clear();
+                }
                 if self.rewound_to.is_some_and(|at| next_offset > at) {
                     self.rewound_to = None;
                 }
@@ -328,7 +339,10 @@ mod tests {
             Ok(())
         }
         fn stage_write(&mut self, asset: Asset, _: u32, bytes: &[u8]) -> Result<(), Status> {
-            self.staged.entry(asset as u8).or_default().extend_from_slice(bytes);
+            self.staged
+                .entry(asset as u8)
+                .or_default()
+                .extend_from_slice(bytes);
             Ok(())
         }
         fn stage_finish(&mut self, _: Asset) -> Result<(), Status> {
@@ -353,7 +367,9 @@ mod tests {
     }
 
     fn data(len: usize, seed: u8) -> Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed)).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed))
+            .collect()
     }
 
     fn sender(audio: Vec<u8>, cover: Vec<u8>, lyrics: Vec<u8>) -> Sender {
@@ -379,7 +395,11 @@ mod tests {
     /// Runs the sender against the real watch-side importer; `drop` decides
     /// which frames (by index) the "link" loses before they reach the watch.
     fn run(mut sender: Sender, drop: impl Fn(usize) -> bool) -> (Sender, Memory, Library) {
-        let mut importer = Importer::new(Platform { width: 212, height: 520 });
+        let mut importer = Importer::new(Platform {
+            width: 212,
+            height: 520,
+            caps: 0,
+        });
         let mut library = Library::default();
         let mut store = Memory::default();
         let mut index = 0;
@@ -403,10 +423,91 @@ mod tests {
         (sender, store, library)
     }
 
+    /// Like `run`, but the answers come late: `depth` frames are on their way (as when the plugin
+    /// keeps several sends in flight) before the sender hears about the first of them.
+    fn run_pipelined(
+        mut sender: Sender,
+        depth: usize,
+        swap: bool,
+        drop: impl Fn(usize) -> bool,
+    ) -> (Sender, Memory, Library) {
+        let mut importer = Importer::new(Platform {
+            width: 212,
+            height: 520,
+            caps: 0,
+        });
+        let mut library = Library::default();
+        let mut store = Memory::default();
+        let mut on_the_way = std::collections::VecDeque::new();
+        let mut index = 0;
+        for _ in 0..200_000 {
+            if sender.is_finished() {
+                break;
+            }
+            while on_the_way.len() < depth {
+                match sender.poll() {
+                    Some(frame) => on_the_way.push_back(frame),
+                    None => break,
+                }
+            }
+            // With `swap`, every other delivery lets the frame behind the oldest overtake it.
+            let which = usize::from(swap && index % 2 == 0 && on_the_way.len() > 1);
+            let Some(frame) = on_the_way.remove(which) else {
+                panic!("sender stalled in {:?}", sender.state());
+            };
+            index += 1;
+            if drop(index) {
+                continue;
+            }
+            let request = Request::decode(&frame).unwrap();
+            for reply in importer.handle(request, &mut library, &mut store).frames {
+                sender.on_frame(&reply);
+            }
+        }
+        (sender, store, library)
+    }
+
+    #[test]
+    fn frames_in_flight_and_late_answers_still_deliver_the_track_intact() {
+        for depth in [2, 3, 6] {
+            for (swap, lost) in [
+                (false, None),
+                (false, Some(9)),
+                (true, None),
+                (true, Some(40)),
+            ] {
+                let (audio, cover, lyrics) =
+                    (data(90_000, 7), data(9_000, 8), b"[00:02.00]z".to_vec());
+                let (sender, store, library) = run_pipelined(
+                    sender(audio.clone(), cover.clone(), lyrics.clone()),
+                    depth,
+                    swap,
+                    |i| Some(i) == lost,
+                );
+                if lost.is_none() && depth <= 5 {
+                    // A frame that overtakes its neighbours is held back by the watch: no rewind.
+                    assert_eq!(sender.resumes(), 0, "depth {depth}, swap {swap}");
+                }
+                assert_eq!(sender.state(), State::Done, "depth {depth}, lost {lost:?}");
+                let files = &store.committed[&4242];
+                assert_eq!(
+                    files[&(Asset::Audio as u8)],
+                    audio,
+                    "depth {depth}, lost {lost:?}"
+                );
+                assert_eq!(files[&(Asset::Cover as u8)], cover);
+                assert_eq!(library.tracks.len(), 1);
+            }
+        }
+    }
+
     #[test]
     fn a_track_travels_from_sender_to_importer() {
         let (audio, cover, lyrics) = (data(70_000, 1), data(5_000, 2), b"[00:01.00]x".to_vec());
-        let (sender, store, library) = run(sender(audio.clone(), cover.clone(), lyrics.clone()), |_| false);
+        let (sender, store, library) =
+            run(sender(audio.clone(), cover.clone(), lyrics.clone()), |_| {
+                false
+            });
         assert_eq!(sender.state(), State::Done);
         assert_eq!(sender.resumes(), 0);
         assert_eq!(sender.confirmed_bytes(), sender.total_bytes());
@@ -430,11 +531,18 @@ mod tests {
     #[test]
     fn the_window_bounds_unconfirmed_bytes() {
         let mut sender = sender(data(200_000, 5), data(10, 6), b"x".to_vec());
-        let mut importer = Importer::new(Platform { width: 1, height: 1 });
+        let mut importer = Importer::new(Platform {
+            width: 1,
+            height: 1,
+            caps: 0,
+        });
         let (mut library, mut store) = (Library::default(), Memory::default());
         // BEGIN first; answer it so streaming starts.
         let begin = sender.poll().unwrap();
-        for reply in importer.handle(Request::decode(&begin).unwrap(), &mut library, &mut store).frames {
+        for reply in importer
+            .handle(Request::decode(&begin).unwrap(), &mut library, &mut store)
+            .frames
+        {
             sender.on_frame(&reply);
         }
         // Without any confirmation the sender stops at the window.
@@ -444,17 +552,32 @@ mod tests {
                 sent += bytes.len() as u32;
             }
         }
-        assert!(sent >= WINDOW && sent < WINDOW + DATA_MAX as u32, "sent {sent}");
+        assert!(
+            sent >= WINDOW && sent < WINDOW + DATA_MAX as u32,
+            "sent {sent}"
+        );
     }
 
     #[test]
     fn a_refusal_or_an_unreadable_source_fails_the_transfer() {
         let mut sender = sender(data(100, 7), data(10, 8), b"z".to_vec());
         let begin = sender.poll().unwrap();
-        let Request::Begin { req, .. } = Request::decode(&begin).unwrap() else { panic!() };
-        let refusal = Reply::Ack { op: op::BEGIN, req, status: Status::NoSpace, value: 0 }.encode().unwrap();
+        let Request::Begin { req, .. } = Request::decode(&begin).unwrap() else {
+            panic!()
+        };
+        let refusal = Reply::Ack {
+            op: op::BEGIN,
+            req,
+            status: Status::NoSpace,
+            value: 0,
+        }
+        .encode()
+        .unwrap();
         sender.on_frame(&refusal);
-        assert_eq!(sender.state(), State::Failed(Failure::Refused(Status::NoSpace)));
+        assert_eq!(
+            sender.state(),
+            State::Failed(Failure::Refused(Status::NoSpace))
+        );
         assert_eq!(sender.poll(), None);
 
         struct Broken;
@@ -474,12 +597,27 @@ mod tests {
             album: String::new(),
             palette_top: 0,
             palette_bottom: 0,
-            assets: vec![AssetSpec { kind: Asset::Audio, size: 10, crc32: 0 }],
+            assets: vec![AssetSpec {
+                kind: Asset::Audio,
+                size: 10,
+                crc32: 0,
+            }],
         };
         let mut sender = Sender::new(meta, vec![Box::new(Broken)]);
         let begin = sender.poll().unwrap();
-        let Request::Begin { req, .. } = Request::decode(&begin).unwrap() else { panic!() };
-        sender.on_frame(&Reply::Ack { op: op::BEGIN, req, status: Status::Ok, value: 0 }.encode().unwrap());
+        let Request::Begin { req, .. } = Request::decode(&begin).unwrap() else {
+            panic!()
+        };
+        sender.on_frame(
+            &Reply::Ack {
+                op: op::BEGIN,
+                req,
+                status: Status::Ok,
+                value: 0,
+            }
+            .encode()
+            .unwrap(),
+        );
         assert_eq!(sender.poll(), None);
         assert_eq!(sender.state(), State::Failed(Failure::Source));
     }

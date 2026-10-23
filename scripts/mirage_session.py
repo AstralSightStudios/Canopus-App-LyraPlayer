@@ -7,11 +7,14 @@
                                     over CPC2 while the Supervisor is loaded, power cycle, Run [--seed N]
     mirage_session.py KEY deploy    like cycle, but from any device state: power cycle, Run, install, power cycle
     mirage_session.py KEY restart   power cycle and Run again (module state is kept)
-    mirage_session.py KEY enable    Manager walk: enable the module and activate it now (new installs are disabled)
+    mirage_session.py KEY enable    enable the module (new installs are disabled); takes effect at the next boot
+    mirage_session.py KEY enable-ui the same by clicking through the Manager (positions measured on old layouts)
     mirage_session.py KEY launch    launcher -> end (screenshots land in --shots)
 
 Reuses the Canopus emulator tooling (installer build, Facetory packager, AstroBox bridge).
-Emulator evidence only.
+LYRA_DEVICE_<KEY>=NAME points a KEY at another emulator device (a fresh one, say) with its own work directory.
+The AstroBox bridge has to speak the Supervisor's CPC2 ABI (2.0 since Canopus' ABI 2.0 change), or every phone
+request times out silently. Emulator evidence only.
 """
 import argparse
 import os
@@ -70,10 +73,13 @@ def sh(*args, **kw):
 
 class Session:
     def __init__(self, key, shots):
-        self.p = PROFILES[key]
+        # LYRA_DEVICE_<key> points the same scripts at another emulator device (a fresh one, say)
+        # without touching the long-lived default; it gets its own work directory.
+        override = os.environ.get(f"LYRA_DEVICE_{key}")
+        self.p = dict(PROFILES[key], device=override) if override else PROFILES[key]
         self.key = key
         self.device = self.p["device"]
-        self.work = WORK / key
+        self.work = WORK / (override or key)
         self.work.mkdir(parents=True, exist_ok=True)
         self.dev = Dev(self.device, shots) if self.exists() else None
         self.shots = shots
@@ -236,7 +242,14 @@ class Session:
         self.restart(seed)
 
     def enable(self):
-        """A freshly installed module is disabled. Walk the Manager (launcher > Manager > modules > the
+        """A freshly installed module is disabled. Enable it with the CPC2 command the Manager's own
+        "启用" row sends (the same call AstroBox makes); it takes effect at the next boot, so `restart`
+        afterwards. The Manager walk below clicked rows by position and broke whenever the Manager's page
+        layout changed (it once hit "移除" and removed the module)."""
+        self.phone('canopusSetEnabled={"module":"lyra_player","enabled":true}')
+
+    def enable_manager_walk(self):
+        """Enables and activates the module by clicking through the Manager. Walk the Manager (launcher > Manager > modules > the
         module > enable > activate now); coordinates measured on Mirage (see Canopus scripts/emu/ui_pages.py).
         The screen sleeps a few seconds after the last touch, so every step is a touch. On Band 10 Pro the
         Manager icon is the last launcher entry only until Lyra's own icon exists."""
@@ -307,7 +320,8 @@ def png(path, w, h):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("key", choices=list(PROFILES))
-    ap.add_argument("cmd", choices=["create", "cycle", "deploy", "restart", "launch", "package", "install", "enable"])
+    ap.add_argument("cmd", choices=["create", "cycle", "deploy", "restart", "launch", "package", "install", "enable",
+                                    "enable-ui"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--shots", default=os.environ.get("MIRAGE_SHOTS", str(WORK / "shots")))
     a = ap.parse_args()
@@ -315,7 +329,8 @@ def main():
     if a.cmd in ("cycle", "deploy", "restart"):
         getattr(s, a.cmd)(seed=a.seed)
     else:
-        getattr(s, {"launch": "launcher", "install": "install_module"}.get(a.cmd, a.cmd))()
+        getattr(s, {"launch": "launcher", "install": "install_module",
+                    "enable-ui": "enable_manager_walk"}.get(a.cmd, a.cmd))()
 
 
 if __name__ == "__main__":

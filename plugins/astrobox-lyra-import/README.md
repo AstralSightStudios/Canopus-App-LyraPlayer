@@ -16,9 +16,14 @@ AstroBox NG API level 4 插件：把本地 MP3 或网易云音乐通过 CanopusC
   MP3 时长由 `mp3-duration` 读取；
 - 网易云扫码登录，登录状态保存在插件私有目录；搜索歌曲、加载个人歌单并直接导入；
   下载歌曲音频、专辑封面和原文/翻译歌词（翻译行合并进 LRC）；
-- 传输由 `crates/lyra-transfer` 的发送状态机完成：16 KiB 窗口、手表每 4 KiB 回报进度、乱序时按手表给出的偏移回退重发、
-  每份资源 CRC32 校验；界面显示总进度和实时速度，手表 45 秒没有回报进度就判为停滞并取消；
-- “手表音乐”分页读取手表曲库（`LIST`），可上移/下移（`MOVE`，带修订号校验，冲突时不覆盖）、删除（`DELETE`）。
+- 传输由 `crates/lyra-transfer` 的发送状态机完成：16 KiB 窗口、手表每 4 KiB 回报进度、丢帧时按手表给出的偏移回退重发、
+  每份资源 CRC32 校验；界面显示总进度和实时速度，手表 45 秒没有回报进度就判为停滞并取消。
+  最多 3 帧同时在途（`IN_FLIGHT`），手表把稍早到的帧先收着；宿主要同样允许多条在途（AstroBox core 的 Connect 发送窗口），
+  否则退化成一次一帧；
+- “手表音乐”分页读取手表曲库（`LIST`），可上移/下移（`MOVE`，带修订号校验，冲突时不覆盖）、删除（`DELETE`）；
+- “手表歌单”（需要手表上的 Lyra Player 协议版本 2）：新建、重命名、删除歌单，把歌曲加入歌单或移出。歌单只引用歌曲，
+  一首歌可以在多个歌单里，也可以不在任何歌单里；删除歌单不删歌曲，删除歌曲会同时把它从所有歌单里去掉。
+  手表主页会列出“全部歌曲”和这些歌单。版本 1 的模块照常导入，只是这一块提示需要更新模块。
 
 ## 数据流
 
@@ -42,5 +47,7 @@ python3 scripts/build_dist.py --release --package        # wasm32-wasip2，输�
 cargo test --target aarch64-apple-darwin                 # 主机测试（把目标换成本机三元组）
 ```
 
-输出位于 `dist/`。插件的 WIT 在 `wit/`：`deps/astrobox-psys-host-v4.wit` 与 `astrobox-psys-plugin-v4.wit`
-定义了 `canopusconnect` 接口（`send` / `listen` / `unlisten` 与 `on-message` 回调）。
+输出位于 `dist/`。`wit/` 是 AstroBox-NG `pluginsystem/wit` 的原样拷贝，插件用其中的世界
+`psys-world-v4-canopusconnect`（全部是 `astrobox:psys-host-v4/*` 导入与 `async func`）。不要手改或混用
+Level 2/3 的 `astrobox:psys-host/*` 接口：宿主按 Level 4 世界链接，对不上就会在启动时实例化失败。
+宿主 WIT 更新后重新拷贝即可；`async func` 需要 wit-bindgen 0.63 及以上。

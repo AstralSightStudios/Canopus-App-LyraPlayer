@@ -18,10 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "assets/glyphs"
 OUT = ROOT / "crates/lyra-player-device/assets"
 
-# name -> edge in pixels
+# name -> (source svg, edge in pixels); the small variants are the mini player's
 SIZES = {
-    "play": 36, "pause": 36, "prev": 28, "next": 28, "back": 24,
-    "repeat": 26, "shuffle": 26, "once": 26, "minus": 20, "plus": 20, "note": 48,
+    "play": ("play", 44), "pause": ("pause", 44), "prev": ("prev", 34), "next": ("next", 34),
+    "back": ("back", 24), "repeat": ("repeat", 26), "repeat-one": ("repeat-one", 26), "shuffle": ("shuffle", 26), "once": ("once", 26),
+    "minus": ("minus", 20), "plus": ("plus", 20), "note": ("note", 48),
+    "play-s": ("play", 28), "pause-s": ("pause", 28), "note-s": ("note", 26),
 }
 
 
@@ -40,9 +42,9 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     rendered = []
     with tempfile.TemporaryDirectory() as tmp:
-        for name, edge in SIZES.items():
+        for name, (source, edge) in SIZES.items():
             png = Path(tmp) / f"{name}.png"
-            subprocess.run(["rsvg-convert", "-w", str(edge), "-h", str(edge), str(SOURCE / f"{name}.svg"),
+            subprocess.run(["rsvg-convert", "-w", str(edge), "-h", str(edge), str(SOURCE / f"{source}.svg"),
                             "-o", str(png)], check=True)
             encoder.convert(png, OUT / f"glyph-{name}.bin")
             rendered.append(png)

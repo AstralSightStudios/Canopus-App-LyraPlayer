@@ -102,7 +102,13 @@ def build(out, count):
             "palette": {"top": int.from_bytes(bytes(mix(colors[0], (0x10, 0x10, 0x18), 0.45)), "big"),
                         "bottom": int.from_bytes(bytes(mix(colors[2], (0x08, 0x08, 0x0C), 0.82)), "big")},
         })
-    (out / "library.json").write_text(json.dumps({"version": 2, "revision": 1, "tracks": tracks}, ensure_ascii=False))
+    # Two playlists: one with songs (in its own order, the last song first) and one empty. A song
+    # can be in several playlists or none, which the sample library shows too.
+    ids = [t["id"] for t in tracks]
+    playlists = [{"id": 7001, "name": "夜间循环", "tracks": ids[::-1][:3]},
+                 {"id": 7002, "name": "空歌单", "tracks": []}]
+    (out / "library.json").write_text(json.dumps(
+        {"version": 2, "revision": 1, "tracks": tracks, "playlists": playlists}, ensure_ascii=False))
 
 
 def ctl(device, *args):

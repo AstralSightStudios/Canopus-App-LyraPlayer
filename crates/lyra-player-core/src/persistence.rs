@@ -20,12 +20,44 @@ struct LibraryFile {
     revision: u32,
     #[serde(default)]
     tracks: Vec<Song>,
+    #[serde(default)]
+    playlists: Vec<Playlist>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Playlist {
+    pub id: u64,
+    pub name: String,
+    pub tracks: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Library {
     pub revision: u32,
     pub tracks: Vec<Song>,
+    pub playlists: Vec<Playlist>,
+}
+
+impl Library {
+    /// Playlists only reference songs. A song may be in several or none; all
+    /// songs remain available from the unfiltered library.
+    pub fn collection(&self, playlist: Option<u64>) -> Vec<u64> {
+        match playlist {
+            None => self.tracks.iter().map(|song| song.id).collect(),
+            Some(id) => self
+                .playlists
+                .iter()
+                .find(|list| list.id == id)
+                .map(|list| {
+                    list.tracks
+                        .iter()
+                        .copied()
+                        .filter(|id| self.tracks.iter().any(|song| song.id == *id))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +81,7 @@ pub fn load_library<S: Store>(store: &mut S) -> Result<Library, PersistenceError
     Ok(Library {
         revision: file.revision,
         tracks: file.tracks,
+        playlists: file.playlists,
     })
 }
 
@@ -57,6 +90,7 @@ pub fn encode_library(library: &Library) -> Vec<u8> {
         version: FORMAT_VERSION,
         revision: library.revision,
         tracks: library.tracks.clone(),
+        playlists: library.playlists.clone(),
     };
     serde_json::to_vec(&file).unwrap_or_default()
 }
@@ -106,9 +140,16 @@ mod tests {
         let library = Library {
             revision: 9,
             tracks: alloc::vec![song()],
+            playlists: alloc::vec![Playlist {
+                id: 1,
+                name: "喜欢的歌".into(),
+                tracks: alloc::vec![7]
+            }],
         };
         let mut store = MemoryStore::default();
-        store.0.insert(LIBRARY_PATH.into(), encode_library(&library));
+        store
+            .0
+            .insert(LIBRARY_PATH.into(), encode_library(&library));
         assert_eq!(load_library(&mut store).unwrap(), library);
     }
 
@@ -116,9 +157,10 @@ mod tests {
     fn missing_library_is_empty_and_old_versions_are_rejected() {
         let mut store = MemoryStore::default();
         assert_eq!(load_library(&mut store).unwrap(), Library::default());
-        store
-            .0
-            .insert(LIBRARY_PATH.into(), br#"{"version":1,"tracks":[]}"#.to_vec());
+        store.0.insert(
+            LIBRARY_PATH.into(),
+            br#"{"version":1,"tracks":[]}"#.to_vec(),
+        );
         assert_eq!(load_library(&mut store), Err(PersistenceError::Version));
     }
 

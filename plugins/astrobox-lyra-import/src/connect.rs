@@ -6,15 +6,18 @@ use std::{collections::HashSet, sync::Mutex};
 use lyra_protocol::{FRAME_MAX, MODULE_ID};
 
 use crate::{
-    astrobox::psys_host::device,
-    astrobox::psys_host_v4::canopusconnect::{self as host, Payload},
+    astrobox::psys_host_v4::{
+        canopusconnect::{self as host, Payload},
+        device,
+    },
     state::{self, DeviceInfo},
 };
 
 static LISTENING: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
-pub fn refresh_devices() {
-    let devices = wit_bindgen::block_on(device::get_connected_device_list().into_future())
+pub async fn refresh_devices() {
+    let devices = device::get_connected_device_list()
+        .await
         .into_iter()
         .map(|item| DeviceInfo {
             addr: item.addr,
@@ -34,6 +37,8 @@ pub fn refresh_devices() {
                 .map(|item| item.addr.clone())
                 .unwrap_or_default();
             state.device_library.clear();
+            state.device_playlists.clear();
+            state.device_version = 0;
             state.library_revision.clear();
             state.library_total = 0;
         }
@@ -55,7 +60,7 @@ pub async fn ensure_listening(addr: &str) -> Result<(), String> {
     if already {
         return Ok(());
     }
-    host::listen(addr, MODULE_ID).into_future().await?;
+    host::listen(addr.to_string(), MODULE_ID.to_string()).await?;
     LISTENING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -69,9 +74,12 @@ pub async fn send(addr: &str, frame: &[u8]) -> Result<(), String> {
     if frame.len() > FRAME_MAX {
         return Err("frame is longer than 480 bytes".to_string());
     }
-    host::send(addr, MODULE_ID, &Payload::Binary(frame.to_vec()))
-        .into_future()
-        .await
+    host::send(
+        addr.to_string(),
+        MODULE_ID.to_string(),
+        Payload::Binary(frame.to_vec()),
+    )
+    .await
 }
 
 /// The message of a `canopusconnect.on-message` call, if it is a binary frame from

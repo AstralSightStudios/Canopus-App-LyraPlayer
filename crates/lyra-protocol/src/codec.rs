@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     DATA_MAX, FRAME_MAX, MAX_ALBUM, MAX_ARTIST, MAX_ARTISTS, MAX_AUDIO_BYTES, MAX_COVER_BYTES,
-    MAX_LYRICS_BYTES, MAX_NAME,
+    MAX_LYRICS_BYTES, MAX_NAME, MAX_PLAYLIST_NAME,
 };
 
 pub mod op {
@@ -17,6 +17,12 @@ pub mod op {
     pub const MOVE: u8 = 0x21;
     pub const PLAY: u8 = 0x30;
     pub const CONTROL: u8 = 0x31;
+    // Request opcodes stay below 0x40: a reply is `op | 0x80` and 0xC0.. is for events.
+    pub const PLAYLISTS: u8 = 0x32;
+    pub const PLAYLIST_TRACKS: u8 = 0x33;
+    pub const PLAYLIST_UPSERT: u8 = 0x34;
+    pub const PLAYLIST_DELETE: u8 = 0x35;
+    pub const PLAYLIST_TRACK: u8 = 0x36;
     pub const REPLY: u8 = 0x80;
     pub const PROGRESS: u8 = 0xC0;
     pub const NOW_PLAYING: u8 = 0xC1;
@@ -120,17 +126,85 @@ pub struct TrackMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
-    Hello { req: u16, version: u8 },
-    List { req: u16, offset: u16, max: u8 },
-    Begin { req: u16, meta: TrackMeta },
-    Data { asset: Asset, offset: u32, bytes: Vec<u8> },
-    AssetEnd { req: u16, asset: Asset },
-    Commit { req: u16, id: u64 },
-    Abort { req: u16 },
-    Delete { req: u16, id: u64 },
-    Move { req: u16, id: u64, up: bool },
-    Play { req: u16, id: u64 },
-    Control { req: u16, command: Control },
+    Hello {
+        req: u16,
+        version: u8,
+    },
+    List {
+        req: u16,
+        offset: u16,
+        max: u8,
+    },
+    Begin {
+        req: u16,
+        meta: TrackMeta,
+    },
+    Data {
+        asset: Asset,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
+    AssetEnd {
+        req: u16,
+        asset: Asset,
+    },
+    Commit {
+        req: u16,
+        id: u64,
+    },
+    Abort {
+        req: u16,
+    },
+    Delete {
+        req: u16,
+        id: u64,
+    },
+    Move {
+        req: u16,
+        id: u64,
+        up: bool,
+    },
+    Play {
+        req: u16,
+        id: u64,
+    },
+    Control {
+        req: u16,
+        command: Control,
+    },
+    Playlists {
+        req: u16,
+        offset: u16,
+        max: u8,
+    },
+    PlaylistTracks {
+        req: u16,
+        id: u64,
+        offset: u16,
+        max: u8,
+    },
+    PlaylistUpsert {
+        req: u16,
+        id: u64,
+        name: String,
+    },
+    PlaylistDelete {
+        req: u16,
+        id: u64,
+    },
+    PlaylistTrack {
+        req: u16,
+        id: u64,
+        track: u64,
+        add: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistEntry {
+    pub id: u64,
+    pub name: String,
+    pub tracks: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +237,8 @@ pub enum Reply {
         revision: u32,
         width: u16,
         height: u16,
+        /// `CAP_*` bits; an older module sends none, which reads as 0.
+        caps: u8,
     },
     List {
         req: u16,
@@ -170,6 +246,21 @@ pub enum Reply {
         total: u16,
         offset: u16,
         entries: Vec<ListEntry>,
+    },
+    Playlists {
+        req: u16,
+        status: Status,
+        total: u16,
+        offset: u16,
+        entries: Vec<PlaylistEntry>,
+    },
+    PlaylistTracks {
+        req: u16,
+        status: Status,
+        id: u64,
+        total: u16,
+        offset: u16,
+        tracks: Vec<u64>,
     },
     /// The answer to every other request; `value` is the library revision
     /// after `Commit`, `Delete` and `Move`, 0 otherwise.
@@ -358,6 +449,43 @@ impl Request {
                 w.u8(u8::from(*up));
                 w.finish()
             }
+            Self::Playlists { req, offset, max } => {
+                let mut w = request(op::PLAYLISTS, *req);
+                w.u16(*offset);
+                w.u8(*max);
+                w.finish()
+            }
+            Self::PlaylistTracks {
+                req,
+                id,
+                offset,
+                max,
+            } => {
+                let mut w = request(op::PLAYLIST_TRACKS, *req);
+                w.u64(*id);
+                w.u16(*offset);
+                w.u8(*max);
+                w.finish()
+            }
+            Self::PlaylistUpsert { req, id, name } => {
+                let mut w = request(op::PLAYLIST_UPSERT, *req);
+                w.u64(*id);
+                w.text(name, MAX_PLAYLIST_NAME);
+                w.finish()
+            }
+            Self::PlaylistDelete { req, id } => id_request(op::PLAYLIST_DELETE, *req, *id),
+            Self::PlaylistTrack {
+                req,
+                id,
+                track,
+                add,
+            } => {
+                let mut w = request(op::PLAYLIST_TRACK, *req);
+                w.u64(*id);
+                w.u64(*track);
+                w.u8(u8::from(*add));
+                w.finish()
+            }
             Self::Play { req, id } => id_request(op::PLAY, *req, *id),
             Self::Control { req, command } => {
                 let mut w = request(op::CONTROL, *req);
@@ -451,6 +579,33 @@ impl Request {
                 id: r.u64()?,
                 up: r.u8()? != 0,
             },
+            op::PLAYLISTS => Self::Playlists {
+                req,
+                offset: r.u16()?,
+                max: r.u8()?,
+            },
+            op::PLAYLIST_TRACKS => Self::PlaylistTracks {
+                req,
+                id: r.u64()?,
+                offset: r.u16()?,
+                max: r.u8()?,
+            },
+            op::PLAYLIST_UPSERT => Self::PlaylistUpsert {
+                req,
+                id: r.u64()?,
+                name: r.text(MAX_PLAYLIST_NAME)?,
+            },
+            op::PLAYLIST_DELETE => Self::PlaylistDelete { req, id: r.u64()? },
+            op::PLAYLIST_TRACK => Self::PlaylistTrack {
+                req,
+                id: r.u64()?,
+                track: r.u64()?,
+                add: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(DecodeError::BadValue),
+                },
+            },
             op::PLAY => Self::Play { req, id: r.u64()? },
             op::CONTROL => Self::Control {
                 req,
@@ -491,6 +646,7 @@ impl Reply {
                 revision,
                 width,
                 height,
+                caps,
             } => {
                 let mut w = Writer::new(op::HELLO | op::REPLY);
                 w.u16(*req);
@@ -502,6 +658,7 @@ impl Reply {
                 w.u32(*revision);
                 w.u16(*width);
                 w.u16(*height);
+                w.u8(*caps);
                 w.finish()
             }
             Self::List {
@@ -522,6 +679,46 @@ impl Reply {
                     w.u32(entry.duration_ms);
                     w.text(&entry.name, MAX_NAME);
                     w.text(&entry.artist, MAX_ARTISTS * MAX_ARTIST);
+                }
+                w.finish()
+            }
+            Self::Playlists {
+                req,
+                status,
+                total,
+                offset,
+                entries,
+            } => {
+                let mut w = Writer::new(op::PLAYLISTS | op::REPLY);
+                w.u16(*req);
+                w.u8(*status as u8);
+                w.u16(*total);
+                w.u16(*offset);
+                w.u8(u8::try_from(entries.len()).map_err(|_| TooLong)?);
+                for entry in entries {
+                    w.u64(entry.id);
+                    w.text(&entry.name, MAX_PLAYLIST_NAME);
+                    w.u16(entry.tracks);
+                }
+                w.finish()
+            }
+            Self::PlaylistTracks {
+                req,
+                status,
+                id,
+                total,
+                offset,
+                tracks,
+            } => {
+                let mut w = Writer::new(op::PLAYLIST_TRACKS | op::REPLY);
+                w.u16(*req);
+                w.u8(*status as u8);
+                w.u64(*id);
+                w.u16(*total);
+                w.u16(*offset);
+                w.u8(u8::try_from(tracks.len()).map_err(|_| TooLong)?);
+                for track in tracks {
+                    w.u64(*track);
                 }
                 w.finish()
             }
@@ -560,6 +757,7 @@ impl Reply {
                 revision: r.u32()?,
                 width: r.u16()?,
                 height: r.u16()?,
+                caps: r.u8().unwrap_or(0),
             },
             op::LIST => {
                 let total = r.u16()?;
@@ -580,6 +778,44 @@ impl Reply {
                     total,
                     offset,
                     entries,
+                }
+            }
+            op::PLAYLISTS => {
+                let total = r.u16()?;
+                let offset = r.u16()?;
+                let count = r.u8()?;
+                let mut entries = Vec::new();
+                for _ in 0..count {
+                    entries.push(PlaylistEntry {
+                        id: r.u64()?,
+                        name: r.text(MAX_PLAYLIST_NAME)?,
+                        tracks: r.u16()?,
+                    });
+                }
+                Self::Playlists {
+                    req,
+                    status,
+                    total,
+                    offset,
+                    entries,
+                }
+            }
+            op::PLAYLIST_TRACKS => {
+                let id = r.u64()?;
+                let total = r.u16()?;
+                let offset = r.u16()?;
+                let count = r.u8()?;
+                let mut tracks = Vec::new();
+                for _ in 0..count {
+                    tracks.push(r.u64()?);
+                }
+                Self::PlaylistTracks {
+                    req,
+                    status,
+                    id,
+                    total,
+                    offset,
+                    tracks,
                 }
             }
             _ => Self::Ack {
@@ -726,6 +962,35 @@ mod tests {
                 up: true,
             },
             Request::Play { req: 9, id: 3 },
+            Request::Playlists {
+                req: 11,
+                offset: 5,
+                max: 4,
+            },
+            Request::PlaylistTracks {
+                req: 12,
+                id: 7,
+                offset: 50,
+                max: 56,
+            },
+            Request::PlaylistUpsert {
+                req: 13,
+                id: 7,
+                name: "睡前音乐".into(),
+            },
+            Request::PlaylistDelete { req: 14, id: 7 },
+            Request::PlaylistTrack {
+                req: 15,
+                id: 7,
+                track: 9,
+                add: true,
+            },
+            Request::PlaylistTrack {
+                req: 16,
+                id: 7,
+                track: 9,
+                add: false,
+            },
             Request::Control {
                 req: 10,
                 command: Control::Next,
@@ -741,6 +1006,25 @@ mod tests {
     #[test]
     fn replies_and_events_round_trip() {
         let replies = vec![
+            Reply::Playlists {
+                req: 11,
+                status: Status::Ok,
+                total: 1,
+                offset: 0,
+                entries: vec![PlaylistEntry {
+                    id: 7,
+                    name: "喜欢的歌".into(),
+                    tracks: 3,
+                }],
+            },
+            Reply::PlaylistTracks {
+                req: 12,
+                status: Status::Ok,
+                id: 7,
+                total: 2,
+                offset: 0,
+                tracks: vec![99, 1],
+            },
             Reply::Hello {
                 req: 1,
                 status: Status::Ok,
@@ -751,6 +1035,7 @@ mod tests {
                 revision: 5,
                 width: 212,
                 height: 520,
+                caps: 1,
             },
             Reply::List {
                 req: 2,

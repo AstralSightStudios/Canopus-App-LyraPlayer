@@ -32,17 +32,38 @@ const OUTBOX_MAX: usize = 48;
 const FLUSH_MS: u32 = 20;
 /// A transfer that has not heard from the phone for this long is dropped.
 const STALL_MS: u32 = 60_000;
-const PLATFORM: Platform = if super::ui::lv::BAND_11 {
-    Platform {
-        width: 212,
-        height: 520,
+
+/// `canopus_services_v1.group_version[CANOPUS_SVC_CONNECT]`: the Supervisor delivers frames that
+/// ask for no reply from group version 2. The runtime crate has no accessor for it, so the table
+/// is read directly: `u32 struct_size` followed by one version byte per service group.
+fn supports_stream(ctx: *const CanopusContext) -> bool {
+    const CONNECT_GROUP: usize = 13;
+    const STREAM_VERSION: u8 = 2;
+    let services = unsafe { (*ctx).services }.cast::<u8>();
+    if services.is_null() {
+        return false;
     }
-} else {
+    let size = unsafe { services.cast::<u32>().read_unaligned() } as usize;
+    size > 4 + CONNECT_GROUP && unsafe { *services.add(4 + CONNECT_GROUP) } >= STREAM_VERSION
+}
+
+/// The screen of this build and what the firmware's Connect service can do.
+fn platform(ctx: *const CanopusContext) -> Platform {
+    let (width, height) = if super::ui::lv::BAND_11 {
+        (212, 520)
+    } else {
+        (336, 480)
+    };
     Platform {
-        width: 336,
-        height: 480,
+        width,
+        height,
+        caps: if supports_stream(ctx) {
+            lyra_protocol::CAP_STREAM
+        } else {
+            0
+        },
     }
-};
+}
 
 fn status_of(error: i32) -> Status {
     match error {
@@ -82,6 +103,7 @@ impl DeviceStore {
         for asset in Self::ASSETS {
             let _ = fs::remove(self.ctx, &format!("{dir}/{}", asset.file_name()));
         }
+        let _ = fs::remove(self.ctx, &format!("{dir}/{}", lyra_player_core::THUMB_FILE));
     }
 }
 
@@ -135,6 +157,11 @@ impl ImportStore for DeviceStore {
         self.open = None;
         let target = format!("tracks/{id}");
         mkdir(self.ctx, &target).map_err(status_of)?;
+        // The list thumbnail is rebuilt from the new cover by the library page.
+        let _ = fs::remove(
+            self.ctx,
+            &format!("{target}/{}", lyra_player_core::THUMB_FILE),
+        );
         // The firmware nests a renamed directory inside an existing target.
         for asset in Self::ASSETS {
             let destination = format!("{target}/{}", asset.file_name());
@@ -208,7 +235,7 @@ pub fn start() -> i32 {
     unsafe {
         ENDPOINT = Some(Endpoint {
             ctx,
-            importer: Importer::new(PLATFORM),
+            importer: Importer::new(platform(ctx)),
             store: DeviceStore { ctx, open: None },
             library: None,
             outbox: VecDeque::new(),
@@ -292,14 +319,15 @@ impl Endpoint {
                     .find(|song| song.id == id)
                     .cloned();
                 if let Some(song) = song {
-                    let effects = super::runtime::with_core(|core| core.app.update(Action::Play(song)));
+                    let effects =
+                        super::runtime::with_core(|core| core.app.update(Action::Play(song)));
                     execute_effects(effects);
                 }
             }
             Change::Control(command) => {
                 let effects = super::runtime::with_core(|core| match command {
                     Control::Toggle => {
-                        core.pending_audio = Some(super::runtime::PendingAudioCommand::Toggle);
+                        core.toggle_audio();
                         Vec::new()
                     }
                     Control::Next => core.app.update(Action::Next),

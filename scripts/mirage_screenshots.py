@@ -44,6 +44,9 @@ def main():
     shot("launcher")
     d.tap(*layout.icon, 4)
     d.hold(4, layout.quiet)                 # the rows arrive over a few refresh ticks
+    shot("home")
+    layout.open_songs(d)
+    d.hold(4, layout.quiet)
     shot("library")
     d.tap(*layout.row(1), 3)                # the second song has real lyrics
     d.hold(5, layout.quiet)

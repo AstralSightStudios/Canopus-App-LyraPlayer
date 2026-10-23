@@ -26,7 +26,19 @@ pub use codec::*;
 pub use crc::{Crc32, crc32};
 
 pub const MODULE_ID: &str = "lyra_player";
-pub const VERSION: u8 = 1;
+/// The newest protocol this crate speaks; the module answers `HELLO` with its own.
+/// Version 2 added playlists.
+pub const VERSION: u8 = 2;
+/// What a client announces in `HELLO` when it only needs the importer: a module that
+/// speaks anything from here on accepts it, and its reply says what else it can do.
+pub const MIN_VERSION: u8 = 1;
+/// `HELLO` reply capability bits.
+/// The module accepts frames the Supervisor delivers without a reply per frame, so the phone
+/// may send `DATA` in bursts instead of one answered message at a time.
+pub const CAP_STREAM: u8 = 1;
+pub const MAX_PLAYLISTS: usize = 32;
+pub const MAX_PLAYLIST_NAME: usize = 64;
+pub const MAX_PLAYLIST_TRACKS: usize = 1024;
 
 /// CanopusConnect carries at most this many bytes per message.
 pub const FRAME_MAX: usize = 480;

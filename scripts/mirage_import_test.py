@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--id", type=int, required=True, help="track ID to create or replace")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--duration-ms", type=int, default=25000)
+    parser.add_argument("--pipeline", type=int, default=3,
+                        help="frames in flight at once (the plugin keeps 3; 1 is the old one-at-a-time)")
     parser.add_argument("--device")
     parser.add_argument("--session-work", type=Path)
     parser.add_argument("--out", type=Path, required=True)
@@ -43,7 +45,7 @@ def main():
             "import", "--id", str(args.id), "--audio", args.source / "audio.mp3",
             "--cover", args.source / "cover.bin", "--lyrics", args.source / "lyrics.lrc",
             "--name", "Transfer Verified", "--artist", "Binary Stream",
-            "--duration-ms", str(args.duration_ms),
+            "--duration-ms", str(args.duration_ms), "--pipeline", str(args.pipeline),
         ), "import failed"
     session.ctl("shutdown", session.device)
     root = "/canopus/m.lyra_player"

@@ -7,9 +7,9 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use qrcode::{QrCode, render::svg};
 use serde::Deserialize;
 
-use crate::astrobox::psys_host::{
+use crate::astrobox::psys_host_v4::{
     dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
-    ui_v3 as ui,
+    ui,
 };
 use crate::{artwork, connect, id3, import, library, netease, state};
 
@@ -42,6 +42,14 @@ const EVENT_LIBRARY_REFRESH: &str = "action:library.refresh";
 const EVENT_LIBRARY_MOVE_UP_PREFIX: &str = "action:library.move.up.";
 const EVENT_LIBRARY_MOVE_DOWN_PREFIX: &str = "action:library.move.down.";
 const EVENT_LIBRARY_DELETE_PREFIX: &str = "action:library.delete.";
+const EVENT_PL_NAME: &str = "input:playlist.name";
+const EVENT_PL_CREATE: &str = "action:playlist.create";
+const EVENT_PL_RENAME_PREFIX: &str = "action:playlist.rename.";
+const EVENT_PL_DELETE_PREFIX: &str = "action:playlist.delete.";
+/// `input:playlist.add.<song id>`: the select's value is the playlist id.
+const EVENT_PL_ADD_PREFIX: &str = "input:playlist.add.";
+/// `action:playlist.remove.<playlist id>.<song id>`
+const EVENT_PL_REMOVE_PREFIX: &str = "action:playlist.remove.";
 
 #[derive(Default, Deserialize)]
 struct UiPayload {
@@ -60,15 +68,15 @@ pub fn rerender() {
     }
 }
 
-pub fn on_event(event_id: &str, payload: &str) {
+pub async fn on_event(event_id: &str, payload: &str) {
     tracing::info!(event_id, "received Lyra Import UI event");
     let payload = serde_json::from_str::<UiPayload>(payload).unwrap_or_default();
     match event_id {
-        EVENT_PICK_AUDIO => pick_asset("audio", &["mp3"]),
-        EVENT_PICK_COVER => pick_asset("cover", &["jpg", "jpeg", "png"]),
-        EVENT_PICK_LYRICS => pick_asset("lyrics", &["lrc", "json", "txt"]),
+        EVENT_PICK_AUDIO => pick_asset("audio", &["mp3"]).await,
+        EVENT_PICK_COVER => pick_asset("cover", &["jpg", "jpeg", "png"]).await,
+        EVENT_PICK_LYRICS => pick_asset("lyrics", &["lrc", "json", "txt"]).await,
         EVENT_REFRESH => {
-            connect::refresh_devices();
+            connect::refresh_devices().await;
             state::with_state(|state| state.status = "已刷新连接设备。".to_string());
         }
         EVENT_DEVICE => {
@@ -76,6 +84,8 @@ pub fn on_event(event_id: &str, payload: &str) {
                 let selected_addr = payload.value.unwrap_or_default();
                 if state.selected_addr != selected_addr {
                     state.device_library.clear();
+                    state.device_playlists.clear();
+                    state.device_version = 0;
                     state.library_revision.clear();
                     state.library_total = 0;
                     state.library_busy = false;
@@ -121,7 +131,7 @@ pub fn on_event(event_id: &str, payload: &str) {
                 state.netease_audio_bitrate = netease::normalized_audio_bitrate(bitrate);
             });
         }
-        EVENT_START_LOCAL => start_local(),
+        EVENT_START_LOCAL => start_local().await,
         EVENT_SEARCH_CLOUD => search_cloud(),
         EVENT_LOAD_PLAYLISTS => load_playlists(),
         EVENT_CLOSE_PLAYLIST => state::with_state(|state| {
@@ -144,14 +154,67 @@ pub fn on_event(event_id: &str, payload: &str) {
         EVENT_QR_BEGIN => begin_qr(),
         EVENT_QR_POLL => poll_qr(),
         EVENT_LOGOUT => logout_netease(),
-        EVENT_LIBRARY_REFRESH => library::refresh(),
-        EVENT_CANCEL => wit_bindgen::block_on(import::cancel()),
+        EVENT_LIBRARY_REFRESH => library::refresh().await,
+        EVENT_PL_NAME => {
+            state::with_state(|state| state.playlist_name = payload.value.unwrap_or_default());
+            return;
+        }
+        EVENT_PL_CREATE => {
+            let name = state::snapshot().playlist_name;
+            library::create_playlist(&name).await;
+            // The typed name is spent once the watch has been asked; a refused one stays to fix.
+            if state::snapshot().library_busy {
+                state::with_state(|state| state.playlist_name.clear());
+            }
+        }
+        event if event.starts_with(EVENT_PL_RENAME_PREFIX) => {
+            if let Some(id) = event
+                .strip_prefix(EVENT_PL_RENAME_PREFIX)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                let name = state::snapshot().playlist_name;
+                library::rename_playlist(id, &name).await;
+            }
+        }
+        event if event.starts_with(EVENT_PL_DELETE_PREFIX) => {
+            if let Some(id) = event
+                .strip_prefix(EVENT_PL_DELETE_PREFIX)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                let name = state::snapshot()
+                    .device_playlists
+                    .iter()
+                    .find(|list| list.id == id)
+                    .map(|list| list.name.clone())
+                    .unwrap_or_else(|| "这个歌单".to_string());
+                confirm_delete_playlist(id, &name).await;
+            }
+        }
+        event if event.starts_with(EVENT_PL_ADD_PREFIX) => {
+            let song = event
+                .strip_prefix(EVENT_PL_ADD_PREFIX)
+                .and_then(|value| value.parse::<u64>().ok());
+            let playlist = payload.value.as_deref().and_then(|value| value.parse::<u64>().ok());
+            if let (Some(song), Some(playlist)) = (song, playlist) {
+                library::playlist_track(playlist, song, true).await;
+            }
+        }
+        event if event.starts_with(EVENT_PL_REMOVE_PREFIX) => {
+            let ids = event
+                .strip_prefix(EVENT_PL_REMOVE_PREFIX)
+                .and_then(|value| value.split_once('.'))
+                .and_then(|(playlist, song)| Some((playlist.parse::<u64>().ok()?, song.parse::<u64>().ok()?)));
+            if let Some((playlist, song)) = ids {
+                library::playlist_track(playlist, song, false).await;
+            }
+        }
+        EVENT_CANCEL => import::cancel().await,
         event if event.starts_with(EVENT_LIBRARY_MOVE_UP_PREFIX) => {
             if let Some(track_id) = event
                 .strip_prefix(EVENT_LIBRARY_MOVE_UP_PREFIX)
                 .and_then(|value| value.parse::<u64>().ok())
             {
-                library::move_track(track_id, "up");
+                library::move_track(track_id, "up").await;
             }
         }
         event if event.starts_with(EVENT_LIBRARY_MOVE_DOWN_PREFIX) => {
@@ -159,7 +222,7 @@ pub fn on_event(event_id: &str, payload: &str) {
                 .strip_prefix(EVENT_LIBRARY_MOVE_DOWN_PREFIX)
                 .and_then(|value| value.parse::<u64>().ok())
             {
-                library::move_track(track_id, "down");
+                library::move_track(track_id, "down").await;
             }
         }
         event if event.starts_with(EVENT_LIBRARY_DELETE_PREFIX) => {
@@ -173,7 +236,7 @@ pub fn on_event(event_id: &str, payload: &str) {
                     .find(|track| track.id == track_id)
                     .map(|track| track.name.clone())
                     .unwrap_or_else(|| "这首音乐".to_string());
-                confirm_delete(track_id, &track_name);
+                confirm_delete(track_id, &track_name).await;
             }
         }
         event if event.starts_with(EVENT_SEARCH_RESULT_PREFIX) => {
@@ -181,7 +244,7 @@ pub fn on_event(event_id: &str, payload: &str) {
                 .strip_prefix(EVENT_SEARCH_RESULT_PREFIX)
                 .and_then(|value| value.parse::<usize>().ok())
             {
-                start_search_result(index);
+                start_search_result(index).await;
             }
         }
         event if event.starts_with(EVENT_PLAYLIST_TRACK_PREFIX) => {
@@ -189,7 +252,7 @@ pub fn on_event(event_id: &str, payload: &str) {
                 .strip_prefix(EVENT_PLAYLIST_TRACK_PREFIX)
                 .and_then(|value| value.parse::<usize>().ok())
             {
-                start_playlist_track(index);
+                start_playlist_track(index).await;
             }
         }
         event if event.starts_with(EVENT_PLAYLIST_PREFIX) => {
@@ -209,11 +272,11 @@ pub fn on_event(event_id: &str, payload: &str) {
     rerender();
 }
 
-fn confirm_delete(track_id: u64, track_name: &str) {
-    let result = wit_bindgen::block_on(dialog::show_dialog(
+async fn confirm_delete(track_id: u64, track_name: &str) {
+    let result = dialog::show_dialog(
         DialogType::Alert,
         DialogStyle::System,
-        &DialogInfo {
+        DialogInfo {
             title: "删除音乐".to_string(),
             content: format!(
                 "确定删除《{}》吗？音频、封面、背景和歌词都会被永久删除。",
@@ -233,34 +296,64 @@ fn confirm_delete(track_id: u64, track_name: &str) {
             ],
         },
     )
-    .into_future());
+    .await;
     if result.clicked_btn_id == "delete" {
-        library::delete_track(track_id);
+        library::delete_track(track_id).await;
     }
 }
 
-fn pick_asset(kind: &str, extensions: &[&str]) {
-    let result = wit_bindgen::block_on(
-        dialog::pick_file(
-            &PickConfig {
-                read: false,
-                copy_to: Some("media".to_string()),
-            },
-            &FilterConfig {
-                multiple: false,
-                extensions: extensions
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect(),
-                default_directory: String::new(),
-                default_file_name: String::new(),
-            },
-        )
-        .into_future(),
-    );
-    if result.name.is_empty() {
-        return;
+async fn confirm_delete_playlist(id: u64, name: &str) {
+    let result = dialog::show_dialog(
+        DialogType::Alert,
+        DialogStyle::System,
+        DialogInfo {
+            title: "删除歌单".to_string(),
+            content: format!("确定删除歌单《{name}》吗？里面的歌曲不会被删除。"),
+            buttons: vec![
+                DialogButton {
+                    id: "cancel".to_string(),
+                    primary: false,
+                    content: "取消".to_string(),
+                },
+                DialogButton {
+                    id: "delete".to_string(),
+                    primary: true,
+                    content: "删除歌单".to_string(),
+                },
+            ],
+        },
+    )
+    .await;
+    if result.clicked_btn_id == "delete" {
+        library::delete_playlist(id).await;
     }
+}
+
+async fn pick_asset(kind: &str, extensions: &[&str]) {
+    let result = dialog::pick_file(
+        PickConfig {
+            read: false,
+            copy_to: Some("media".to_string()),
+        },
+        FilterConfig {
+            multiple: false,
+            extensions: extensions
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            default_directory: String::new(),
+            default_file_name: String::new(),
+        },
+    )
+    .await;
+    let result = match result {
+        Ok(result) if !result.name.is_empty() => result,
+        Ok(_) => return,
+        Err(error) => {
+            state::with_state(|state| state.status = format!("无法选择文件：{error}"));
+            return;
+        }
+    };
     let path = format!("media/{}", result.name);
     let inspected = import::inspect_file(&path, &result.name, kind);
     // On Android the name is a content URI segment such as "audio%3A1000012345",
@@ -299,7 +392,7 @@ fn pick_asset(kind: &str, extensions: &[&str]) {
     }
 }
 
-fn start_local() {
+async fn start_local() {
     let snapshot = state::snapshot();
     let Some(audio) = snapshot.audio else {
         state::with_state(|state| state.status = "请先选择 MP3。".to_string());
@@ -334,7 +427,7 @@ fn start_local() {
     } else {
         vec![snapshot.artist.trim().to_string()]
     };
-    let result = wit_bindgen::block_on(import::start(import::ImportRequest {
+    let result = import::start(import::ImportRequest {
         addr: snapshot.selected_addr,
         track_id: local_track_id(),
         name: snapshot.track_name.trim().to_string(),
@@ -343,7 +436,8 @@ fn start_local() {
         duration_ms: snapshot.duration_ms,
         palette,
         assets,
-    }));
+    })
+    .await;
     if let Err(error) = result {
         state::with_state(|state| state.status = format!("无法开始导入：{error}"));
     }
@@ -411,25 +505,25 @@ fn open_playlist(id: u64) {
     }
 }
 
-fn start_search_result(index: usize) {
+async fn start_search_result(index: usize) {
     let snapshot = state::snapshot();
     let Some(song) = snapshot.netease_results.get(index).cloned() else {
         state::with_state(|state| state.status = "搜索结果已失效，请重新搜索。".to_string());
         return;
     };
-    start_cloud_song(song, snapshot);
+    start_cloud_song(song, snapshot).await;
 }
 
-fn start_playlist_track(index: usize) {
+async fn start_playlist_track(index: usize) {
     let snapshot = state::snapshot();
     let Some(song) = snapshot.netease_playlist_tracks.get(index).cloned() else {
         state::with_state(|state| state.status = "歌单歌曲已失效，请重新打开歌单。".to_string());
         return;
     };
-    start_cloud_song(song, snapshot);
+    start_cloud_song(song, snapshot).await;
 }
 
-fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
+async fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
     state::with_state(|state| state.status = format!("正在准备《{}》…", song.name));
     let prepared = match netease::prepare(
         &song,
@@ -442,7 +536,7 @@ fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
             return;
         }
     };
-    let result = wit_bindgen::block_on(import::start(import::ImportRequest {
+    let result = import::start(import::ImportRequest {
         addr: snapshot.selected_addr,
         track_id: prepared.song.id,
         name: prepared.song.name,
@@ -451,7 +545,8 @@ fn start_cloud_song(song: state::CloudSong, snapshot: state::UiState) {
         duration_ms: prepared.song.duration_ms,
         palette: prepared.palette,
         assets: prepared.assets,
-    }));
+    })
+    .await;
     if let Err(error) = result {
         state::with_state(|state| state.status = format!("无法开始导入：{error}"));
     }
@@ -573,6 +668,7 @@ fn build_root() -> ui::Element {
     }
 
     root = root.child(device_library_card(&state));
+    root = root.child(playlist_card(&state));
 
     let local = ui::Element::new(ui::ElementType::Card, None)
         .width_full()
@@ -760,6 +856,21 @@ fn device_library_card(state: &state::UiState) -> ui::Element {
                 "#fafafa",
             ))
             .child(text(&metadata, 13, "#a1a1aa"));
+        if !state.device_playlists.is_empty() {
+            let mut choose = ui::Element::new(ui::ElementType::Select, None)
+                .width_full()
+                .prop("default-value", "")
+                .prop("key", &format!("{EVENT_PL_ADD_PREFIX}{}", track.id))
+                .on(ui::Event::Change, &format!("{EVENT_PL_ADD_PREFIX}{}", track.id))
+                .child(ui::Element::new(ui::ElementType::Option, Some("加入歌单…")).prop("value", ""));
+            for list in &state.device_playlists {
+                choose = choose.child(
+                    ui::Element::new(ui::ElementType::Option, Some(&list.name))
+                        .prop("value", &list.id.to_string()),
+                );
+            }
+            item = item.child(choose);
+        }
         if index > 0 {
             item = item.child(library_button(
                 "上移",
@@ -782,6 +893,79 @@ fn device_library_card(state: &state::UiState) -> ui::Element {
             "#b91c1c",
             state.library_busy,
         ));
+        card = card.child(item);
+    }
+    card
+}
+
+/// Playlists hold references to songs: a song can be in several of them, or none.
+fn playlist_card(state: &state::UiState) -> ui::Element {
+    let mut card = ui::Element::new(ui::ElementType::Card, None)
+        .width_full()
+        .padding(18)
+        .radius(12)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .gap(10)
+        .child(text("手表歌单", 22, "#f4f4f5"))
+        .child(text(
+            "手表主页会列出“全部歌曲”和这些歌单。歌单只引用歌曲，歌曲可以放进多个歌单，也可以不放进任何歌单。",
+            13,
+            "#a1a1aa",
+        ));
+    if state.device_version == 0 {
+        return card.child(text("先刷新手表音乐，才能管理歌单。", 13, "#a1a1aa"));
+    }
+    if state.device_version < library::PLAYLIST_VERSION {
+        return card.child(text(
+            "手表上的 Lyra Player 版本过旧，请先更新模块才能使用歌单。",
+            13,
+            "#fbbf24",
+        ));
+    }
+    card = card
+        .child(input("歌单名称", &state.playlist_name, EVENT_PL_NAME))
+        .child(library_button("新建歌单", EVENT_PL_CREATE, "#2563eb", state.library_busy));
+    if state.device_playlists.is_empty() {
+        return card.child(text("还没有歌单。", 13, "#a1a1aa"));
+    }
+    for list in &state.device_playlists {
+        let mut item = ui::Element::new(ui::ElementType::Card, None)
+            .width_full()
+            .padding(14)
+            .radius(10)
+            .bg("#18181b")
+            .flex()
+            .flex_direction(ui::FlexDirection::Column)
+            .gap(6)
+            .child(text(&list.name, 17, "#fafafa"))
+            .child(text(&format!("{} 首歌曲", list.tracks.len()), 13, "#a1a1aa"));
+        for song in &list.tracks {
+            let name = state
+                .device_library
+                .iter()
+                .find(|track| track.id == *song)
+                .map_or("（手表上已不存在的歌曲）", |track| track.name.as_str());
+            item = item.child(text(name, 14, "#d4d4d8")).child(library_button(
+                "移出歌单",
+                &format!("{EVENT_PL_REMOVE_PREFIX}{}.{song}", list.id),
+                "#3f3f46",
+                state.library_busy,
+            ));
+        }
+        item = item
+            .child(library_button(
+                "改成输入框里的名称",
+                &format!("{EVENT_PL_RENAME_PREFIX}{}", list.id),
+                "#4f46e5",
+                state.library_busy,
+            ))
+            .child(library_button(
+                "删除歌单",
+                &format!("{EVENT_PL_DELETE_PREFIX}{}", list.id),
+                "#b91c1c",
+                state.library_busy,
+            ));
         card = card.child(item);
     }
     card

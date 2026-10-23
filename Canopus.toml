@@ -7,7 +7,7 @@ version_code = 1
 kind = "target"
 language = "rust"
 lifecycle = "resident-after-activation"
-canopus_abi = "1"
+canopus_abi = "2"
 description = "Canopus native local music player for Lyra"
 
 [build]
@@ -24,6 +24,18 @@ allowed_constants = [
   "0x0c070201",
   "0x0c092603",
   "0x0c010101",
+  # Every pixel of crates/lyra-player-device/assets/appicon.bin with alpha 0x0c reads like a flash
+  # address to the verifier (a test in the device crate keeps this list complete).
+  "0x0c2b1515",
+  "0x0c2b2b2b",
+  "0x0c6a2b2b",
+  "0x0c6a806a",
+  "0x0c802b2b",
+  "0x0c806a6a",
+  "0x0cbf6a40",
+  "0x0cbfaa80",
+  "0x0cd5406a",
+  "0x0cd56a95",
 ]
 
 [targets]

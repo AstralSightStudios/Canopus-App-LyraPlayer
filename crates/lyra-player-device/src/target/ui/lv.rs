@@ -43,10 +43,19 @@ pub mod prop {
     pub const BORDER_WIDTH: u32 = 48;
     pub const BORDER_COLOR: u32 = 49;
     pub const BORDER_OPA: u32 = 50;
+    pub const SHADOW_WIDTH: u32 = 60;
+    pub const SHADOW_COLOR: u32 = 61;
+    pub const SHADOW_OPA: u32 = 62;
+    pub const SHADOW_OFFSET_Y: u32 = 65;
+    /// Signed: a negative spread shrinks the shadow.
+    pub const SHADOW_SPREAD: u32 = 66;
     pub const IMAGE_OPA: u32 = 68;
     pub const TEXT_COLOR: u32 = 88;
     pub const TEXT_OPA: u32 = 89;
     pub const TEXT_ALIGN: u32 = 94;
+    /// Opacity of the whole object (background, shadow, image and text alike).
+    pub const OPA: u32 = 95;
+    pub const TRANSLATE_X: u32 = 106;
     pub const TRANSFORM_SCALE_X: u32 = 108;
     pub const TRANSFORM_SCALE_Y: u32 = 109;
     pub const TRANSFORM_PIVOT_X: u32 = 111;
@@ -126,6 +135,20 @@ pub unsafe fn style(object: Obj, props: &[(u32, u32)]) {
 
 pub unsafe fn set_style(object: Obj, id: u32, value: u32) {
     unsafe { lvx_object_set_local_style_u32(object, id, value, 0) };
+}
+
+/// Keeps Band 10 Pro's stock scroll bar from appearing on a container that the app scrolls
+/// itself (the lyrics follow the song: the bar would flash at every line).
+///
+/// Containers there are the stock page-content widget, which draws its own bar whenever a
+/// `SCROLL_BEGIN` arrives while a mode byte at +60 is 2; `LV_SCROLLBAR_MODE_OFF` and the scrollbar
+/// part's styles do not reach it. The constructor stores `0x015B0102` at +60 (mode 2, bar shape 1,
+/// then two angles); the 036 and 043 constructors are identical but for their calls. Band 11
+/// containers are plain `lv_obj`s, far smaller than that, so it is never touched there.
+pub unsafe fn quiet_scroll_bar(object: Obj) {
+    if !BAND_11 && !object.is_null() {
+        unsafe { object.cast::<u8>().add(60).write(0) };
+    }
 }
 
 /// A bare container: no theme style, not clickable until asked.

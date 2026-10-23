@@ -1,12 +1,12 @@
 {
   "name": "Lyra音乐导入器",
   "icon": "icon.png",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "通过 CanopusConnect 把本地 MP3 或网易云音乐直接导入手表上的 Lyra Player，无需快应用",
   "author": "Searchstars",
   "website": "",
   "entry": "astrobox_plugin_lyra_import.wasm",
-  "wasi_version": 2,
+  "wasi_version": 3,
   "api_level": 4,
   "permissions": [
     "canopusconnect.send",

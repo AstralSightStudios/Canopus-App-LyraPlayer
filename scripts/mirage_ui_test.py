@@ -3,7 +3,8 @@
 
     mirage_ui_test.py 155 [--deploy] [--seed N] [--shots DIR] [SCENARIO ...]
 
-Scenarios: library, player, lyrics, back (default: all). `--deploy` rebuilds the module,
+Scenarios: library, player, lyrics, back, edge, mini, playlist (default: all but playlist, in
+this order -- they build on each other: `library` leaves the app on the "all songs" page). `--deploy` rebuilds the module,
 installs it and power-cycles the device first (about 90 s); `--seed N` re-seeds N sample tracks
 during that restart. Emulator evidence only; the screenshots are for people to look at, the
 asserts only check that the screen is lit and changes where it must.
@@ -27,7 +28,10 @@ class Layout:
         w, h = size
         self.w, self.h = w, h
         if (w, h) == (212, 520):
-            self.row = lambda i: (w // 2, 115 + 98 * i)       # song rows of the library page
+            self.home_row = lambda i: (w // 2, 98 + 72 * i)   # "all songs", then the playlists
+            self.row = lambda i: (w // 2, 98 + 54 + 72 * i)   # song rows, below the two play buttons
+            self.shuffle, self.loop = (54, 84), (158, 84)     # the play buttons above the songs
+            self.mini, self.mini_toggle = (90, 470), (180, 470)  # the now-playing bar and its button
             self.icon = (106, 100)                            # Lyra's launcher icon after scrolling to the end
             self.back, self.mode = (34, 36), (176, 36)
             self.prev, self.play, self.next = (40, 420), (106, 420), (172, 420)
@@ -36,7 +40,10 @@ class Layout:
             self.lyrics_swipe = (190, 300, 20, 300)
             self.player_swipe = (20, 300, 190, 300)
         else:
-            self.row = lambda i: (w // 2, 108 + 92 * i)
+            self.home_row = lambda i: (w // 2, 104 + 80 * i)
+            self.row = lambda i: (w // 2, 104 + 58 + 80 * i)
+            self.shuffle, self.loop = (87, 88), (249, 88)
+            self.mini, self.mini_toggle = (150, 430), (290, 430)
             self.icon = (40, 275)                             # clipped at the launcher's left edge
             self.back, self.mode = (42, 36), (294, 36)
             self.prev, self.play, self.next = (88, 424), (168, 424), (248, 424)
@@ -46,8 +53,15 @@ class Layout:
             self.player_swipe = (30, 300, 310, 300)
 
 
+    def open_songs(self, d, settle=2.5):
+        """From the home page: into "all songs"."""
+        d.tap(*self.home_row(0), settle)
+
+
 def library(d, l):
-    d.shot("library")
+    d.shot("home")
+    l.open_songs(d)
+    d.shot("songs")
 
 
 def player(d, l):
@@ -81,15 +95,42 @@ def lyrics(d, l):
 def edge(d, l):
     """The system's own back gesture: a swipe from the left edge."""
     d.swipe(4, l.h // 2, l.w - 20, l.h // 2, 300, 3)
-    d.shot("library-after-edge-swipe")
+    d.shot("home-after-edge-swipe")
 
 
 def back(d, l):
     d.tap(*l.back, 3)
-    d.shot("library-after-back")
+    d.shot("songs-after-back")
 
 
-SCENARIOS = {"library": library, "player": player, "lyrics": lyrics, "back": back, "edge": edge}
+def playlist(d, l):
+    """From the home page: the first playlist, then both play buttons, then back to the home page."""
+    d.tap(*l.home_row(1), 2.5)
+    d.shot("playlist")
+    d.tap(*l.shuffle, 3)
+    d.shot("playlist-shuffle")
+    d.tap(*l.back, 2.5)
+    d.shot("playlist-after-back")
+    d.tap(*l.loop, 3)
+    d.shot("playlist-loop")
+    d.tap(*l.back, 2.5)
+    d.swipe(4, l.h // 2, l.w - 20, l.h // 2, 300, 3)
+    d.shot("home-after-playlist")
+
+
+def mini(d, l):
+    """The now-playing bar (run after `player`, `back` and `edge`: it shows on the home page too)."""
+    d.tap(*l.mini_toggle, 1.5)
+    d.shot("mini-paused")
+    d.tap(*l.mini_toggle, 1.5)
+    d.shot("mini-playing")
+    d.tap(*l.mini, 3)
+    d.shot("player-from-mini")
+
+
+SCENARIOS = {"library": library, "player": player, "lyrics": lyrics, "back": back, "edge": edge, "mini": mini,
+             "playlist": playlist}
+DEFAULT = ["library", "player", "lyrics", "back", "edge", "mini"]
 
 
 def main():
@@ -106,7 +147,7 @@ def main():
     d = session.dev or Dev(session.device, a.shots)
     layout = Layout(d.size)
     d.open_app(layout.icon)
-    for name in a.scenarios or SCENARIOS:
+    for name in a.scenarios or DEFAULT:
         print("scenario", name)
         SCENARIOS[name](d, layout)
 

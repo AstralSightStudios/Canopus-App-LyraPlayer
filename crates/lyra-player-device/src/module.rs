@@ -240,4 +240,26 @@ mod tests {
         assert_eq!(canopus_mod_query(&mut writer), -1);
         assert_eq!(writer.dropped, 1);
     }
+
+    /// The launcher icon is embedded in the module; the verifier takes any word 0x0cXXXXXX in the
+    /// module's data for a flash address unless `Canopus.toml` lists it. Alpha 0x0c pixels are such
+    /// words, so every one of them has to be listed.
+    #[test]
+    fn every_icon_pixel_that_looks_like_a_flash_address_is_allowed_in_the_manifest() {
+        let icon = include_bytes!("../assets/appicon.bin");
+        assert_eq!(icon.len(), 12 + 117 * 117 * 4, "a 117x117 ARGB8888 LVGL image");
+        let manifest = include_str!("../../../Canopus.toml");
+        let allowed: Vec<u32> = manifest
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').trim_matches('"').strip_prefix("0x"))
+            .filter_map(|hex| u32::from_str_radix(hex, 16).ok())
+            .collect();
+        let missing: Vec<String> = icon
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .filter(|word| word >> 24 == 0x0c && !allowed.contains(word))
+            .map(|word| format!("{word:#010x}"))
+            .collect();
+        assert!(missing.is_empty(), "add to allowed_constants in Canopus.toml: {missing:?}");
+    }
 }

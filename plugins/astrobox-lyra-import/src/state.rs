@@ -51,6 +51,14 @@ pub struct DeviceLibraryTrack {
     pub duration_ms: u32,
 }
 
+/// A playlist on the watch: only references to songs.
+#[derive(Clone, Debug, Default)]
+pub struct DevicePlaylist {
+    pub id: u64,
+    pub name: String,
+    pub tracks: Vec<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NeteaseView {
     #[default]
@@ -82,6 +90,10 @@ pub struct UiState {
     pub library_total: usize,
     pub library_busy: bool,
     pub library_target: Option<u64>,
+    /// The protocol version the module on the watch speaks; 0 until it has answered.
+    pub device_version: u8,
+    pub device_playlists: Vec<DevicePlaylist>,
+    pub playlist_name: String,
     pub netease_cookie: String,
     pub netease_view: NeteaseView,
     pub netease_audio_bitrate: u32,

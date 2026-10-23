@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""CPU load of the player UI on a Mirage device: resting versus dragging the lyric list.
+"""CPU load of the Lyra UI on a Mirage device: resting versus dragging a list.
 
-    mirage_perf.py KEY
+    mirage_perf.py KEY [lyrics|library|launcher]
 
-KEY is 155 / 179 (Band 11) or 043 (Band 10 Pro). Reads the Idle task's share from NSH `ps`, so the
+KEY is 155 / 179 (Band 11) or 043 (Band 10 Pro). `lyrics` (the default) drags the lyric list of the first song;
+`library` starts the second song, returns to the song list (now-playing bar shown, equalizer moving) and drags it;
+`launcher` drags the stock launcher the same way, for comparison. Reads the Idle task's share from NSH `ps`, so the
 device must be booted with its shell enabled (set `"shell" : true` in the device's device.json while it is
-shut down, then `miragectl boot DEVICE`) and have the Supervisor loaded. Drag the stock launcher yourself to
-compare: on 043 both come out at about 75 % idle. Emulator numbers only; the emulated CPU is not the watch's.
+shut down, then `miragectl boot DEVICE`) and have the Supervisor loaded. Emulator numbers only; the emulated CPU
+is not the watch's.
 """
 import statistics
 import subprocess
@@ -24,6 +26,7 @@ from mirage_ui_test import Layout  # noqa: E402
 
 def main():
     key = sys.argv[1]
+    scene = sys.argv[2] if len(sys.argv) > 2 else "lyrics"
     session = mirage_session.Session(key, HERE.parent / "build/mirage" / key / "perf")
     d, device = session.dev, session.device
     layout = Layout(d.size)
@@ -33,14 +36,22 @@ def main():
         out = subprocess.run([str(MIRAGECTL), "sh", device, "ps"], capture_output=True, text=True).stdout
         return next(float(line.split()[-2].rstrip("%")) for line in out.splitlines() if "Idle_Task" in line)
 
-    d.open_app(layout.icon)
-    d.tap(*layout.row(0), 3)
-    d.swipe(*layout.lyrics_swipe, 250, 2.0)
+    if scene == "launcher":
+        d.launcher_to_end()
+    else:
+        d.open_app(layout.icon)
+        layout.open_songs(d)
+        if scene == "library":
+            d.tap(*layout.row(1), 3)
+            d.tap(*layout.back, 3)
+        else:
+            d.tap(*layout.row(0), 3)
+            d.swipe(*layout.lyrics_swipe, 250, 2.0)
     rest = []
     for _ in range(4):
         d.hold(3, layout.quiet)
         rest.append(idle())
-    print("resting idle %:", rest)
+    print(scene, "resting idle %:", rest)
     drag = []
     for rep in range(3):
         ys = (h - 120, 160) if rep % 2 == 0 else (160, h - 120)
@@ -51,8 +62,7 @@ def main():
         time.sleep(0.8)
         drag += [idle() for _ in range(3)]
         worker.join()
-    print("dragging idle %:", drag, "mean", round(statistics.mean(drag), 1))
-
+    print(scene, "dragging idle %:", drag, "mean", round(statistics.mean(drag), 1))
 
 if __name__ == "__main__":
     main()

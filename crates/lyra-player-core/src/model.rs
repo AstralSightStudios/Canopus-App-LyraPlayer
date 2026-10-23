@@ -104,6 +104,14 @@ impl Song {
             .then(|| format!("{ROOT}/tracks/{}/cover.bin", self.id))
     }
 
+    /// The list artwork the watch derives from the cover (see [`crate::thumbnail`]), relative to
+    /// the module directory.
+    pub fn thumb_file(&self) -> Option<String> {
+        self.assets
+            .has(Assets::COVER)
+            .then(|| format!("tracks/{}/{THUMB_FILE}", self.id))
+    }
+
     pub fn lyrics_path(&self) -> Option<String> {
         self.assets
             .has(Assets::LYRICS)
@@ -117,3 +125,6 @@ pub fn track_dir(id: u64) -> String {
 
 /// Cover edge length in pixels; the importer produces exactly this size.
 pub const COVER_SIZE: u16 = 176;
+
+/// The watch-made list artwork next to `cover.bin`; never sent by the phone.
+pub const THUMB_FILE: &str = "thumb.bin";

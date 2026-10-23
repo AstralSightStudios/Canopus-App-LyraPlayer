@@ -27,6 +27,8 @@ pub enum PlaybackMode {
     RepeatAll,
     /// Pick another track pseudo-randomly.
     Shuffle,
+    /// Replay this track on EOF; manual next/previous still change tracks.
+    RepeatOne,
 }
 
 impl PlaybackMode {
@@ -34,7 +36,8 @@ impl PlaybackMode {
         match self {
             Self::ListOnce => Self::RepeatAll,
             Self::RepeatAll => Self::Shuffle,
-            Self::Shuffle => Self::ListOnce,
+            Self::Shuffle => Self::RepeatOne,
+            Self::RepeatOne => Self::ListOnce,
         }
     }
 
@@ -43,7 +46,45 @@ impl PlaybackMode {
             Self::ListOnce => "列表播放",
             Self::RepeatAll => "循环播放",
             Self::Shuffle => "随机播放",
+            Self::RepeatOne => "单曲循环",
         }
+    }
+}
+
+/// A media clock advanced by decoded samples, not by time since START. Waiting
+/// for AVDTP, starvation, pause and a busy UI therefore cannot run lyrics ahead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SampleClock {
+    frames: u32,
+    micros: u64,
+}
+
+impl SampleClock {
+    pub const fn new() -> Self {
+        Self {
+            frames: 0,
+            micros: 0,
+        }
+    }
+
+    pub fn reset(&mut self, position_ms: u32) {
+        self.frames = 0;
+        self.micros = u64::from(position_ms) * 1_000;
+    }
+
+    pub fn observe(&mut self, frames: u32, sample_rate: u32) -> u32 {
+        if sample_rate != 0 {
+            let delta = frames.wrapping_sub(self.frames);
+            self.micros = self
+                .micros
+                .saturating_add(u64::from(delta) * 1_000_000 / u64::from(sample_rate));
+            self.frames = frames;
+        }
+        self.position_ms()
+    }
+
+    pub fn position_ms(&self) -> u32 {
+        (self.micros / 1_000).min(u64::from(u32::MAX)) as u32
     }
 }
 
@@ -290,6 +331,44 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_clock_waits_for_decode_and_freezes_on_starvation_or_pause() {
+        let mut clock = SampleClock::new();
+        for _ in 0..40 {
+            assert_eq!(clock.observe(0, 0), 0);
+        }
+        assert_eq!(clock.observe(44_100, 44_100), 1_000);
+        for _ in 0..40 {
+            assert_eq!(clock.observe(44_100, 44_100), 1_000);
+        }
+        assert_eq!(clock.observe(88_200, 44_100), 2_000);
+        clock.reset(30_000);
+        assert_eq!(clock.observe(48_000, 48_000), 31_000);
+    }
+
+    #[test]
+    fn sample_counter_wrap_does_not_rewind_or_jump() {
+        let mut clock = SampleClock {
+            frames: u32::MAX - 479,
+            micros: 7_000_000,
+        };
+        assert_eq!(clock.observe(480, 48_000), 7_020);
+    }
+
+    #[test]
+    fn modes_include_single_track_repeat() {
+        let mut mode = PlaybackMode::ListOnce;
+        for expected in [
+            PlaybackMode::RepeatAll,
+            PlaybackMode::Shuffle,
+            PlaybackMode::RepeatOne,
+            PlaybackMode::ListOnce,
+        ] {
+            mode = mode.next();
+            assert_eq!(mode, expected);
+        }
+    }
 
     #[test]
     fn headset_play_applies_only_to_a_paused_stream() {

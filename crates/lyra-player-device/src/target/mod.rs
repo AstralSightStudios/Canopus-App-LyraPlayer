@@ -5,10 +5,10 @@ use core::sync::atomic::Ordering;
 
 use alloc::{string::String, vec::Vec};
 use lyra_player_core::{
-    Action, Effect, Route, Song,
+    Action, Collection, Effect, Route, Song,
     lyrics::Lyrics,
-    playback::{MediaControl, PlaybackState},
-    view::PlayerView,
+    playback::{MediaControl, PlaybackMode, PlaybackState},
+    view::{PlayerView, RowTarget, Transport},
 };
 
 use runtime::{initialized, runtime, try_with_core, with_core};
@@ -95,22 +95,31 @@ pub fn lyrics_snapshot() -> Lyrics {
 }
 
 pub struct NowPlaying {
+    pub id: u64,
     pub title: String,
-    pub state: &'static str,
-    pub palette: lyra_player_core::Palette,
+    pub artist: String,
+    pub transport: Transport,
+    pub has_cover: bool,
 }
 
-pub struct TrackRow {
-    pub id: u64,
-    pub name: String,
-    pub artist: String,
-    pub palette: lyra_player_core::Palette,
+/// One row as a list page draws it.
+pub struct FrameRow {
+    pub target: LibraryTarget,
+    pub title: String,
+    pub subtitle: String,
+    /// The track whose cover the row shows.
+    pub art: Option<u64>,
 }
 
 pub struct LibraryFrame {
+    /// Bumped by every import: artwork may have changed under an unchanged track id.
+    pub revision: u32,
     pub now_playing: Option<NowPlaying>,
-    pub current: Option<u64>,
-    pub tracks: Vec<TrackRow>,
+    /// The page's large title.
+    pub title: String,
+    pub rows: Vec<FrameRow>,
+    /// How many songs the library holds, whatever the page shows.
+    pub songs: usize,
     /// Whether this firmware has a phone channel the importer can use.
     pub import_supported: bool,
 }
@@ -118,42 +127,66 @@ pub struct LibraryFrame {
 #[derive(Clone, Copy, Debug)]
 pub enum LibraryTarget {
     NowPlaying,
+    Toggle,
     Song(u64),
+    Collection(Collection),
+    /// Start the open collection from the top in this mode (shuffle or repeat).
+    PlayCollection(PlaybackMode),
 }
 
-/// Changes whenever the song list or the now-playing row would draw differently.
-pub fn library_key() -> u64 {
+/// Changes whenever the page or the now-playing row would draw differently.
+pub fn library_key(page: usize) -> u64 {
     with_core(|core| {
         let current = core.app.player.current.as_ref().map_or(0, |song| song.id);
         let transport = PlayerView::of(&core.app).map_or(0, |view| view.transport as u64 + 1);
+        let collection = match core.app.collection {
+            Collection::Overview => 0,
+            Collection::All => 1,
+            Collection::Playlist(id) => 2 ^ (id << 2),
+        };
         (u64::from(core.app.library.revision) << 40)
             ^ (current << 8)
             ^ transport
             ^ ((core.app.tracks().len() as u64) << 32)
+            ^ (collection << 20)
+            ^ ((page as u64) << 62)
     })
 }
 
-pub fn library_frame() -> LibraryFrame {
+pub fn library_frame(page: usize) -> LibraryFrame {
     with_core(|core| {
         let view = PlayerView::of(&core.app);
+        let (title, rows) = if page == native_app::PAGE_COLLECTION {
+            lyra_player_core::view::collection_rows(&core.app)
+        } else {
+            (
+                String::from("音乐"),
+                lyra_player_core::view::overview_rows(&core.app),
+            )
+        };
         LibraryFrame {
-            now_playing: view.as_ref().map(|view| NowPlaying {
-                title: view.title.clone(),
-                state: ui::library::transport_label(view.transport),
-                palette: view.palette,
+            revision: core.app.library.revision,
+            now_playing: view.map(|view| NowPlaying {
+                id: view.id,
+                has_cover: view.cover.is_some(),
+                title: view.title,
+                artist: view.artist,
+                transport: view.transport,
             }),
-            current: core.app.player.current.as_ref().map(|song| song.id),
-            tracks: core
-                .app
-                .tracks()
-                .iter()
-                .map(|song| TrackRow {
-                    id: song.id,
-                    name: song.name.clone(),
-                    artist: song.artist_line(),
-                    palette: song.palette,
+            title,
+            rows: rows
+                .into_iter()
+                .map(|row| FrameRow {
+                    target: match row.target {
+                        RowTarget::Song(id) => LibraryTarget::Song(id),
+                        RowTarget::Collection(collection) => LibraryTarget::Collection(collection),
+                    },
+                    title: row.title,
+                    subtitle: row.subtitle,
+                    art: row.art,
                 })
                 .collect(),
+            songs: core.app.tracks().len(),
             import_supported: runtime().connect_result.load(Ordering::Acquire) == 0,
         }
     })
@@ -177,9 +210,23 @@ pub enum PlayerEvent {
 pub fn handle_library_event(target: LibraryTarget) {
     let effects = with_core(|core| match target {
         LibraryTarget::NowPlaying => Some(core.app.update(Action::Open(Route::Player))),
+        LibraryTarget::Toggle => {
+            core.toggle_audio();
+            Some(Vec::new())
+        }
         LibraryTarget::Song(id) => {
             let song: Option<Song> = core.app.tracks().iter().find(|song| song.id == id).cloned();
             song.map(|song| core.app.update(Action::SelectSong(song)))
+        }
+        LibraryTarget::Collection(collection) => {
+            Some(core.app.update(Action::OpenCollection(collection)))
+        }
+        LibraryTarget::PlayCollection(mode) => {
+            let playlist = match core.app.collection {
+                Collection::Playlist(id) => Some(id),
+                _ => None,
+            };
+            Some(core.app.update(Action::PlayCollection { playlist, mode }))
         }
     });
     if let Some(effects) = effects {
@@ -192,7 +239,7 @@ pub fn handle_player_event(event: PlayerEvent) {
     let effects = with_core(|core| match event {
         PlayerEvent::Back => None,
         PlayerEvent::Toggle => {
-            core.pending_audio = Some(runtime::PendingAudioCommand::Toggle);
+            core.toggle_audio();
             Some(Vec::new())
         }
         PlayerEvent::VolumeDown | PlayerEvent::VolumeUp => {
@@ -202,7 +249,8 @@ pub fn handle_player_event(event: PlayerEvent) {
             } else {
                 current.saturating_add(10).min(100)
             };
-            core.pending_audio = Some(runtime::PendingAudioCommand::SetVolume(volume));
+            core.app.player.volume_percent = volume;
+            core.pending_volume = Some(volume);
             Some(Vec::new())
         }
         PlayerEvent::Previous => Some(core.app.update(Action::Previous)),
@@ -253,6 +301,7 @@ fn route_page(route: Route) -> usize {
     match route {
         Route::Library => native_app::PAGE_LIBRARY,
         Route::Player => native_app::PAGE_PLAYER,
+        Route::Collection => native_app::PAGE_COLLECTION,
     }
 }
 
@@ -269,9 +318,9 @@ const MAX_HEADSET_CONTROLS_PER_TICK: usize = 8;
 /// state, and toggling on a repeat would invert playback instead of confirming
 /// it. Track changes are the app's decision, not the player's, so they go
 /// straight to `update`.
-fn apply_headset_controls(core: &mut runtime::Core) {
+fn apply_headset_controls(core: &mut runtime::Core, audio: &mut audio::AudioDevice) {
     for _ in 0..MAX_HEADSET_CONTROLS_PER_TICK {
-        let control = match core.audio.poll_headset_control() {
+        let control = match audio.poll_headset_control() {
             Ok(Some(control)) => control,
             Ok(None) => return,
             Err(error) => {
@@ -282,7 +331,7 @@ fn apply_headset_controls(core: &mut runtime::Core) {
         match control {
             MediaControl::Play | MediaControl::Pause => {
                 if core.app.player.transport_control_applies(control) {
-                    core.pending_audio = Some(runtime::PendingAudioCommand::Toggle);
+                    core.toggle_audio();
                 }
             }
             MediaControl::Next => {
@@ -297,102 +346,98 @@ fn apply_headset_controls(core: &mut runtime::Core) {
     }
 }
 
-/// Runs on the Bluetooth owner thread. Everything it does must stay inside the
-/// non-blocking `try_with_core`: this thread can preempt a UI thread that holds
-/// the core lock, so spinning in `with_core` here would never see it released.
+/// Runs on the Bluetooth owner. File IO and the audio endpoint are exclusively
+/// owned here; contention with UI snapshots may delay publishing, never feeding.
 pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
-    let _ = try_with_core(|core| {
-        apply_headset_controls(core);
-        if let Some(command) = core.pending_audio.take() {
-            match command {
+    let owner = unsafe { runtime::audio_owner() };
+    let commands = try_with_core(|core| {
+        apply_headset_controls(core, &mut owner.audio);
+        (
+            core.audio_epoch,
+            core.pending_audio.take(),
+            core.pending_volume.take(),
+        )
+    });
+    if let Some((epoch, command, volume)) = commands {
+        if let Some(command) = command {
+            let result = match command {
                 runtime::PendingAudioCommand::Stream(path) => {
-                    if let Ok(volume) = core.audio.volume_percent() {
-                        if core.app.player.sync_volume(volume) {
-                            core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                        }
+                    owner.epoch = epoch;
+                    owner.error = None;
+                    // The headset is the volume authority: start from what it has now, so the
+                    // page does not show this player's default for a second.
+                    if let Ok(volume) = owner.audio.volume_percent() {
+                        owner.player.sync_volume(volume);
                     }
-                    if let Err(error) = core.audio.start_local(&path, &mut core.app.player) {
-                        core.app.error = Some(alloc::format!(
-                            "local audio start {}: {}",
-                            core.audio.failure_stage(),
-                            error
-                        ));
-                        core.app.player.state = PlaybackState::Failed;
-                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                        runtime().last_error.store(error, Ordering::Release);
-                        return;
-                    }
-                    core.app.error = None;
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
+                    owner.audio.start_local(&path, &mut owner.player)
                 }
-                runtime::PendingAudioCommand::Toggle => {
-                    if let Err(error) = core.app.player.toggle(&mut core.audio) {
-                        core.app.error = Some(alloc::format!("audio ioctl failed: {error}"));
-                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                        runtime().last_error.store(error, Ordering::Release);
-                        return;
-                    }
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                }
-                runtime::PendingAudioCommand::SetVolume(volume) => {
-                    if let Err(error) = core.app.player.set_volume(volume, &mut core.audio) {
-                        core.app.error = Some(alloc::format!("volume ioctl failed: {error}"));
-                        core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                        runtime().last_error.store(error, Ordering::Release);
-                        return;
-                    }
-                }
+                runtime::PendingAudioCommand::Toggle => owner.player.toggle(&mut owner.audio),
                 runtime::PendingAudioCommand::Stop => {
-                    core.audio.stop_local();
+                    owner.epoch = epoch;
+                    owner.audio.stop_local();
+                    owner.player.clear();
+                    Ok(())
                 }
+            };
+            if let Err(error) = result {
+                fail_audio(owner, error);
             }
         }
-        if let Err(error) = core.audio.pump_local(&mut core.app.player) {
-            core.audio.abort_local();
-            core.app.player.state = PlaybackState::Failed;
-            core.app.error = Some(alloc::format!(
-                "local audio pump {}: {}",
-                core.audio.failure_stage(),
-                error
-            ));
-            core.app.generation = core.app.generation.wrapping_add(1).max(1);
-            runtime().last_error.store(error, Ordering::Release);
+        if let Some(volume) = volume {
+            if let Err(error) = owner.player.set_volume(volume, &mut owner.audio) {
+                runtime().last_error.store(error, Ordering::Release);
+            }
+        }
+    }
+    if let Err(error) = owner.audio.pump_local(&mut owner.player) {
+        fail_audio(owner, error);
+    }
+    if tick % 20 == 0 && owner.audio.is_open() {
+        if let Ok(volume) = owner.audio.volume_percent() {
+            owner.player.sync_volume(volume);
+        }
+    }
+    let _ = try_with_core(|core| {
+        // A user can select another track while the old feed is running. Never
+        // publish the old stream's state/position over that newer selection.
+        if core.audio_epoch != owner.epoch || owner.epoch == 0 {
             return;
         }
-        if core.app.player.state == PlaybackState::Draining && !core.audio.local_is_open() {
-            let effects = if core.app.has_next() {
-                core.app.update(Action::Next)
-            } else {
-                // Nothing follows. Without this the player would sit in
-                // Draining forever and the home row would keep advertising the
-                // last track as "即将结束" long after the audio stopped.
-                core.app.update(Action::PlaybackExhausted)
-            };
+        let mut changed = core.app.player.state != owner.player.state;
+        core.app.player.state = owner.player.state;
+        changed |= core.app.player.sync_position(owner.player.position_ms);
+        // A volume the user just asked for is shown at once; the driver follows next tick.
+        if core.pending_volume.is_none() {
+            changed |= core.app.player.sync_volume(owner.player.volume_percent);
+        }
+        if owner.error.is_some() && core.app.error != owner.error {
+            core.app.error = owner.error.clone();
+            changed = true;
+        }
+        if changed {
+            core.app.generation = core.app.generation.wrapping_add(1).max(1);
+        }
+        if owner.player.state == PlaybackState::Draining && !owner.audio.local_is_open() {
+            let effects = core.app.update(Action::TrackEnded);
             queue_audio_effects(core, effects);
+            owner.player.state = PlaybackState::Finished;
             runtime()
                 .player_media_refresh_pending
                 .store(true, Ordering::Release);
         }
-        if tick % 5 == 0 {
-            if let Some(position_ms) = core.audio.playback_position_ms() {
-                if core.app.player.sync_position(position_ms) {
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                }
-            } else if core.app.player.state == PlaybackState::Playing {
-                let _ = core.app.update(Action::Tick(250));
-            }
-        }
-        if tick % 20 == 0 && core.audio.is_open() {
-            match core.audio.volume_percent() {
-                Ok(volume) if core.app.player.sync_volume(volume) => {
-                    core.app.generation = core.app.generation.wrapping_add(1).max(1);
-                }
-                Ok(_) => {}
-                Err(error) => runtime().last_error.store(error, Ordering::Release),
-            }
-        }
     });
+}
+
+fn fail_audio(owner: &mut runtime::AudioOwner, error: i32) {
+    owner.error = Some(alloc::format!(
+        "audio {}: {}",
+        owner.audio.failure_stage(),
+        error
+    ));
+    owner.audio.abort_local();
+    owner.player.state = PlaybackState::Failed;
+    runtime().last_error.store(error, Ordering::Release);
 }
 
 pub fn ui_maintenance_tick() {
@@ -479,9 +524,13 @@ fn queue_audio_effect(core: &mut runtime::Core, effect: Effect) {
                 core.app.generation = core.app.generation.wrapping_add(1).max(1);
                 return;
             }
+            core.audio_epoch = core.audio_epoch.wrapping_add(1).max(1);
             core.pending_audio = Some(runtime::PendingAudioCommand::Stream(path));
         }
-        Effect::StopAudio => core.pending_audio = Some(runtime::PendingAudioCommand::Stop),
+        Effect::StopAudio => {
+            core.audio_epoch = core.audio_epoch.wrapping_add(1).max(1);
+            core.pending_audio = Some(runtime::PendingAudioCommand::Stop);
+        }
         Effect::Navigate(_) | Effect::LoadLyrics { .. } => {}
     }
 }
