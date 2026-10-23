@@ -1,33 +1,35 @@
 schema = 1
 
 [module]
-id = "lyra_player"
+id = "org.canopus.lyra-player"
 version = "0.1.1"
-version_code = 1
-kind = "target"
 language = "rust"
 lifecycle = "resident-after-activation"
 canopus_abi = "1"
-description = "Canopus native local music player for Lyra"
-
-[build]
-sources = ["crates/lyra-player-device/Cargo.toml"]
-allowed_constants = [
-  "0x0c03020a",
-  "0x0c020103",
-  "0x0c07266a",
-  "0x0c04071a",
-  "0x0c147a46",
-  "0x0c000f06",
-  "0x0c000000",
-  "0x0c59011a",
-]
 
 [targets]
 include = [
   "xiaomi-band-10-pro-3.101.036",
   "xiaomi-band-10-pro-3.101.043",
+  "xiaomi-band-9-pro-3.1.175",
   "xiaomi-band-11-4.100.139",
   "xiaomi-band-11-4.100.155",
-  "xiaomi-band-11-4.100.177",
+  "xiaomi-band-9-3.1.32",
 ]
+
+[capabilities]
+required = [
+  "identity-guard",
+  "native-app.register",
+  "launcher.entry",
+  "ui.dispatch",
+  "interconnect.client",
+  "nuttx.fs",
+]
+
+[native_app]
+enabled = true
+app_id = "org.canopus.lyra-player"
+name = "Lyra"
+entry = "canopus_module_descriptor"
+role = "standalone"

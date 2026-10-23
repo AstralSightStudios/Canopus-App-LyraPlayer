@@ -17,4 +17,3 @@ __pycache__/
 !/watchfaces/lyra-player-prod/xiaomi-band-*/main.lua
 !/watchfaces/lyra-player-prod/xiaomi-band-*/docs/
 .DS_Store
-dist/
