@@ -84,6 +84,8 @@ pub struct UiState {
     pub sent: u64,
     pub total: u64,
     pub speed_bytes_per_second: u64,
+    /// Average time the watch took to take one frame, over the last speed sample.
+    pub round_trip_ms: u32,
     pub active: bool,
     pub device_library: Vec<DeviceLibraryTrack>,
     pub library_revision: String,

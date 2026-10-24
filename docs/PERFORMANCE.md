@@ -156,3 +156,88 @@ python3 scripts/mirage_import_test.py 043 SOURCE --id 90001 --repeats 2 --out bu
 `verified-043/verification.json`、`verified-155/verification.json` 是最终文件校验记录。
 该目录不进入 Git，原有展示截图仍在 `docs/screenshots/`。
 音频在 Mirage 中用 `dry-run` 标记模拟播放，没有验证真实蓝牙耳机输出。AstroBox 插件通过 host 测试和共享发送器验证，未启动完整插件宿主 UI。
+
+## 播放：卡顿、进度落后与起播慢（2026-10-24）
+
+真机（Band 10 Pro）报告：界面一动、歌词每次带动画切换都会卡；界面进度比耳机里慢约 20 秒，歌词同样；起播慢约 3 秒。
+下面的原因来自代码与固件反汇编，修复只在主机测试和 Mirage（无蓝牙 sink，`dry-run`）里验证过，**真机未验证**。
+
+### 进度慢约 8 %（不是卡顿造成的）
+
+BluetoothAudio 模块把 48 kHz（以及 24 kHz）的 MP3 重采样到 44.1 kHz，`pcm_frames` 数的是重采样后的 44.1 kHz 帧，
+`decoded_sample_rate` 报的却是 MP3 自己的 48 kHz。Lyra 用 `pcm_frames / decoded_sample_rate` 算位置，于是时钟慢
+44.1/48 = 0.919：4 分钟的歌到结尾差 19.5 s。结束时机由驱动的 STOPPED 决定，所以“结束恰到好处”。卡顿只会让耳机和
+`pcm_frames` 一起停，造不出这种差距。44.1 kHz 的文件不受影响。
+
+修复在模块：`StreamProgress::Frame` 带上 `source_frames`，`pcm_frames` 改数 MP3 自己采样率下的帧；头文件与
+`THIRD_PARTY_PLAYBACK.md` 写明 `pcm_frames / decoded_sample_rate` 就是播放位置。**需要同时更新 BluetoothAudio 模块。**
+
+### 起播慢：ID3 标签
+
+插件原样上传 MP3，内嵌封面的 ID3v2 标签常有几百 KB 到 1 MB 以上。模块解码器要先把标签读过去，而 Lyra 每 50 ms
+只能往 16 KiB 的输入环里塞一次：1 MB 标签约 3 s 静音。现在：
+
+* 插件上传前去掉开头的 ID3v2 与结尾的 APEv2、ID3v1（`id3::audio_range`），只传音频帧，传输量同时变小；
+* 手表打开文件时跳过开头的 ID3v2 标签（能 `lseek` 就跳，不能就在读取线程里读过去），已经导入的旧歌也受益。
+
+### 卡顿
+
+固件事实（036 反汇编）：模块的包定时器和 Lyra 的音频 tick 都在 `bluelet_thread`（优先级 103）上跑；
+UI 主任务 `miwear` 是 102，`fb_flush_thread` 是调用者 +1 = 103。也就是说 UI 渲染本身抢不走蓝牙线程，
+界面变化造成卡顿只能经由共享资源（闪存/文件系统、内存带宽：固件用 VGLite GPU 渲染）或同优先级的刷屏线程。
+原实现在这两点上都很脆弱：
+
+1. **蓝牙线程做阻塞的文件读取**：Lyra 每 50 ms 在 `bluelet_thread` 上 `read` 最多 8×4 KB 的 MP3。界面读封面、
+   图标、字体或导入写文件时，这次读就要等，而同一线程上的 A2DP 包定时器也跟着停。
+2. **包节奏丢掉的时间不补**：模块每次回调只发一个包，回调迟到超过 50 ms 就把截止时间重置到“现在”。
+   一次停顿让耳机的缓冲（启动时只预填约 150 ms 静音）永久少一截，之后任何小停顿都会被听到。
+
+修复：
+
+* 模块 `PacketClock`：按一个固定锚点计算应发的包数，迟到的包一次回调最多补发 3 个（流控窗口仍是 2 个在途），
+  落后超过 400 ms（耳机肯定已经断流）才重定锚点；锚点在第一个音频包发出时才建立，跳标签、等输入的时间不算欠账。
+  暂停后恢复重定锚点。模块“耳机”详情页的 Underruns 行会显示本次播放最大落后 `late N ms`，真机上用来判断
+  蓝牙线程实际被卡了多久。
+* Lyra `feeder`：MP3 改由 Supervisor 的后台定时器（UI owner 线程，每 10 ms，熄屏也跑）读进 32 KiB 的块环，
+  蓝牙线程只从内存拷贝。每块带请求的 epoch，切歌只换 epoch。Supervisor 没有后台定时器时（旧版 Supervisor 的 036、139）
+  照旧在蓝牙线程读；新版 Supervisor 在五个目标上都有（见下面“036、139 的后台定时器”）。读取线程超过 1 s 没有供数时，蓝牙线程按已消耗的字节数 `lseek` 到同一位置自己接着读。
+
+Mirage `.043`（`dry-run`）：读取器运行、发布了 118 块（约 470 KB），自动切歌、歌词、导入回归（两次导入后关机回读，
+三个文件逐字节一致）都正常。模拟器没有蓝牙 sink，包节奏的改动只有主机测试（`tests/media.rs`）覆盖。
+
+### 导入写入
+
+手表收到的每帧 464 字节原来直接写一次文件；现在攒满 4 KiB 整块再写（`ASSET_END` 时写剩余部分并 `sync`），
+处理函数在 UI owner 上占用的时间和手机等应答的时间都更短。插件的进度行新增“往返 N ms”：每帧从交给宿主到
+手表收下的平均时间。3 帧在途时速度约等于 3×464 B / 往返时间，真机上用它判断瓶颈是不是链路往返。
+
+### 深接收环（2026-10-24）
+
+3 帧在途时速度 ≈ 3×464 B / 往返时间；真机往返约 140 ms 就正好是 10 KiB/s。瓶颈在 Supervisor 只有 4 槽的
+L2 接收环（手机最多 3 条在途），所以改了框架（细节见 Canopus `ADR-CAN-009` “在途窗口”）：
+
+* Supervisor：接收环 16 槽，放在堆上；QUERY_DEVICE +84 报告环深；应答与事件轮流发，PROGRESS 不再被应答饿死；
+* AstroBox core：插件 `listen` / 重连 `resync` 时问一次环深，插件窗口放宽到环深减一；旧 Supervisor 不报告，保持 3；
+* 插件：`IN_FLIGHT` 3 → 15，实际在途数由宿主按手表环深决定。
+
+Mirage `.043`，525,590 字节、1,139 帧，导入后关机逐字节回读一致：
+
+| 在途帧数 | 耗时 | 速度 |
+|---|---|---|
+| 1 | 37.6 s | 13.6 KiB/s |
+| 3 | 10.1 s | 50.7 KiB/s |
+| 15 | 6.6 s | 77.6 KiB/s |
+
+（3 帧比此前的 34.7 KiB/s 快，是手表端改成 4 KiB 整块写入之后。）同一个 AstroBox 对旧 Supervisor 的设备让 15 帧在途时，
+窗口仍是 3，约 35 KiB/s，无超时、无重传。若真机往返仍约 140 ms，15 帧在途的上限约 50 KiB/s；实际以插件显示的往返为准。
+需要同时更新 Supervisor（重新运行安装表盘）和 AstroBox。
+
+### 036、139 的后台定时器（2026-10-24）
+
+后台定时器（熄屏也触发）原来挂在 Supervisor 的 L2 后端上，而 036、139 没有恢复出 L2 所需的 SAR/会话/加密入口，
+所以这两个固件上 `timer_set_background` 一直不支持，`feeder` 只能退回蓝牙线程读。其实后台定时器只需要 UI 所属的
+libuv 循环和 `uv_timer_init` / `uv_timer_start`：Canopus 把这部分拆成独立的 owner 泵，并从固件里找到了这两个目标的
+地址（036：循环 `0x20121F80`、init `0x0C2CD84C`、start `0x0C2CDA3C`；139 与 155 相同），见 Canopus
+`evidence/owner-pump.json`。Mirage 里在 036、139 的原版固件上读 libuv 定时器堆：Supervisor 的常驻定时器每 10 ms 到期一次，
+熄屏期间到期时间随循环时间前进。装新版 Supervisor 后，Lyra 在这两个固件上也走 UI 线程读取。
+（139 的固化启动仍不支持：它在 Mirage 里没跑通，与后台定时器无关，所以没有一起打开。）

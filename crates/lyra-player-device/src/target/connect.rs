@@ -28,6 +28,10 @@ use crate::module::context;
 
 const ERR_BUSY: i32 = -16;
 const ERR_NOSPACE: i32 = -28;
+/// Imported bytes are written in blocks of this size. They arrive 464 at a time, and each small
+/// append costs the flash file system nearly as much as a whole block (the handler runs on the UI
+/// owner and holds up the reply to the phone meanwhile).
+const WRITE_BLOCK: usize = 4 * 1024;
 const OUTBOX_MAX: usize = 48;
 const FLUSH_MS: u32 = 20;
 /// A transfer that has not heard from the phone for this long is dropped.
@@ -94,10 +98,35 @@ fn mkdir(ctx: *const CanopusContext, path: &str) -> Result<(), i32> {
 struct DeviceStore {
     ctx: *const CanopusContext,
     open: Option<(Asset, fs::File)>,
+    /// Bytes of the open asset not written yet, less than [`WRITE_BLOCK`] after each frame.
+    pending: Vec<u8>,
+}
+
+fn write_all(file: &mut fs::File, mut bytes: &[u8]) -> Result<(), Status> {
+    while !bytes.is_empty() {
+        match file.write(bytes) {
+            Ok(0) => return Err(Status::Io),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) => return Err(status_of(error)),
+        }
+    }
+    Ok(())
 }
 
 impl DeviceStore {
     const ASSETS: [Asset; 3] = [Asset::Audio, Asset::Cover, Asset::Lyrics];
+
+    /// Writes what the open asset still holds back.
+    fn flush(&mut self) -> Result<(), Status> {
+        let pending = core::mem::take(&mut self.pending);
+        let result = match &mut self.open {
+            Some((_, file)) => write_all(file, &pending),
+            None => Ok(()),
+        };
+        self.pending = pending;
+        self.pending.clear();
+        result
+    }
 
     fn remove_dir_contents(&self, dir: &str) {
         for asset in Self::ASSETS {
@@ -111,6 +140,7 @@ impl ImportStore for DeviceStore {
     fn stage_begin(&mut self, id: u64) -> Result<(), Status> {
         let _ = id;
         self.open = None;
+        self.pending.clear();
         mkdir(self.ctx, "tracks").map_err(status_of)?;
         self.remove_dir_contents("stage");
         mkdir(self.ctx, "stage").map_err(status_of)
@@ -119,6 +149,7 @@ impl ImportStore for DeviceStore {
     fn stage_write(&mut self, asset: Asset, offset: u32, bytes: &[u8]) -> Result<(), Status> {
         let reopen = !matches!(&self.open, Some((open, _)) if *open == asset);
         if reopen {
+            self.flush()?;
             self.open = None;
             let flags = FS_WRITE | FS_CREATE | FS_TRUNC;
             if offset != 0 {
@@ -131,30 +162,30 @@ impl ImportStore for DeviceStore {
         let Some((_, file)) = &mut self.open else {
             return Err(Status::Io);
         };
-        let mut written = 0;
-        while written < bytes.len() {
-            match file.write(&bytes[written..]) {
-                Ok(0) => return Err(Status::Io),
-                Ok(count) => written += count,
-                Err(error) => return Err(status_of(error)),
-            }
+        self.pending.extend_from_slice(bytes);
+        if self.pending.len() >= WRITE_BLOCK {
+            let whole = self.pending.len() / WRITE_BLOCK * WRITE_BLOCK;
+            let result = write_all(file, &self.pending[..whole]);
+            self.pending.drain(..whole);
+            result?;
         }
         Ok(())
     }
 
     fn stage_finish(&mut self, asset: Asset) -> Result<(), Status> {
-        if let Some((open, file)) = self.open.take() {
-            if open == asset {
-                let _ = file.sync();
-            } else {
-                self.open = Some((open, file));
-            }
+        if !matches!(&self.open, Some((open, _)) if *open == asset) {
+            return Ok(());
+        }
+        self.flush()?;
+        if let Some((_, file)) = self.open.take() {
+            let _ = file.sync();
         }
         Ok(())
     }
 
     fn stage_commit(&mut self, id: u64) -> Result<(), Status> {
         self.open = None;
+        self.pending.clear();
         let target = format!("tracks/{id}");
         mkdir(self.ctx, &target).map_err(status_of)?;
         // The list thumbnail is rebuilt from the new cover by the library page.
@@ -178,6 +209,7 @@ impl ImportStore for DeviceStore {
 
     fn stage_abort(&mut self) {
         self.open = None;
+        self.pending.clear();
         self.remove_dir_contents("stage");
     }
 
@@ -236,7 +268,11 @@ pub fn start() -> i32 {
         ENDPOINT = Some(Endpoint {
             ctx,
             importer: Importer::new(platform(ctx)),
-            store: DeviceStore { ctx, open: None },
+            store: DeviceStore {
+                ctx,
+                open: None,
+                pending: Vec::new(),
+            },
             library: None,
             outbox: VecDeque::new(),
             timer: -1,
@@ -301,6 +337,8 @@ impl Endpoint {
     }
 
     fn apply(&mut self, change: Change) {
+        // A phone can start playback before any page has run; the reader belongs to this thread.
+        super::feeder::start();
         match change {
             Change::Library => {
                 runtime().library_dirty.store(true, Ordering::Release);

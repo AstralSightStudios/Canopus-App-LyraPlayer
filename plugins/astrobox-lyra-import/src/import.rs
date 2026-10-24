@@ -67,8 +67,10 @@ pub struct ImportRequest {
     pub assets: Vec<ImportAsset>,
 }
 
+/// `len` bytes of a file from `start` on.
 struct FileSource {
     file: File,
+    start: u64,
     len: u32,
 }
 
@@ -78,9 +80,10 @@ impl Source for FileSource {
     }
 
     fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<usize, String> {
+        let want = buf.len().min(self.len.saturating_sub(offset) as usize);
         self.file
-            .seek(SeekFrom::Start(u64::from(offset)))
-            .and_then(|_| self.file.read(buf))
+            .seek(SeekFrom::Start(self.start + u64::from(offset)))
+            .and_then(|_| self.file.read(&mut buf[..want]))
             .map_err(|error| error.to_string())
     }
 }
@@ -96,6 +99,9 @@ struct Active {
     /// Another call is already sending frames; others only feed events in.
     pumping: bool,
     speed_mark: (Instant, u64),
+    /// Time from handing a frame to the host until the watch took it, summed over the frames
+    /// answered since the speed was last published, and their count.
+    round_trips: (Duration, u32),
 }
 
 static ACTIVE: OnceLock<Mutex<Option<Active>>> = OnceLock::new();
@@ -165,7 +171,20 @@ fn open(path: &str) -> Result<Box<dyn Source>, String> {
         .map_err(|error| format!("无法读取 {path}：{error}"))?
         .len();
     let len = u32::try_from(len).map_err(|_| "文件过大".to_string())?;
-    Ok(Box::new(FileSource { file, len }))
+    Ok(Box::new(FileSource {
+        file,
+        start: 0,
+        len,
+    }))
+}
+
+/// The audio frames of an MP3 without its tags (see [`crate::id3::audio_range`]).
+fn open_audio(path: &str) -> Result<Box<dyn Source>, String> {
+    let mut file = File::open(path).map_err(|error| format!("无法打开 {path}：{error}"))?;
+    let (start, end) =
+        crate::id3::audio_range(&mut file).map_err(|error| format!("无法读取 {path}：{error}"))?;
+    let len = u32::try_from(end - start).map_err(|_| "文件过大".to_string())?;
+    Ok(Box::new(FileSource { file, start, len }))
 }
 
 /// The sender for a request: files opened, lyrics normalised to LRC, sizes and CRCs
@@ -187,7 +206,8 @@ fn prepare(request: &ImportRequest) -> Result<Sender, String> {
                     }
                 }
             }
-            _ => open(&asset.path)?,
+            Asset::Audio => open_audio(&asset.path)?,
+            Asset::Cover => open(&asset.path)?,
         };
         sources.push((asset.kind, source));
     }
@@ -230,6 +250,7 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
             last_progress: Instant::now(),
             pumping: false,
             speed_mark: (Instant::now(), 0),
+            round_trips: (Duration::ZERO, 0),
         });
     }
     state::with_state(|state| {
@@ -237,6 +258,7 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
         state.sent = 0;
         state.total = total;
         state.speed_bytes_per_second = 0;
+        state.round_trip_ms = 0;
         state.status = "正在连接手表上的 Lyra Player…".to_string();
     });
     let hello = Request::Hello {
@@ -312,12 +334,12 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
     true
 }
 
-/// Frames kept on their way to the watch at once. The host lets this many CanopusConnect messages
-/// be in flight per device (it keeps the last slot of the watch's queue for the Manager), so the
-/// round trip of one frame no longer sets the pace: over a real Bluetooth link a frame takes
-/// several connection intervals to be answered, and one answered frame at a time is what held the
-/// transfer under 10 KiB/s.
-const IN_FLIGHT: usize = 3;
+/// Frames kept on their way to the watch at once. Every frame waits a Bluetooth round trip for its
+/// answer, so this many frames per round trip is the speed of an import. The host decides how many
+/// really are in flight: as many as the watch's request ring holds less the slot it keeps for the
+/// Manager -- 15 on a Supervisor with the deep ring, 3 on older ones -- and holds the rest back,
+/// in order. Asking for more than the host allows only queues them there.
+const IN_FLIGHT: usize = 15;
 
 /// Sends every frame the sender has ready, [`IN_FLIGHT`] at a time. Only one call does this at a
 /// time; events that arrive meanwhile are fed in by `on_frame` and picked up by the running loop.
@@ -342,7 +364,12 @@ async fn pump() {
                     active.pumping = false;
                     return;
                 }
-                publish_progress(active.total, &mut active.speed_mark, &active.sender);
+                publish_progress(
+                    active.total,
+                    &mut active.speed_mark,
+                    &mut active.round_trips,
+                    &active.sender,
+                );
                 match active.sender.state() {
                     State::Done => {
                         active.pumping = false;
@@ -370,7 +397,11 @@ async fn pump() {
                 active.sender.poll().map(|frame| (active.addr.clone(), frame))
             };
             match next {
-                Some((addr, frame)) => sends.push(async move { connect::send(&addr, &frame).await }),
+                Some((addr, frame)) => sends.push(async move {
+                    let started = Instant::now();
+                    let result = connect::send(&addr, &frame).await;
+                    (result, started.elapsed())
+                }),
                 None => break,
             }
         }
@@ -381,29 +412,49 @@ async fn pump() {
             }
             return;
         }
-        if let Some(Err(error)) = sends.next().await {
-            *lock() = None;
-            finish_error(&format!("发送失败：{error}"));
-            return;
+        match sends.next().await {
+            Some((Err(error), _)) => {
+                *lock() = None;
+                finish_error(&format!("发送失败：{error}"));
+                return;
+            }
+            Some((Ok(()), elapsed)) => {
+                if let Some(active) = lock().as_mut() {
+                    active.round_trips.0 += elapsed;
+                    active.round_trips.1 += 1;
+                }
+            }
+            None => {}
         }
     }
 }
 
-fn publish_progress(total: u64, mark: &mut (Instant, u64), sender: &Sender) {
+/// Publishes the confirmed bytes, and every two seconds the speed and the average time a frame
+/// took to be answered: with a fixed number of frames in flight, that round trip is what sets
+/// the speed, so a slow import can be told apart from a slow link.
+fn publish_progress(
+    total: u64,
+    mark: &mut (Instant, u64),
+    round_trips: &mut (Duration, u32),
+    sender: &Sender,
+) {
     let confirmed = sender.confirmed_bytes();
     let elapsed = mark.0.elapsed();
     let speed = if elapsed >= Duration::from_secs(2) {
         let speed = confirmed.saturating_sub(mark.1) as f64 / elapsed.as_secs_f64();
         *mark = (Instant::now(), confirmed);
-        Some(speed as u64)
+        let (sum, count) = std::mem::replace(round_trips, (Duration::ZERO, 0));
+        let round_trip_ms = sum.as_millis() as u64 / u64::from(count.max(1));
+        Some((speed as u64, round_trip_ms as u32))
     } else {
         None
     };
     state::with_state(|state| {
         state.sent = confirmed;
         state.total = total;
-        if let Some(speed) = speed {
+        if let Some((speed, round_trip_ms)) = speed {
             state.speed_bytes_per_second = speed;
+            state.round_trip_ms = round_trip_ms;
         }
         state.status = match sender.state() {
             State::Streaming(_) | State::AwaitAssetEnd(_) => "正在传输到手表…".to_string(),

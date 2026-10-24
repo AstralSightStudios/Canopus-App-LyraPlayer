@@ -1004,13 +1004,19 @@ fn transfer_card(state: &state::UiState) -> ui::Element {
             let remaining = remaining_text(state.total.saturating_sub(state.sent), state.speed_bytes_per_second)
                 .map(|text| format!(" · {text}"))
                 .unwrap_or_default();
+            let round_trip = if state.round_trip_ms > 0 {
+                format!(" · 往返 {} ms", state.round_trip_ms)
+            } else {
+                String::new()
+            };
             format!(
-                "{}% · {:.2} / {:.2} MiB · {}k/s{}",
+                "{}% · {:.2} / {:.2} MiB · {}k/s{}{}",
                 percent,
                 state.sent as f64 / 1_048_576.0,
                 state.total as f64 / 1_048_576.0,
                 speed_kib.max(1),
-                remaining
+                remaining,
+                round_trip
             )
         } else {
             format!(

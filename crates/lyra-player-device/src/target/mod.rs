@@ -16,6 +16,7 @@ use runtime::{initialized, runtime, try_with_core, with_core};
 pub mod audio;
 mod audio_service;
 pub mod connect;
+mod feeder;
 pub mod native_app;
 pub mod runtime;
 pub mod storage;
@@ -441,6 +442,8 @@ fn fail_audio(owner: &mut runtime::AudioOwner, error: i32) {
 }
 
 pub fn ui_maintenance_tick() {
+    // The track reader runs on this (UI owner) thread; starting it is cheap once it runs.
+    feeder::start();
     let service_result = audio_service::start();
     if service_result != 0 {
         runtime()

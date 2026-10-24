@@ -88,6 +88,28 @@ impl SampleClock {
     }
 }
 
+/// Bytes the ID3v2 tag at the start of an MP3 takes (header, body and footer), read from the
+/// file's first ten bytes; `None` when the file starts with audio.
+///
+/// A tag often embeds the album art, several hundred KiB of it. Left in the stream, the decoder
+/// has to be fed all of it before the first frame, at the speed audio is fed -- seconds of
+/// silence at the start of a track -- so the player steps over it when it opens the file.
+pub fn id3v2_tag_len(header: &[u8]) -> Option<u32> {
+    let header = header.get(..10)?;
+    if &header[..3] != b"ID3"
+        || header[3] == 0xFF
+        || header[4] == 0xFF
+        || header[6..10].iter().any(|byte| byte & 0x80 != 0)
+    {
+        return None;
+    }
+    let body = header[6..10]
+        .iter()
+        .fold(0u32, |size, byte| (size << 7) | u32::from(*byte));
+    let footer = if header[5] & 0x10 != 0 { 10 } else { 0 };
+    Some(10 + body + footer)
+}
+
 /// A media control a headset gesture asked for, as delivered by the
 /// BluetoothAudio module's control-event queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,6 +376,28 @@ mod tests {
             micros: 7_000_000,
         };
         assert_eq!(clock.observe(480, 48_000), 7_020);
+    }
+
+    #[test]
+    fn id3v2_tag_length_covers_header_body_and_footer() {
+        // 1000 = 7 * 128 + 104 as a syncsafe integer.
+        let tag = *b"ID3\x04\x00\x00\x00\x00\x07\x68";
+        assert_eq!(id3v2_tag_len(&tag), Some(1_010));
+        let mut with_footer = tag;
+        with_footer[5] = 0x10;
+        assert_eq!(id3v2_tag_len(&with_footer), Some(1_020));
+        let largest = *b"ID3\x03\x00\x00\x7f\x7f\x7f\x7f";
+        assert_eq!(id3v2_tag_len(&largest), Some(10 + (1 << 28) - 1));
+    }
+
+    #[test]
+    fn audio_and_damaged_headers_are_not_tags() {
+        // An MPEG-1 Layer III frame header.
+        assert_eq!(id3v2_tag_len(&[0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0, 0, 0]), None);
+        // A size byte with its high bit set is not syncsafe.
+        assert_eq!(id3v2_tag_len(b"ID3\x04\x00\x00\x00\x00\x87\x68"), None);
+        assert_eq!(id3v2_tag_len(b"ID3\xff\x00\x00\x00\x00\x07\x68"), None);
+        assert_eq!(id3v2_tag_len(b"ID3\x04\x00"), None);
     }
 
     #[test]
