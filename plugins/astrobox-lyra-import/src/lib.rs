@@ -13,6 +13,7 @@ mod netease;
 mod sniff;
 mod state;
 mod ui;
+mod view;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -82,12 +83,10 @@ impl lifecycle::Guest for LyraImportPlugin {
             if let Ok(Some(cookie)) = &restored {
                 state.netease_cookie = cookie.clone();
             }
-            state.status = match &restored {
-                Err(error) => error.clone(),
-                Ok(Some(_)) => "已恢复网易云登录状态。".to_string(),
-                Ok(None) if state.devices.is_empty() => "未发现已连接设备。".to_string(),
-                Ok(None) => "请确认手表上已启用 Lyra Player，然后选择本地或网易云音乐。".to_string(),
-            };
+            // The page itself shows the login and device state; only a problem needs words.
+            if let Err(error) = &restored {
+                state.status = error.clone();
+            }
         });
     }
 }

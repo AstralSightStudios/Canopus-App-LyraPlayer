@@ -68,9 +68,23 @@ pub enum NeteaseView {
     PlaylistTracks,
 }
 
+/// The page's three tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Cloud,
+    Local,
+    Library,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
     pub root: Option<String>,
+    pub tab: Tab,
+    /// The song the running (or last) import carries.
+    pub import_title: String,
+    /// The watch playlist whose songs are listed open.
+    pub expanded_playlist: Option<u64>,
     pub devices: Vec<DeviceInfo>,
     pub selected_addr: String,
     pub audio: Option<SelectedFile>,
@@ -95,7 +109,6 @@ pub struct UiState {
     /// The protocol version the module on the watch speaks; 0 until it has answered.
     pub device_version: u8,
     pub device_playlists: Vec<DevicePlaylist>,
-    pub playlist_name: String,
     pub netease_cookie: String,
     pub netease_view: NeteaseView,
     pub netease_audio_bitrate: u32,

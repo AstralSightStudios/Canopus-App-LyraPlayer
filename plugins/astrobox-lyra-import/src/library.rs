@@ -181,7 +181,7 @@ pub async fn create_playlist(name: &str) {
 pub async fn rename_playlist(id: u64, name: &str) {
     let name = name.trim();
     if name.is_empty() || name.len() > MAX_PLAYLIST_NAME {
-        state::with_state(|state| state.status = "请先在输入框里写好新的歌单名称。".into());
+        state::with_state(|state| state.status = "歌单名称不能为空，也不能太长。".into());
         return;
     }
     if !playlists_supported() {
