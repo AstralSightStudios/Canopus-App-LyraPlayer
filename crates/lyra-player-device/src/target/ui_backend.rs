@@ -11,7 +11,9 @@ use canopus_ui_core::{NodeKind, Snapshot};
 use lyra_player_core::player_layout::PlayerLayout;
 use lyra_player_core::ui::{PLAYER_BACKGROUND_KEY, PLAYER_COVER_KEY};
 
-use super::native_app::{APP_ID, PAGE_COUNT, PAGE_OVERVIEW, PAGE_PLAYER, page_descriptor_ptr};
+use super::native_app::{
+    PAGE_COUNT, PAGE_OVERVIEW, PAGE_PLAYER, navigation_key, page_descriptor_ptr,
+};
 use super::storage;
 
 static EMPTY_TEXT: [u8; 1] = [0];
@@ -333,8 +335,9 @@ pub fn page_destroy(page_index: usize) -> i32 {
 // ---------------------------------------------------------------------------
 
 pub fn navigate(page_index: usize) {
-    let key = ((APP_ID as u32) << 16) | page_index as u32;
-    unsafe { activity_navigate(key, 0, 0, 0) };
+    if let Some(key) = navigation_key(page_index) {
+        unsafe { activity_navigate(key, 0, 0, 0) };
+    }
 }
 
 pub fn back(page_index: usize) {
