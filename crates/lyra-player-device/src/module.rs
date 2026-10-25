@@ -115,19 +115,20 @@ pub extern "C" fn canopus_mod_query(writer: *mut StatusWriterV1) -> i32 {
     0
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_publish_native_app(_ctx: *const ContextV1) -> i32 {
-    -103
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_publish_native_app_stage(_ctx: *const ContextV1, stage: u32) -> i32 {
+pub extern "C" fn canopus_mod_publish_native_app_stage(ctx: *const ContextV1, stage: u32) -> i32 {
     #[cfg(feature = "device")]
-    let result = crate::target::native_app::install_stage(stage)
+    // SAFETY: the Supervisor invokes this callback with the live module context
+    // on the serialized UI owner.
+    let result = unsafe { crate::target::native_app::install_stage(ctx, stage) }
         .map(|()| 0)
         .unwrap_or_else(|error| error);
     #[cfg(not(feature = "device"))]
-    let result = if matches!(stage, 1 | 2) { 0 } else { -103 };
+    let result = {
+        let _ = ctx;
+        if matches!(stage, 1 | 2) { 0 } else { -22 }
+    };
     if result != 0 {
         LAST_ERROR.store(result as u32, Ordering::Release);
     }
@@ -153,7 +154,7 @@ pub static canopus_module_descriptor: ModuleDescriptorV1 = ModuleDescriptorV1 {
     deactivate: Some(canopus_mod_deactivate),
     stop: Some(canopus_mod_stop),
     query: Some(canopus_mod_query),
-    publish_native_app: Some(canopus_mod_publish_native_app),
+    publish_native_app: None,
     publish_native_app_stage: Some(canopus_mod_publish_native_app_stage),
 };
 

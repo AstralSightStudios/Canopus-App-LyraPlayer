@@ -8,7 +8,7 @@ use core::ffi::c_void;
 
 use canopus_target_private::*;
 
-use super::native_app::{APP_ID, PAGE_COLLECTION, PAGE_COUNT, PAGE_LIBRARY, live_page_ptr};
+use super::native_app::{PAGE_COLLECTION, PAGE_COUNT, PAGE_LIBRARY, live_page_ptr, navigation_key};
 
 pub mod artwork;
 pub mod assets;
@@ -141,8 +141,9 @@ fn destroy_page(index: usize) {
 }
 
 pub fn navigate(page_index: usize) {
-    let key = ((APP_ID as u32) << 16) | page_index as u32;
-    unsafe { activity_navigate(key, 0, 0, 0) };
+    if let Some(key) = navigation_key(page_index) {
+        unsafe { activity_navigate(key, 0, 0, 0) };
+    }
 }
 
 /// Finishes a page so the one below resumes. Band 11's `page_finish` takes
@@ -150,7 +151,9 @@ pub fn navigate(page_index: usize) {
 /// takes the page descriptor.
 pub fn back(page_index: usize) {
     let argument = if lv::BAND_11 {
-        let key = ((APP_ID as u32) << 16) | page_index as u32;
+        let Some(key) = navigation_key(page_index) else {
+            return;
+        };
         key as usize as *mut firmware_page_descriptor
     } else {
         live_page_ptr(page_index)

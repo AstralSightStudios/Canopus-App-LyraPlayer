@@ -3,6 +3,13 @@
 Canopus 原生音乐播放器模块，加上把音乐直接送进手表的 AstroBox 插件。构建时需要同级的 `Canopus`
 框架仓库，也可通过 `CANOPUS_ROOT` 指定框架目录。
 
+原生应用登记需要包含 `register_app()` 接口的 Canopus 框架
+（commit `2503271` 或更新版本）。启用模块前请更新 Supervisor 并重启设备。
+Lyra 将三个原生页面提交给 Supervisor，由框架按模块 ID 分配并持久化应用 ID、
+安装页面和发布启动器图标；页面导航使用框架返回的 ID，不再占用固定的 `0xCC`。
+登记分两阶段执行：第一阶段提交定义，Supervisor 完成发布后才调用第二阶段。
+应用仍由用户点击启动器图标打开。
+
 | 目标 | 播放器 | 导入（CanopusConnect） |
 |---|---|---|
 | Band 11 `.155` | ✔ Mirage 验证 | ✔ Mirage 验证 |

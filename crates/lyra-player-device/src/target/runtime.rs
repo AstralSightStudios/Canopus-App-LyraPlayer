@@ -13,7 +13,7 @@ pub enum PendingAudioCommand {
 }
 
 pub const APP_NONE: u32 = 0;
-pub const APP_REGISTERED: u32 = 1;
+pub const APP_PENDING: u32 = 1;
 pub const APP_OK: u32 = 2;
 pub const APP_FAILED: u32 = 3;
 
@@ -72,8 +72,7 @@ impl Core {
 pub struct Runtime {
     pub app_state: AtomicU32,
     pub app_error: AtomicI32,
-    pub app_install_result: AtomicI32,
-    pub launcher_add_result: AtomicI32,
+    pub app_id: AtomicU32,
     pub last_error: AtomicI32,
     pub active_page: AtomicU32,
     pub timer_ticks: AtomicU32,
@@ -93,8 +92,7 @@ impl Runtime {
         Self {
             app_state: AtomicU32::new(APP_NONE),
             app_error: AtomicI32::new(0),
-            app_install_result: AtomicI32::new(0),
-            launcher_add_result: AtomicI32::new(0),
+            app_id: AtomicU32::new(0),
             last_error: AtomicI32::new(0),
             active_page: AtomicU32::new(0),
             timer_ticks: AtomicU32::new(0),
