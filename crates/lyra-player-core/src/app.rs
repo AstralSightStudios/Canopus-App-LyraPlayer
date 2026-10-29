@@ -239,12 +239,12 @@ impl LyraApp {
             // manager must not be touched; the user may also be on another
             // page or outside the app entirely.
             Action::Previous => {
-                if let Some(song) = self.adjacent_song(false) {
+                if let Some(song) = self.adjacent_song(false).cloned() {
                     self.play(song, &mut effects);
                 }
             }
             Action::Next => {
-                if let Some(song) = self.adjacent_song(true) {
+                if let Some(song) = self.adjacent_song(true).cloned() {
                     self.play(song, &mut effects);
                 }
             }
@@ -252,7 +252,7 @@ impl LyraApp {
                 let following = if self.mode == PlaybackMode::RepeatOne {
                     self.player.current.clone()
                 } else {
-                    self.adjacent_song(true)
+                    self.adjacent_song(true).cloned()
                 };
                 if let Some(song) = following {
                     self.play(song, &mut effects);
@@ -302,7 +302,7 @@ impl LyraApp {
         self.lyrics.active_index(self.player.position_ms)
     }
 
-    fn adjacent_song(&self, next: bool) -> Option<Song> {
+    fn adjacent_song(&self, next: bool) -> Option<&Song> {
         let id = self.player.current.as_ref()?.id;
         let tracks = &self.queue;
         let index = tracks.iter().position(|item| *item == id)?;
@@ -327,7 +327,7 @@ impl LyraApp {
             }
             PlaybackMode::Shuffle => {
                 if count == 1 {
-                    return self.player.current.clone();
+                    return self.player.current.as_ref();
                 }
                 // A whole shuffled ordering would have to survive library
                 // reloads and page changes; stepping to another track by a
@@ -338,11 +338,7 @@ impl LyraApp {
             }
         };
         let adjacent = tracks.get(adjacent)?;
-        self.library
-            .tracks
-            .iter()
-            .find(|song| song.id == *adjacent)
-            .cloned()
+        self.library.tracks.iter().find(|song| song.id == *adjacent)
     }
 
     fn play(&mut self, song: Song, effects: &mut Vec<Effect>) {

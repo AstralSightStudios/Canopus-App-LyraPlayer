@@ -11,7 +11,7 @@ use crate::astrobox::psys_host_v4::{
     dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
     ui,
 };
-use crate::state::{self, NeteaseView, Tab, UiState};
+use crate::state::{self, NeteaseView, PlaylistEditor, Tab, UiState};
 use crate::view::{Kind, On, View};
 use crate::{artwork, connect, id3, import, library, netease};
 
@@ -46,6 +46,9 @@ const EVENT_LIBRARY_MOVE_UP_PREFIX: &str = "action:library.move.up.";
 const EVENT_LIBRARY_MOVE_DOWN_PREFIX: &str = "action:library.move.down.";
 const EVENT_LIBRARY_DELETE_PREFIX: &str = "action:library.delete.";
 const EVENT_PL_CREATE: &str = "action:playlist.create";
+const EVENT_PL_NAME: &str = "input:playlist.name";
+const EVENT_PL_SAVE: &str = "action:playlist.save";
+const EVENT_PL_CANCEL: &str = "action:playlist.cancel";
 const EVENT_PL_RENAME_PREFIX: &str = "action:playlist.rename.";
 const EVENT_PL_DELETE_PREFIX: &str = "action:playlist.delete.";
 const EVENT_PL_TOGGLE_PREFIX: &str = "action:playlist.toggle.";
@@ -91,6 +94,13 @@ pub async fn on_event(event_id: &str, payload: &str) {
         EVENT_ARTIST => return state::with_state(|state| state.artist = value),
         EVENT_ALBUM => return state::with_state(|state| state.album = value),
         EVENT_QUERY => return state::with_state(|state| state.netease_query = value),
+        EVENT_PL_NAME => {
+            return state::with_state(|state| {
+                if let Some(editor) = &mut state.playlist_editor {
+                    editor.name = value;
+                }
+            });
+        }
         EVENT_DEVICE => state::with_state(|state| {
             if state.selected_addr != value {
                 state.device_library.clear();
@@ -101,6 +111,7 @@ pub async fn on_event(event_id: &str, payload: &str) {
                 state.library_busy = false;
                 state.library_target = None;
                 state.expanded_playlist = None;
+                state.playlist_editor = None;
             }
             state.selected_addr = value;
         }),
@@ -173,18 +184,24 @@ pub async fn on_event(event_id: &str, payload: &str) {
             }
         }),
         EVENT_LIBRARY_REFRESH => library::refresh().await,
-        EVENT_PL_CREATE => {
-            if let Some(name) = ask_name("新建歌单", "给歌单起个名字。", "新建").await {
-                library::create_playlist(&name).await;
+        EVENT_PL_CREATE => state::with_state(|state| {
+            state.playlist_editor = Some(PlaylistEditor::default());
+        }),
+        EVENT_PL_CANCEL => state::with_state(|state| state.playlist_editor = None),
+        EVENT_PL_SAVE => {
+            if let Some(editor) = state::snapshot().playlist_editor {
+                match editor.id {
+                    Some(id) => library::rename_playlist(id, &editor.name).await,
+                    None => library::create_playlist(&editor.name).await,
+                }
             }
         }
         event if event.starts_with(EVENT_PL_RENAME_PREFIX) => {
             if let Some(id) = id(event, EVENT_PL_RENAME_PREFIX) {
-                let current = playlist_name(id);
-                let content = format!("现在叫《{current}》，请输入新的名字。");
-                if let Some(name) = ask_name("重命名歌单", &content, "保存").await {
-                    library::rename_playlist(id, &name).await;
-                }
+                let name = playlist_name(id);
+                state::with_state(|state| {
+                    state.playlist_editor = Some(PlaylistEditor { id: Some(id), name })
+                });
             }
         }
         event if event.starts_with(EVENT_PL_DELETE_PREFIX) => {
@@ -272,22 +289,6 @@ fn dialog_buttons(cancel: &str, confirm: &str) -> Vec<DialogButton> {
             content: confirm.to_string(),
         },
     ]
-}
-
-/// Asks for a playlist name; `None` when cancelled or left empty.
-async fn ask_name(title: &str, content: &str, confirm: &str) -> Option<String> {
-    let result = dialog::show_dialog(
-        DialogType::Input,
-        DialogStyle::System,
-        DialogInfo {
-            title: title.to_string(),
-            content: content.to_string(),
-            buttons: dialog_buttons("取消", confirm),
-        },
-    )
-    .await;
-    let name = result.input_result.trim().to_string();
-    (result.clicked_btn_id == "confirm" && !name.is_empty()).then_some(name)
 }
 
 async fn confirm(title: &str, content: String, confirm: &str) -> bool {
@@ -1410,8 +1411,47 @@ fn library_rows(state: &UiState, playlists_ok: bool) -> Vec<View> {
 
 fn playlists_section(state: &UiState) -> View {
     let busy = state.library_busy || state.active;
-    let create = button("新建", EVENT_PL_CREATE, "soft", "blue", "2").disabled_if(busy);
-    let header = section_header("歌单", "歌单只引用歌曲：同一首歌可以放进多个歌单", Some(create));
+    let mut header = stack(12).child(section_header("歌单", "同一首歌可以放进多个歌单", None));
+    header = header.child(if let Some(editor) = &state.playlist_editor {
+        let creating = editor.id.is_none();
+        card()
+            .child(heading(
+                if creating {
+                    "新建歌单"
+                } else {
+                    "重命名歌单"
+                },
+                15,
+            ))
+            .child(
+                input("歌单名称", &editor.name, EVENT_PL_NAME)
+                    .prop("key", &format!("playlist-name-{:?}", editor.id))
+                    .disabled_if(busy),
+            )
+            .child(
+                row()
+                    .child(button("取消", EVENT_PL_CANCEL, "soft", "gray", "3").disabled_if(busy))
+                    .child(
+                        button(
+                            if creating {
+                                "新建歌单"
+                            } else {
+                                "保存名称"
+                            },
+                            EVENT_PL_SAVE,
+                            "solid",
+                            "blue",
+                            "3",
+                        )
+                        .grow()
+                        .disabled_if(busy),
+                    ),
+            )
+    } else {
+        button("新建歌单", EVENT_PL_CREATE, "soft", "blue", "3")
+            .width_full()
+            .disabled_if(busy)
+    });
     if state.device_playlists.is_empty() {
         return stack(12).child(header).child(empty_state("还没有歌单",
             "新建一个歌单，然后在歌曲的“⋯”菜单里把歌加进来。",
@@ -1555,7 +1595,51 @@ mod tests {
     fn event_ids_carry_their_numbers() {
         assert_eq!(ids("action:playlist.add.7.42", EVENT_PL_ADD_PREFIX), Some((7, 42)));
         assert_eq!(ids("action:playlist.add.7", EVENT_PL_ADD_PREFIX), None);
-        assert_eq!(id("action:library.delete.9", EVENT_LIBRARY_DELETE_PREFIX), Some(9));
+        assert_eq!(
+            id("action:library.delete.9", EVENT_LIBRARY_DELETE_PREFIX),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn playlist_editor_opens_accepts_text_and_cancels_without_a_host_dialog() {
+        use std::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+        let event = |id: &str, payload: &str| {
+            let mut future = pin!(on_event(id, payload));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(())
+            ));
+        };
+        state::with_state(|state| *state = UiState::default());
+        event(EVENT_PL_CREATE, "{}");
+        assert!(state::snapshot().playlist_editor.unwrap().id.is_none());
+        event(EVENT_PL_NAME, r#"{"value":"通勤歌单"}"#);
+        let snapshot = state::snapshot();
+        assert_eq!(snapshot.playlist_editor.as_ref().unwrap().name, "通勤歌单");
+        // A refresh/rerender keeps the typed draft in the visible input.
+        let tree = playlists_section(&snapshot).to_json(&mut 0).to_string();
+        assert!(tree.contains("通勤歌单") && tree.contains(EVENT_PL_SAVE));
+        event(EVENT_PL_CANCEL, "{}");
+        assert!(state::snapshot().playlist_editor.is_none());
+        state::with_state(|state| {
+            state.device_playlists.push(DevicePlaylist {
+                id: 7,
+                name: "夜跑".into(),
+                ..DevicePlaylist::default()
+            })
+        });
+        event("action:playlist.rename.7", "{}");
+        let editor = state::snapshot().playlist_editor.unwrap();
+        assert_eq!(editor.id, Some(7));
+        assert_eq!(editor.name, "夜跑");
+        state::with_state(|state| *state = UiState::default());
     }
 
     fn song(id: u64, name: &str, artist: &str, album: &str, seconds: u32) -> CloudSong {

@@ -50,7 +50,7 @@ const W_VIEW: usize = 9;
 /// Ticks are 100 ms. The lyric view returns to the active line this long after
 /// the finger leaves it.
 const BROWSE_HOLD_TICKS: u32 = 40;
-/// How long the volume read-out replaces the title (Band 10 Pro).
+/// How long the volume read-out replaces the title.
 const TOAST_TICKS: u32 = 15;
 /// How much of one 100 ms tick label creation may take: a little while the player page is in
 /// view (the user is pressing buttons), more once the lyric page is being waited for.
@@ -159,13 +159,13 @@ struct PlayerPage {
     bg: Obj,
     pager: Obj,
     cover: Obj,
+    cover_image: Obj,
     cover_placeholder: Obj,
     cover_path: Vec<u8>,
     title: Obj,
     artist: Obj,
     elapsed: Obj,
     remaining: Obj,
-    volume: Obj,
     bar_fill: Obj,
     back: Button,
     prev: Button,
@@ -196,7 +196,7 @@ struct PlayerPage {
     toast_until: u32,
     // what is on screen
     shown: Option<PlayerView>,
-    /// Band 10 Pro: the volume read-out has taken over the title line.
+    /// The volume read-out has taken over the title line.
     title_borrowed: bool,
     glyph_paths: [Option<Glyph>; 7],
     dot_page: usize,
@@ -283,7 +283,7 @@ unsafe fn text_label(
     rect: Rect,
     large: bool,
     centered: bool,
-    scrolling: bool,
+    single_line: bool,
     opa: u32,
 ) -> Obj {
     let label = unsafe { lvx_label_create(parent) };
@@ -305,8 +305,11 @@ unsafe fn text_label(
                 (prop::TEXT_ALIGN, if centered { 2 } else { 1 }),
             ],
         );
-        if scrolling {
-            lvx_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        if single_line {
+            // Circular scrolling continuously redraws both metadata lines (and
+            // even the offscreen lyrics header). Firmware rendering can starve
+            // the Bluetooth owner until the page closes or the screen sleeps.
+            lvx_label_set_long_mode(label, lv::LONG_DOT);
         }
         lv::resize(label, rect.w, rect.h);
         lv::place(label, rect.x, rect.y);
@@ -354,11 +357,6 @@ unsafe fn card_style(object: Obj) {
 /// The no-cover square: a lighter shade of the page's own colour.
 fn placeholder_color(palette: Palette) -> lyra_player_core::Rgb {
     palette.top.mix(lyra_player_core::Rgb(0xFFFFFF), 40)
-}
-
-/// The Band 11 volume level bar, centred in the read-out's slot.
-const fn volume_bar_rect() -> Rect {
-    Rect::new(M.volume.x + 4, M.volume.center_y() - 2, M.volume.w - 8, 4)
 }
 
 /// The page background colour at height `y`: the palette fades top to bottom.
@@ -448,11 +446,10 @@ unsafe fn build(root: Obj) -> i32 {
         }
         placeholder
     };
-    let cover = unsafe {
-        let cover = lvx_image_create(page_a);
+    let (cover, cover_image) = unsafe {
+        let cover = lv::container(page_a, M.cover.x, M.cover.y, M.cover.w, M.cover.h);
+        let mut image = lv::NULL;
         if !cover.is_null() {
-            lv::resize(cover, M.cover.w, M.cover.h);
-            lv::place(cover, M.cover.x, M.cover.y);
             lv::style(
                 cover,
                 &[(prop::RADIUS, COVER_RADIUS), (prop::CLIP_CORNER, 1)],
@@ -461,8 +458,12 @@ unsafe fn build(root: Obj) -> i32 {
             card_style(cover);
             lv::clear_flag(cover, flag::CLICKABLE | flag::SCROLLABLE);
             lv::show(cover, false);
+            image = lvx_image_create(cover);
+            if !image.is_null() {
+                lv::clear_flag(image, flag::CLICKABLE | flag::SCROLLABLE);
+            }
         }
-        cover
+        (cover, image)
     };
     let title = unsafe { text_label(page_a, M.title, true, true, true, 255) };
     let artist = unsafe { text_label(page_a, M.artist, false, true, true, 150) };
@@ -502,31 +503,6 @@ unsafe fn build(root: Obj) -> i32 {
     let next = unsafe { icon_button(page_a, M.next, Glyph::Next, W_NEXT, 255) };
     let vol_down = unsafe { icon_button(page_a, M.volume_down, Glyph::Minus, W_VOL_DOWN, 170) };
     let vol_up = unsafe { icon_button(page_a, M.volume_up, Glyph::Plus, W_VOL_UP, 170) };
-    // Band 11 has a row for the volume: a slim level bar between the two buttons.
-    let volume = if lv::BAND_11 {
-        unsafe {
-            let bar = volume_bar_rect();
-            let track = lv::container(page_a, bar.x, bar.y, bar.w, bar.h);
-            let fill = lv::container(page_a, bar.x, bar.y, bar.w, bar.h);
-            for (object, opa) in [(track, 64), (fill, 200)] {
-                if !object.is_null() {
-                    lv::style(
-                        object,
-                        &[
-                            (prop::RADIUS, 2),
-                            (prop::BG_COLOR, WHITE),
-                            (prop::BG_OPA, opa),
-                        ],
-                    );
-                    lv::clear_flag(object, flag::CLICKABLE | flag::SCROLLABLE);
-                }
-            }
-            fill
-        }
-    } else {
-        lv::NULL
-    };
-
     // --- lyrics ------------------------------------------------------------
     let ly_title = unsafe {
         let rect = Rect::new(
@@ -607,13 +583,13 @@ unsafe fn build(root: Obj) -> i32 {
             bg,
             pager,
             cover,
+            cover_image,
             cover_placeholder,
             cover_path: Vec::new(),
             title,
             artist,
             elapsed,
             remaining,
-            volume,
             bar_fill,
             back,
             prev,
@@ -736,7 +712,7 @@ extern "C" fn button_event(event: *mut c_void) {
                 W_VOL_DOWN => crate::target::PlayerEvent::VolumeDown,
                 _ => crate::target::PlayerEvent::VolumeUp,
             });
-            if matches!(widget, W_VOL_DOWN | W_VOL_UP) && !lv::BAND_11 {
+            if matches!(widget, W_VOL_DOWN | W_VOL_UP) {
                 page.toast_until = page.tick + TOAST_TICKS;
                 page.title_borrowed = true;
             }
@@ -809,30 +785,28 @@ extern "C" fn view_event(event: *mut c_void) {
 pub fn refresh() {
     let Some(page) = page() else { return };
     page.tick = page.tick.wrapping_add(1);
-    let frame = crate::target::player_frame();
+    let mut frame = crate::target::player_frame();
     unsafe {
-        page.apply_view(&frame);
+        page.apply_view(frame.view.take());
         page.apply_lyrics(&frame);
     }
 }
 
 impl PlayerPage {
-    unsafe fn apply_view(&mut self, frame: &PlayerFrame) {
-        let Some(view) = &frame.view else {
-            if self.shown.is_some() {
-                self.shown = None;
-            }
+    unsafe fn apply_view(&mut self, view: Option<PlayerView>) {
+        let Some(view) = view else {
+            self.shown = None;
             return;
         };
-        let previous = self.shown.clone();
+        let previous = self.shown.take();
         let changed = |f: &dyn Fn(&PlayerView) -> bool| previous.as_ref().is_none_or(f);
         // A freshly opened or resumed page shows the song at once; a change while it is open
         // animates.
         if changed(&|old| old.id != view.id) {
             if previous.is_some() {
-                self.begin_swap(view);
+                self.begin_swap(&view);
             } else {
-                unsafe { self.show_track(view) };
+                unsafe { self.show_track(&view) };
             }
         }
         if changed(&|old| old.palette != view.palette) {
@@ -883,7 +857,7 @@ impl PlayerPage {
             unsafe { self.set_glyph(self.mode, 1, glyph) };
         }
         if changed(&|old| old.volume != view.volume) || self.toast_active() || self.title_borrowed {
-            unsafe { self.show_volume(view) };
+            unsafe { self.show_volume(&view) };
         }
         if changed(&|old| old.error != view.error || old.transport != view.transport)
             && view.transport == Transport::Failed
@@ -892,11 +866,11 @@ impl PlayerPage {
                 unsafe { set_text(self.artist, error) };
             }
         }
-        self.shown = Some(view.clone());
+        self.shown = Some(view);
     }
 
     fn toast_active(&self) -> bool {
-        !lv::BAND_11 && self.tick < self.toast_until
+        self.tick < self.toast_until
     }
 
     unsafe fn show_track(&mut self, view: &PlayerView) {
@@ -909,7 +883,10 @@ impl PlayerPage {
             Some(path) => {
                 self.cover_path = lv::c_string(path);
                 unsafe {
-                    lvx_image_set_src(self.cover, self.cover_path.as_ptr().cast());
+                    lvx_image_set_src(self.cover_image, self.cover_path.as_ptr().cast());
+                    let scale = M.cover.w * 256 / i32::from(lyra_player_core::COVER_SIZE);
+                    lvx_image_set_scale(self.cover_image, scale, scale);
+                    lvx_object_align(self.cover_image, align::CENTER, 0, 0);
                     lv::show(self.cover, true);
                     lv::show(self.cover_placeholder, false);
                 }
@@ -954,11 +931,7 @@ impl PlayerPage {
 
     unsafe fn show_volume(&mut self, view: &PlayerView) {
         let text = alloc::format!("{}%", view.volume);
-        if lv::BAND_11 {
-            let bar = volume_bar_rect();
-            let width = (bar.w * i32::from(view.volume.min(100)) / 100).max(bar.h);
-            unsafe { lv::resize(self.volume, width, bar.h) };
-        } else if self.toast_active() {
+        if self.toast_active() {
             unsafe { set_text(self.title, &alloc::format!("音量 {text}")) };
         } else if self.title_borrowed {
             // The read-out is over: the title gets its line back.

@@ -59,6 +59,13 @@ pub struct DevicePlaylist {
     pub tracks: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PlaylistEditor {
+    /// `None` creates a playlist; `Some` renames the existing one.
+    pub id: Option<u64>,
+    pub name: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NeteaseView {
     #[default]
@@ -85,6 +92,7 @@ pub struct UiState {
     pub import_title: String,
     /// The watch playlist whose songs are listed open.
     pub expanded_playlist: Option<u64>,
+    pub playlist_editor: Option<PlaylistEditor>,
     pub devices: Vec<DeviceInfo>,
     pub selected_addr: String,
     pub audio: Option<SelectedFile>,

@@ -251,7 +251,6 @@ pub unsafe fn label(
 }
 
 pub const LONG_DOT: u32 = 1;
-pub const LONG_CIRCULAR: u32 = 3;
 
 pub unsafe fn set_text(label: Obj, text: &str) {
     if label.is_null() {

@@ -31,11 +31,11 @@ class Layout:
             self.home_row = lambda i: (w // 2, 98 + 72 * i)   # "all songs", then the playlists
             self.row = lambda i: (w // 2, 98 + 54 + 72 * i)   # song rows, below the two play buttons
             self.shuffle, self.loop = (54, 84), (158, 84)     # the play buttons above the songs
-            self.mini, self.mini_toggle = (90, 470), (180, 470)  # the now-playing bar and its button
+            self.mini, self.mini_toggle = (90, 434), (176, 434)  # the now-playing bar and its button
             self.icon = (106, 100)                            # Lyra's launcher icon after scrolling to the end
-            self.back, self.mode = (34, 36), (176, 36)
+            self.back, self.mode = (54, 60), (158, 60)
             self.prev, self.play, self.next = (40, 420), (106, 420), (172, 420)
-            self.vol_down, self.vol_up = (34, 483), (178, 483)
+            self.vol_down, self.vol_up = (76, 480), (136, 480)
             self.quiet = (106, 24)                            # inert spot that keeps the screen on
             self.lyrics_swipe = (190, 300, 20, 300)
             self.player_swipe = (20, 300, 190, 300)

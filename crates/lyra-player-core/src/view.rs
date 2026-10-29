@@ -32,6 +32,18 @@ pub enum Transport {
     Failed,
 }
 
+impl Transport {
+    pub fn of(state: PlaybackState) -> Self {
+        match state {
+            PlaybackState::Idle | PlaybackState::Finished => Self::Idle,
+            PlaybackState::Resolving | PlaybackState::Buffering => Self::Loading,
+            PlaybackState::Playing | PlaybackState::Draining => Self::Playing,
+            PlaybackState::Paused => Self::Paused,
+            PlaybackState::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerView {
     pub id: u64,
@@ -56,13 +68,7 @@ impl PlayerView {
         let song: &Song = app.player.current.as_ref()?;
         let position = app.player.position_ms;
         let duration = app.player.duration_ms.max(song.duration_ms);
-        let transport = match app.player.state {
-            PlaybackState::Idle | PlaybackState::Finished => Transport::Idle,
-            PlaybackState::Resolving | PlaybackState::Buffering => Transport::Loading,
-            PlaybackState::Playing | PlaybackState::Draining => Transport::Playing,
-            PlaybackState::Paused => Transport::Paused,
-            PlaybackState::Failed => Transport::Failed,
-        };
+        let transport = Transport::of(app.player.state);
         let progress = if duration == 0 {
             0
         } else {

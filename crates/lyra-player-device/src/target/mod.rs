@@ -139,7 +139,12 @@ pub enum LibraryTarget {
 pub fn library_key(page: usize) -> u64 {
     with_core(|core| {
         let current = core.app.player.current.as_ref().map_or(0, |song| song.id);
-        let transport = PlayerView::of(&core.app).map_or(0, |view| view.transport as u64 + 1);
+        let transport = core
+            .app
+            .player
+            .current
+            .as_ref()
+            .map_or(0, |_| Transport::of(core.app.player.state) as u64 + 1);
         let collection = match core.app.collection {
             Collection::Overview => 0,
             Collection::All => 1,

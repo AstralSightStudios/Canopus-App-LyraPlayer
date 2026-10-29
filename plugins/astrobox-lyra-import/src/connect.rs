@@ -38,6 +38,7 @@ pub async fn refresh_devices() {
                 .unwrap_or_default();
             state.device_library.clear();
             state.device_playlists.clear();
+            state.playlist_editor = None;
             state.device_version = 0;
             state.library_revision.clear();
             state.library_total = 0;

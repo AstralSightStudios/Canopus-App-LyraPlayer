@@ -74,8 +74,7 @@ pub struct Metrics {
     pub next: Rect,
     pub volume_down: Rect,
     pub volume_up: Rect,
-    /// The volume read-out: on Band 11 a level bar centred in this slot between
-    /// the buttons, on Band 10 Pro a transient label over the title.
+    /// The transient volume read-out over the title.
     pub volume: Rect,
     /// Centre line of the two page-indicator dots.
     pub dots_y: i32,
@@ -130,9 +129,9 @@ pub const LIST_BAND_11: ListMetrics = ListMetrics {
     thumb_radius: 8,
     text_x: 70,
     text_y: 3,
-    mini: Rect::new(8, 436, 196, 68),
+    mini: Rect::new(8, 400, 196, 68),
     mini_thumb: Rect::new(8, 8, 52, 52),
-    mini_button: Rect::new(152, 14, 40, 40),
+    mini_button: Rect::new(144, 10, 48, 48),
     action_h: 44,
 };
 
@@ -183,9 +182,11 @@ pub const BAND_11: Metrics = Metrics {
     height: 520,
     large_px: 28,
     small_px: 24,
-    back: Rect::new(14, 16, 40, 40),
-    mode: Rect::new(158, 16, 40, 40),
-    cover: Rect::new(18, 68, 176, 176),
+    // The narrow panel has semicircular ends. Keep the full button bounds
+    // inside them; a rectangular-screen bounds check alone misses clipping.
+    back: Rect::new(30, 36, 48, 48),
+    mode: Rect::new(134, 36, 48, 48),
+    cover: Rect::new(34, 100, 144, 144),
     title: Rect::new(12, 263, 188, 39),
     artist: Rect::new(12, 302, 188, 34),
     bar: Rect::new(18, 336, 176, 6),
@@ -194,9 +195,9 @@ pub const BAND_11: Metrics = Metrics {
     prev: Rect::new(12, 392, 56, 56),
     play: Rect::new(70, 384, 72, 72),
     next: Rect::new(144, 392, 56, 56),
-    volume_down: Rect::new(14, 466, 40, 34),
-    volume_up: Rect::new(158, 466, 40, 34),
-    volume: Rect::new(58, 466, 96, 34),
+    volume_down: Rect::new(52, 456, 48, 48),
+    volume_up: Rect::new(112, 456, 48, 48),
+    volume: Rect::new(12, 263, 188, 39),
     dots_y: 508,
     lyrics_header: Rect::new(0, 0, 212, 56),
     lyrics_view: Rect::new(0, 56, 212, 440),
@@ -347,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scrolling_title_stays_clear_of_the_cover_shadow() {
+    fn the_title_stays_clear_of_the_cover_shadow() {
         for metrics in BOTH {
             assert!(metrics.title.y >= metrics.cover.bottom() + cover_shadow_reach());
             assert!(metrics.volume.y >= metrics.cover.bottom() + cover_shadow_reach());
@@ -356,8 +357,6 @@ mod tests {
 
     #[test]
     fn labels_are_at_least_one_line_tall() {
-        // LVGL's circular long mode scrolls *vertically* when the line is
-        // taller than the box, so a short title in a short box would bounce.
         for metrics in BOTH {
             assert!(metrics.title.h >= metrics.large_line());
             assert!(metrics.artist.h >= metrics.small_line());
@@ -383,13 +382,52 @@ mod tests {
     fn controls_are_centred_and_the_cover_is_a_square() {
         for metrics in BOTH {
             assert_eq!(metrics.cover.w, metrics.cover.h);
-            assert_eq!(metrics.cover.w, i32::from(crate::COVER_SIZE));
+            assert!(metrics.cover.w <= i32::from(crate::COVER_SIZE));
             assert_eq!(metrics.cover.center_x(), metrics.width / 2);
             assert_eq!(metrics.play.center_x(), metrics.width / 2);
             assert_eq!(
                 metrics.play.center_x() - metrics.prev.center_x(),
                 metrics.next.center_x() - metrics.play.center_x()
             );
+        }
+    }
+
+    #[test]
+    fn narrow_panel_buttons_stay_inside_the_capsule_screen() {
+        let m = BAND_11;
+        let mini = LIST_BAND_11;
+        let mini_button = Rect::new(
+            mini.mini.x + mini.mini_button.x,
+            mini.mini.y + mini.mini_button.y,
+            mini.mini_button.w,
+            mini.mini_button.h,
+        );
+        let radius = m.width / 2;
+        for rect in [
+            m.back,
+            m.mode,
+            m.prev,
+            m.play,
+            m.next,
+            m.volume_down,
+            m.volume_up,
+            mini_button,
+        ] {
+            assert!(rect.w >= 48 && rect.h >= 48);
+            for x in [rect.x, rect.right()] {
+                for y in [rect.y, rect.bottom()] {
+                    let dy = if y < radius {
+                        radius - y
+                    } else {
+                        (y - (m.height - radius)).max(0)
+                    };
+                    let dx = x - radius;
+                    assert!(
+                        dx * dx + dy * dy <= radius * radius,
+                        "clipped touch target: {rect:?}"
+                    );
+                }
+            }
         }
     }
 

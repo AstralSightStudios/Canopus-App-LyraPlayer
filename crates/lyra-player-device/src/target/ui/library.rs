@@ -649,7 +649,7 @@ impl Mini {
                 M.small_line(),
                 false,
                 1,
-                lv::LONG_CIRCULAR,
+                lv::LONG_DOT,
                 255,
             )
         };

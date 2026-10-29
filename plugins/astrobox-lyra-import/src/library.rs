@@ -441,6 +441,9 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
                 state.library_target = None;
             });
             if status == Status::Ok {
+                if reply_op == op::PLAYLIST_UPSERT {
+                    state::with_state(|state| state.playlist_editor = None);
+                }
                 refresh().await;
             } else {
                 state::with_state(|state| state.status = format!("手表拒绝了该操作：{status:?}"));
