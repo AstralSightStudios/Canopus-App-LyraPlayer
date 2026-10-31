@@ -30,7 +30,6 @@ pub struct CloudSong {
     pub name: String,
     pub artists: Vec<String>,
     pub album: String,
-    pub album_id: u64,
     pub duration_ms: u32,
     pub cover_url: String,
 }
@@ -52,6 +51,21 @@ pub struct DeviceLibraryTrack {
     pub duration_ms: u32,
 }
 
+/// A playlist on the watch: only references to songs.
+#[derive(Clone, Debug, Default)]
+pub struct DevicePlaylist {
+    pub id: u64,
+    pub name: String,
+    pub tracks: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PlaylistEditor {
+    /// `None` creates a playlist; `Some` renames the existing one.
+    pub id: Option<u64>,
+    pub name: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NeteaseView {
     #[default]
@@ -61,17 +75,24 @@ pub enum NeteaseView {
     PlaylistTracks,
 }
 
+/// The page's three tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TransferMode {
+pub enum Tab {
     #[default]
-    Crc32,
-    Fast,
-    Ultra,
+    Cloud,
+    Local,
+    Library,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
     pub root: Option<String>,
+    pub tab: Tab,
+    /// The song the running (or last) import carries.
+    pub import_title: String,
+    /// The watch playlist whose songs are listed open.
+    pub expanded_playlist: Option<u64>,
+    pub playlist_editor: Option<PlaylistEditor>,
     pub devices: Vec<DeviceInfo>,
     pub selected_addr: String,
     pub audio: Option<SelectedFile>,
@@ -85,15 +106,17 @@ pub struct UiState {
     pub sent: u64,
     pub total: u64,
     pub speed_bytes_per_second: u64,
-    pub transfer_mode: TransferMode,
+    /// Average time the watch took to take one frame, over the last speed sample.
+    pub round_trip_ms: u32,
     pub active: bool,
     pub device_library: Vec<DeviceLibraryTrack>,
-    pub library_request_id: String,
     pub library_revision: String,
     pub library_total: usize,
     pub library_busy: bool,
     pub library_target: Option<u64>,
-    pub library_nonce: u64,
+    /// The protocol version the module on the watch speaks; 0 until it has answered.
+    pub device_version: u8,
+    pub device_playlists: Vec<DevicePlaylist>,
     pub netease_cookie: String,
     pub netease_view: NeteaseView,
     pub netease_audio_bitrate: u32,
@@ -112,10 +135,7 @@ static STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
 pub fn with_state<R>(f: impl FnOnce(&mut UiState) -> R) -> R {
     let mut state = STATE
         .get_or_init(|| {
-            Mutex::new(UiState {
-                transfer_mode: TransferMode::Crc32,
-                ..UiState::default()
-            })
+            Mutex::new(UiState::default())
         })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

@@ -6,6 +6,7 @@ use astrobox:psys-host/os;
 use astrobox:psys-host/transport;
 use astrobox:psys-host/ui;
 use astrobox:psys-host/ui-v3;
+use astrobox:psys-host/clipboard;
 use astrobox:psys-host/dialog;
 use astrobox:psys-host/device;
 use astrobox:psys-host/register;
@@ -27,6 +28,7 @@ world psys-world {
   import transport;
   import ui;
   import ui-v3;
+  import clipboard;
   import dialog;
   import device;
   import register;
@@ -48,6 +50,7 @@ world psys-world-v2 {
   import transport;
   import ui;
   import ui-v3;
+  import clipboard;
   import dialog;
   import device;
   import register;
@@ -68,6 +71,7 @@ world psys-world-v3 {
   import os;
   import transport;
   import ui-v3;
+  import clipboard;
   import dialog;
   import device;
   import register;
@@ -82,4 +86,62 @@ world psys-world-v3 {
 
   export lifecycle;
   export plugin-event-v3;
+}
+
+// API Level 4：独立的一套包（psys-host-v4 / psys-plugin-v4），全部走 `async func`，
+// 运行在 WASI p3 + 新版 wasmtime 上。Level 2/3 的世界完全不受影响。
+world psys-world-v4 {
+  import astrobox:psys-host-v4/os;
+  import astrobox:psys-host-v4/transport;
+  import astrobox:psys-host-v4/ui;
+  import astrobox:psys-host-v4/clipboard;
+  import astrobox:psys-host-v4/dialog;
+  import astrobox:psys-host-v4/device;
+  import astrobox:psys-host-v4/register;
+  import astrobox:psys-host-v4/event;
+  import astrobox:psys-host-v4/provider-callback;
+  import astrobox:psys-host-v4/queue;
+  import astrobox:psys-host-v4/timer;
+  import astrobox:psys-host-v4/interconnect;
+  import astrobox:psys-host-v4/thirdpartyapp;
+  import astrobox:psys-host-v4/watchface;
+  import astrobox:psys-host-v4/i18n;
+  import astrobox:psys-host-v4/http-server;
+  import astrobox:psys-host-v4/browser;
+  import astrobox:psys-host-v4/notification;
+  import astrobox:psys-host-v4/account;
+  import astrobox:psys-host-v4/canopusconnect;
+
+  export astrobox:psys-plugin-v4/lifecycle;
+  export astrobox:psys-plugin-v4/event;
+}
+
+// 需要内建 HTTP 服务器的 Level 4 插件用这个世界：在基础世界之上多导出一个
+// 请求处理接口。宿主仍按基础世界实例化，另外单独查找这个导出，因此不实现它的
+// 插件完全不受影响。
+world psys-world-v4-http {
+  include psys-world-v4;
+
+  export astrobox:psys-plugin-v4/http;
+}
+
+// 仅供宿主使用：单独把插件的 HTTP 处理导出拿出来做查找，因此不含任何 import。
+// 插件不要用这个世界，要用 `psys-world-v4-http`。
+world psys-plugin-http-export {
+  export astrobox:psys-plugin-v4/http;
+}
+
+// 需要接收 CanopusConnect 消息的 Level 4 插件用这个世界：在基础世界之上多导出一个
+// 消息处理接口，宿主同样单独查找这个导出。同时要 HTTP 的插件自己写一个 include
+// `psys-world-v4` 并导出两个接口的世界即可。
+world psys-world-v4-canopusconnect {
+  include psys-world-v4;
+
+  export astrobox:psys-plugin-v4/canopusconnect;
+}
+
+// 仅供宿主使用：单独把插件的 CanopusConnect 消息处理导出拿出来做查找，因此不含任何
+// import。插件不要用这个世界，要用 `psys-world-v4-canopusconnect`。
+world psys-plugin-canopusconnect-export {
+  export astrobox:psys-plugin-v4/canopusconnect;
 }

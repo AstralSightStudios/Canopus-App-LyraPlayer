@@ -22,6 +22,11 @@ interface transport {
     from-json: func(protocol: protocol, data: string) -> result<list<u8>>;
 }
 
+interface clipboard {
+    read-text: func() -> future<result<string>>;
+    write-text: func(text: string) -> future<result>;
+}
+
 interface dialog {
     enum dialog-type {
         ALERT,
@@ -350,8 +355,18 @@ interface ui-v3 {
         LONG-PRESS,
     }
 
+    // 插件UI实际可渲染区域的尺寸（CSS像素，已向下取整）。
+    record render-size {
+        width: u32,
+        height: u32,
+    }
+
     render:func(id:string,el:element);
     render-to-text-card:func(id:string,text:string);
+
+    // 获取当前插件UI渲染容器的尺寸，供插件做自适应布局。
+    // 若渲染区域尚未挂载或不可知，width/height 返回 0。
+    get-render-size: func() -> future<render-size>;
 }
 
 

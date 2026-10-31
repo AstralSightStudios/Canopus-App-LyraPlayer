@@ -1,80 +1,81 @@
-use wit_bindgen::FutureReader;
-
-use crate::exports::astrobox::psys_plugin::{event_v3 as event, event_v3::EventType, lifecycle};
+use crate::astrobox::psys_host_v4::canopusconnect::Payload;
+use crate::exports::astrobox::psys_plugin_v4::{
+    canopusconnect as plugin_connect, event, event::EventType, lifecycle,
+};
 
 mod artwork;
+mod connect;
 mod id3;
 mod import;
-mod interconnect;
 mod library;
+mod lyrics;
 mod netease;
 mod sniff;
 mod state;
 mod ui;
+mod view;
 
 wit_bindgen::generate!({
     path: "wit",
-    world: "psys-world-v3",
+    world: "psys-world-v4-canopusconnect",
     generate_all,
 });
 
 struct LyraImportPlugin;
 
 impl event::Guest for LyraImportPlugin {
-    fn on_event(event_type: EventType, event_payload: _rt::String) -> FutureReader<String> {
+    async fn on_event(event_type: EventType, event_payload: String) -> String {
         match event_type {
-            EventType::InterconnectMessage => {
-                if let Some(message) = interconnect::parse_event(&event_payload) {
-                    if !library::handle(&message.addr, &message.package, &message.payload) {
-                        wit_bindgen::block_on(import::handle(
-                            &message.addr,
-                            &message.package,
-                            &message.payload,
-                        ));
-                    }
+            EventType::DeviceAction => {
+                connect::refresh_devices().await;
+                ui::rerender();
+            }
+            EventType::Timer => {
+                if event_payload == import::STALL_TIMER_PAYLOAD {
+                    import::check_stall();
                     ui::rerender();
                 }
             }
-            EventType::DeviceAction => {
-                interconnect::refresh_devices();
-                ui::rerender();
-            }
-            EventType::PluginMessage
+            EventType::InterconnectMessage
+            | EventType::PluginMessage
             | EventType::ProviderAction
             | EventType::DeeplinkAction
-            | EventType::TransportPacket
-            | EventType::Timer => {}
+            | EventType::TransportPacket => {}
         }
-        immediate_string(String::new())
+        String::new()
     }
 
-    fn on_ui_event_v3(
-        event_id: _rt::String,
-        _event: event::Event,
-        event_payload: _rt::String,
-    ) -> FutureReader<_rt::String> {
-        ui::on_event(&event_id, &event_payload);
-        immediate_string(String::new())
+    async fn on_ui_event(event_id: String, _event: event::UiEvent, event_payload: String) -> String {
+        ui::on_event(&event_id, &event_payload).await;
+        String::new()
     }
 
-    fn on_ui_render(element_id: _rt::String) -> FutureReader<()> {
+    async fn on_ui_render(element_id: String) {
         ui::render_main_ui(&element_id);
-        immediate_unit()
     }
 
-    fn on_card_render(_card_id: _rt::String) -> FutureReader<()> {
-        immediate_unit()
+    async fn on_card_render(_card_id: String) {}
+}
+
+impl plugin_connect::Guest for LyraImportPlugin {
+    async fn on_message(device_addr: String, module: String, payload: Payload) {
+        if let Some(frame) = connect::binary_frame(&module, payload) {
+            if !import::on_frame(&device_addr, &frame).await {
+                library::on_frame(&device_addr, &frame).await;
+            }
+            ui::rerender();
+        }
     }
 }
 
 impl lifecycle::Guest for LyraImportPlugin {
-    fn on_load() {
+    async fn on_load() {
         tracing_subscriber::fmt()
             .with_writer(std::io::stdout)
             .with_ansi(false)
             .compact()
             .init();
-        interconnect::refresh_devices();
+        connect::refresh_devices().await;
         let restored = state::load_netease_session();
         state::with_state(|state| {
             state.netease_audio_bitrate =
@@ -82,30 +83,12 @@ impl lifecycle::Guest for LyraImportPlugin {
             if let Ok(Some(cookie)) = &restored {
                 state.netease_cookie = cookie.clone();
             }
-            state.status = match &restored {
-                Err(error) => error.clone(),
-                Ok(Some(_)) => "已恢复网易云登录状态。".to_string(),
-                Ok(None) if state.devices.is_empty() => "未发现已连接设备。".to_string(),
-                Ok(None) => "请打开手表上的 Lyra Import，然后选择本地或网易云音乐。".to_string(),
-            };
+            // The page itself shows the login and device state; only a problem needs words.
+            if let Err(error) = &restored {
+                state.status = error.clone();
+            }
         });
     }
-}
-
-fn immediate_string(value: String) -> FutureReader<String> {
-    let (writer, reader) = wit_future::new(String::new);
-    wit_bindgen::spawn(async move {
-        let _ = writer.write(value).await;
-    });
-    reader
-}
-
-fn immediate_unit() -> FutureReader<()> {
-    let (writer, reader) = wit_future::new::<()>(|| ());
-    wit_bindgen::spawn(async move {
-        let _ = writer.write(()).await;
-    });
-    reader
 }
 
 export!(LyraImportPlugin);

@@ -27,6 +27,8 @@ pub enum PlaybackMode {
     RepeatAll,
     /// Pick another track pseudo-randomly.
     Shuffle,
+    /// Replay this track on EOF; manual next/previous still change tracks.
+    RepeatOne,
 }
 
 impl PlaybackMode {
@@ -34,7 +36,8 @@ impl PlaybackMode {
         match self {
             Self::ListOnce => Self::RepeatAll,
             Self::RepeatAll => Self::Shuffle,
-            Self::Shuffle => Self::ListOnce,
+            Self::Shuffle => Self::RepeatOne,
+            Self::RepeatOne => Self::ListOnce,
         }
     }
 
@@ -43,8 +46,68 @@ impl PlaybackMode {
             Self::ListOnce => "列表播放",
             Self::RepeatAll => "循环播放",
             Self::Shuffle => "随机播放",
+            Self::RepeatOne => "单曲循环",
         }
     }
+}
+
+/// A media clock advanced by decoded samples, not by time since START. Waiting
+/// for AVDTP, starvation, pause and a busy UI therefore cannot run lyrics ahead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SampleClock {
+    frames: u32,
+    micros: u64,
+}
+
+impl SampleClock {
+    pub const fn new() -> Self {
+        Self {
+            frames: 0,
+            micros: 0,
+        }
+    }
+
+    pub fn reset(&mut self, position_ms: u32) {
+        self.frames = 0;
+        self.micros = u64::from(position_ms) * 1_000;
+    }
+
+    pub fn observe(&mut self, frames: u32, sample_rate: u32) -> u32 {
+        if sample_rate != 0 {
+            let delta = frames.wrapping_sub(self.frames);
+            self.micros = self
+                .micros
+                .saturating_add(u64::from(delta) * 1_000_000 / u64::from(sample_rate));
+            self.frames = frames;
+        }
+        self.position_ms()
+    }
+
+    pub fn position_ms(&self) -> u32 {
+        (self.micros / 1_000).min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Bytes the ID3v2 tag at the start of an MP3 takes (header, body and footer), read from the
+/// file's first ten bytes; `None` when the file starts with audio.
+///
+/// A tag often embeds the album art, several hundred KiB of it. Left in the stream, the decoder
+/// has to be fed all of it before the first frame, at the speed audio is fed -- seconds of
+/// silence at the start of a track -- so the player steps over it when it opens the file.
+pub fn id3v2_tag_len(header: &[u8]) -> Option<u32> {
+    let header = header.get(..10)?;
+    if &header[..3] != b"ID3"
+        || header[3] == 0xFF
+        || header[4] == 0xFF
+        || header[6..10].iter().any(|byte| byte & 0x80 != 0)
+    {
+        return None;
+    }
+    let body = header[6..10]
+        .iter()
+        .fold(0u32, |size, byte| (size << 7) | u32::from(*byte));
+    let footer = if header[5] & 0x10 != 0 { 10 } else { 0 };
+    Some(10 + body + footer)
 }
 
 /// A media control a headset gesture asked for, as delivered by the
@@ -290,6 +353,66 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_clock_waits_for_decode_and_freezes_on_starvation_or_pause() {
+        let mut clock = SampleClock::new();
+        for _ in 0..40 {
+            assert_eq!(clock.observe(0, 0), 0);
+        }
+        assert_eq!(clock.observe(44_100, 44_100), 1_000);
+        for _ in 0..40 {
+            assert_eq!(clock.observe(44_100, 44_100), 1_000);
+        }
+        assert_eq!(clock.observe(88_200, 44_100), 2_000);
+        clock.reset(30_000);
+        assert_eq!(clock.observe(48_000, 48_000), 31_000);
+    }
+
+    #[test]
+    fn sample_counter_wrap_does_not_rewind_or_jump() {
+        let mut clock = SampleClock {
+            frames: u32::MAX - 479,
+            micros: 7_000_000,
+        };
+        assert_eq!(clock.observe(480, 48_000), 7_020);
+    }
+
+    #[test]
+    fn id3v2_tag_length_covers_header_body_and_footer() {
+        // 1000 = 7 * 128 + 104 as a syncsafe integer.
+        let tag = *b"ID3\x04\x00\x00\x00\x00\x07\x68";
+        assert_eq!(id3v2_tag_len(&tag), Some(1_010));
+        let mut with_footer = tag;
+        with_footer[5] = 0x10;
+        assert_eq!(id3v2_tag_len(&with_footer), Some(1_020));
+        let largest = *b"ID3\x03\x00\x00\x7f\x7f\x7f\x7f";
+        assert_eq!(id3v2_tag_len(&largest), Some(10 + (1 << 28) - 1));
+    }
+
+    #[test]
+    fn audio_and_damaged_headers_are_not_tags() {
+        // An MPEG-1 Layer III frame header.
+        assert_eq!(id3v2_tag_len(&[0xff, 0xfb, 0x90, 0x64, 0, 0, 0, 0, 0, 0]), None);
+        // A size byte with its high bit set is not syncsafe.
+        assert_eq!(id3v2_tag_len(b"ID3\x04\x00\x00\x00\x00\x87\x68"), None);
+        assert_eq!(id3v2_tag_len(b"ID3\xff\x00\x00\x00\x00\x07\x68"), None);
+        assert_eq!(id3v2_tag_len(b"ID3\x04\x00"), None);
+    }
+
+    #[test]
+    fn modes_include_single_track_repeat() {
+        let mut mode = PlaybackMode::ListOnce;
+        for expected in [
+            PlaybackMode::RepeatAll,
+            PlaybackMode::Shuffle,
+            PlaybackMode::RepeatOne,
+            PlaybackMode::ListOnce,
+        ] {
+            mode = mode.next();
+            assert_eq!(mode, expected);
+        }
+    }
 
     #[test]
     fn headset_play_applies_only_to_a_paused_stream() {

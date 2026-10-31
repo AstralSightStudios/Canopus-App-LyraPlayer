@@ -1,382 +1,498 @@
-use serde::Deserialize;
-use serde_json::json;
+//! The watch's song list and playlists as the plugin shows them: read page by page,
+//! reordered and deleted through the same CanopusConnect channel the importer uses.
+//!
+//! A refresh is one chain of requests that share a request id: `HELLO` (which version
+//! does the module speak?), the songs, then -- for version 2 and up -- the playlists and
+//! the members of each.
 
-use crate::{interconnect, state};
+use std::{
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-pub const PAGE_SIZE: usize = 8;
+use lyra_protocol::{
+    MAX_PLAYLIST_NAME, MAX_PLAYLISTS, MIN_VERSION, Incoming, Reply, Request, Status, op,
+};
 
-#[derive(Deserialize)]
-struct Page {
-    #[serde(rename = "requestId")]
-    request_id: String,
-    revision: String,
-    offset: usize,
-    total: usize,
-    tracks: Vec<WireTrack>,
+use crate::{connect, state};
+
+pub const PAGE_SIZE: u8 = 8;
+/// Playlist members per request; the module never answers with more than 57 per frame.
+const MEMBER_PAGE: u8 = 56;
+const PLAYLIST_PAGE: u8 = 4;
+/// Request ids of this module start here; the importer's are below.
+const REQ_BASE: u16 = 0x8000;
+/// The first protocol version that has playlists.
+pub const PLAYLIST_VERSION: u8 = 2;
+
+enum Phase {
+    Hello,
+    Songs,
+    Playlists,
+    /// Members of the playlist at this index.
+    Members(usize),
 }
 
-#[derive(Deserialize)]
-struct WireTrack {
-    id: u64,
-    name: String,
-    #[serde(default)]
-    artists: Vec<String>,
-    #[serde(default)]
-    album: String,
-    #[serde(rename = "durationMs", default)]
-    duration_ms: u32,
+struct Refresh {
+    req: u16,
+    phase: Phase,
+    tracks: Vec<state::DeviceLibraryTrack>,
+    playlists: Vec<state::DevicePlaylist>,
 }
 
-pub fn refresh() {
+static NEXT_REQ: Mutex<u16> = Mutex::new(REQ_BASE);
+static LISTING: Mutex<Option<Refresh>> = Mutex::new(None);
+/// The request id of a pending move, delete or playlist change.
+static OPERATION: Mutex<Option<u16>> = Mutex::new(None);
+
+fn next_req() -> u16 {
+    let mut next = NEXT_REQ.lock().unwrap_or_else(|e| e.into_inner());
+    *next = if *next == u16::MAX { REQ_BASE } else { *next + 1 };
+    *next
+}
+
+async fn send(addr: &str, request: Request) -> Result<(), String> {
+    let frame = request.encode().map_err(|_| "内部错误".to_string())?;
+    connect::ensure_listening(addr).await?;
+    connect::send(addr, &frame).await
+}
+
+fn precheck(action: &str) -> Option<String> {
     let snapshot = state::snapshot();
     if snapshot.selected_addr.is_empty() {
         state::with_state(|state| state.status = "请先选择设备。".into());
-        return;
+        return None;
     }
     if snapshot.active {
-        state::with_state(|state| state.status = "请等待当前导入完成后再读取手表音乐。".into());
-        return;
+        state::with_state(|state| state.status = format!("请等待当前导入完成后再{action}。"));
+        return None;
     }
     if snapshot.library_busy {
         state::with_state(|state| state.status = "请等待当前音乐库操作完成。".into());
-        return;
+        return None;
     }
+    Some(snapshot.selected_addr)
+}
 
-    let request_id = next_request_id();
+pub async fn refresh() {
+    let Some(addr) = precheck("读取手表音乐") else {
+        return;
+    };
+    let req = next_req();
+    *LISTING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Refresh {
+        req,
+        phase: Phase::Hello,
+        tracks: Vec::new(),
+        playlists: Vec::new(),
+    });
     state::with_state(|state| {
-        state.library_request_id = request_id.clone();
         state.device_library.clear();
+        state.device_playlists.clear();
         state.library_revision.clear();
         state.library_total = 0;
         state.library_busy = true;
         state.library_target = None;
         state.status = "正在读取手表音乐列表…".into();
     });
-    send_list(&snapshot.selected_addr, &request_id, 0);
-}
-
-pub fn move_track(track_id: u64, direction: &str) {
-    let snapshot = state::snapshot();
-    if snapshot.selected_addr.is_empty() {
-        state::with_state(|state| state.status = "请先选择设备。".into());
-        return;
-    }
-    if snapshot.active {
-        state::with_state(|state| state.status = "请等待当前导入完成后再调整排序。".into());
-        return;
-    }
-    if snapshot.library_busy {
-        state::with_state(|state| state.status = "请等待当前音乐库操作完成。".into());
-        return;
-    }
-    if snapshot.library_revision.is_empty() {
-        state::with_state(|state| state.status = "请先刷新手表音乐列表。".into());
-        return;
-    }
-    if direction != "up" && direction != "down" {
-        state::with_state(|state| state.status = "无效的排序方向。".into());
-        return;
-    }
-
-    let request_id = next_request_id();
-    state::with_state(|state| {
-        state.library_request_id = request_id.clone();
-        state.library_target = Some(track_id);
-        state.library_busy = true;
-        state.status = "正在调整手表音乐顺序…".into();
-    });
-    let payload = json!({
-        "tag": "lyra-library-move",
-        "version": 1,
-        "requestId": request_id,
-        "revision": snapshot.library_revision,
-        "trackId": track_id,
-        "direction": direction,
-    });
-    if let Err(error) = wit_bindgen::block_on(interconnect::send(&snapshot.selected_addr, &payload))
-    {
-        state::with_state(|state| {
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = format!("调整手表音乐顺序失败：{error}");
-        });
+    let hello = Request::Hello {
+        req,
+        version: MIN_VERSION,
+    };
+    if let Err(error) = send(&addr, hello).await {
+        fail(&format!("无法读取手表音乐：{error}"));
     }
 }
 
-pub fn delete_track(track_id: u64) {
-    let snapshot = state::snapshot();
-    if snapshot.selected_addr.is_empty() {
-        state::with_state(|state| state.status = "请先选择设备。".into());
+pub async fn move_track(track_id: u64, direction: &str) {
+    let Some(addr) = precheck("调整顺序") else {
         return;
-    }
-    if snapshot.active {
-        state::with_state(|state| {
-            state.status = "请等待当前导入完成后再删除音乐。".into()
-        });
-        return;
-    }
-    if snapshot.library_busy {
-        state::with_state(|state| state.status = "请等待当前音乐库操作完成。".into());
-        return;
-    }
-    if snapshot.library_revision.is_empty() {
-        state::with_state(|state| state.status = "请先刷新手表音乐列表。".into());
-        return;
-    }
-
-    let request_id = next_request_id();
-    state::with_state(|state| {
-        state.library_request_id = request_id.clone();
-        state.library_target = Some(track_id);
-        state.library_busy = true;
-        state.status = "正在删除手表音乐…".into();
-    });
-    let payload = json!({
-        "tag": "lyra-library-delete",
-        "version": 1,
-        "requestId": request_id,
-        "revision": snapshot.library_revision,
-        "trackId": track_id,
-    });
-    if let Err(error) = wit_bindgen::block_on(interconnect::send(&snapshot.selected_addr, &payload))
-    {
-        state::with_state(|state| {
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = format!("删除手表音乐失败：{error}")
-        });
-    }
+    };
+    let request = Request::Move {
+        req: begin_operation(Some(track_id), "正在调整手表音乐顺序…"),
+        id: track_id,
+        up: direction == "up",
+    };
+    run(&addr, request, "调整手表音乐顺序失败").await;
 }
 
-fn next_request_id() -> String {
-    state::with_state(|state| {
-        state.library_nonce = state.library_nonce.wrapping_add(1);
-        format!("library-{}", state.library_nonce)
-    })
+pub async fn delete_track(track_id: u64) {
+    let Some(addr) = precheck("删除音乐") else {
+        return;
+    };
+    let request = Request::Delete {
+        req: begin_operation(Some(track_id), "正在删除手表音乐…"),
+        id: track_id,
+    };
+    run(&addr, request, "删除手表音乐失败").await;
 }
 
-fn send_list(addr: &str, request_id: &str, offset: usize) {
-    let payload = json!({
-        "tag": "lyra-library-list",
-        "version": 1,
-        "requestId": request_id,
-        "offset": offset,
-        "limit": PAGE_SIZE,
-    });
-    if let Err(error) = wit_bindgen::block_on(interconnect::send(addr, &payload)) {
+/// A new id for a playlist; the module only needs it to be non-zero and unused.
+fn new_playlist_id() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(1);
+    nanos.max(1)
+}
+
+fn playlists_supported() -> bool {
+    let version = state::snapshot().device_version;
+    if version < PLAYLIST_VERSION {
         state::with_state(|state| {
-            if state.selected_addr == addr && state.library_request_id == request_id {
-                state.library_busy = false;
-                state.library_target = None;
+            state.status = if version == 0 {
+                "请先刷新手表音乐，再管理歌单。".into()
+            } else {
+                "手表上的 Lyra Player 版本过旧，请先更新模块才能使用歌单。".into()
             }
-            state.status = format!("读取手表音乐失败：{error}");
         });
-    }
-}
-
-pub fn handle(addr: &str, package: &str, payload: &str) -> bool {
-    if package != interconnect::ROUTE_PACKAGE {
         return false;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return false;
-    };
-    let Some(tag) = value.get("tag").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    if tag == "lyra-import-error"
-        && value.get("code").and_then(serde_json::Value::as_str) == Some("invalid-request")
-        && value.get("message").and_then(serde_json::Value::as_str) == Some("unknown message tag")
-    {
-        state::with_state(|state| {
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = "当前快应用不支持音乐库管理，请更新 Lyra Import 快应用。".into();
-        });
-        return true;
-    }
-    if !tag.starts_with("lyra-library-") {
-        return false;
-    }
-
-    match tag {
-        "lyra-library-page" => handle_page(addr, value),
-        "lyra-library-error" => handle_error(addr, &value),
-        "lyra-library-moved" => handle_moved(addr, &value),
-        "lyra-library-deleted" => handle_deleted(addr, &value),
-        _ => {}
     }
     true
 }
 
-fn handle_page(addr: &str, value: serde_json::Value) {
-    let page = match serde_json::from_value::<Page>(value) {
-        Ok(page) => page,
-        Err(error) => {
+pub async fn create_playlist(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        state::with_state(|state| state.status = "请先输入歌单名称。".into());
+        return;
+    }
+    if name.len() > MAX_PLAYLIST_NAME {
+        state::with_state(|state| state.status = "歌单名称太长。".into());
+        return;
+    }
+    if !playlists_supported() {
+        return;
+    }
+    if state::snapshot().device_playlists.len() >= MAX_PLAYLISTS {
+        state::with_state(|state| state.status = format!("最多只能有 {MAX_PLAYLISTS} 个歌单。"));
+        return;
+    }
+    let Some(addr) = precheck("新建歌单") else {
+        return;
+    };
+    let request = Request::PlaylistUpsert {
+        req: begin_operation(None, "正在新建歌单…"),
+        id: new_playlist_id(),
+        name: name.to_string(),
+    };
+    run(&addr, request, "新建歌单失败").await;
+}
+
+pub async fn rename_playlist(id: u64, name: &str) {
+    let name = name.trim();
+    if name.is_empty() || name.len() > MAX_PLAYLIST_NAME {
+        state::with_state(|state| state.status = "歌单名称不能为空，也不能太长。".into());
+        return;
+    }
+    if !playlists_supported() {
+        return;
+    }
+    let Some(addr) = precheck("重命名歌单") else {
+        return;
+    };
+    let request = Request::PlaylistUpsert {
+        req: begin_operation(None, "正在重命名歌单…"),
+        id,
+        name: name.to_string(),
+    };
+    run(&addr, request, "重命名歌单失败").await;
+}
+
+pub async fn delete_playlist(id: u64) {
+    if !playlists_supported() {
+        return;
+    }
+    let Some(addr) = precheck("删除歌单") else {
+        return;
+    };
+    let request = Request::PlaylistDelete {
+        req: begin_operation(None, "正在删除歌单…"),
+        id,
+    };
+    run(&addr, request, "删除歌单失败").await;
+}
+
+pub async fn playlist_track(id: u64, track: u64, add: bool) {
+    if !playlists_supported() {
+        return;
+    }
+    let Some(addr) = precheck("调整歌单") else {
+        return;
+    };
+    let request = Request::PlaylistTrack {
+        req: begin_operation(Some(track), "正在调整歌单…"),
+        id,
+        track,
+        add,
+    };
+    run(&addr, request, "调整歌单失败").await;
+}
+
+fn begin_operation(target: Option<u64>, status: &str) -> u16 {
+    let req = next_req();
+    *OPERATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(req);
+    state::with_state(|state| {
+        state.library_target = target;
+        state.library_busy = true;
+        state.status = status.to_string();
+    });
+    req
+}
+
+async fn run(addr: &str, request: Request, failure: &str) {
+    if let Err(error) = send(addr, request).await {
+        fail(&format!("{failure}：{error}"));
+    }
+}
+
+fn fail(message: &str) {
+    *LISTING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *OPERATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    state::with_state(|state| {
+        state.library_busy = false;
+        state.library_target = None;
+        state.status = message.to_string();
+    });
+}
+
+/// What the listing does after a reply: send the next request, or it is complete.
+enum Next {
+    Send(Request),
+    Done,
+}
+
+/// A frame from the module; `true` when it answered one of this module's requests.
+pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
+    let Ok(Incoming::Reply(reply)) = Incoming::decode(frame) else {
+        return false;
+    };
+    match reply {
+        Reply::Hello {
+            req,
+            status,
+            version,
+            ..
+        } => {
+            let mut guard = LISTING.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(listing) = guard.as_mut().filter(|l| l.req == req) else {
+                return false;
+            };
+            if status != Status::Ok {
+                drop(guard);
+                fail("手表上的 Lyra Player 版本过旧，请先更新模块。");
+                return true;
+            }
+            listing.phase = Phase::Songs;
+            let next = Request::List {
+                req,
+                offset: 0,
+                max: PAGE_SIZE,
+            };
+            drop(guard);
+            state::with_state(|state| state.device_version = version);
+            advance(addr, Next::Send(next)).await;
+            true
+        }
+        Reply::List {
+            req,
+            status,
+            total,
+            offset,
+            entries,
+        } => {
+            let mut guard = LISTING.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(listing) = guard.as_mut().filter(|l| l.req == req) else {
+                return false;
+            };
+            if status != Status::Ok {
+                drop(guard);
+                fail("手表拒绝了音乐列表请求。");
+                return true;
+            }
+            let count = entries.len();
+            listing.tracks.extend(entries.into_iter().map(|entry| state::DeviceLibraryTrack {
+                id: entry.id,
+                name: entry.name,
+                artists: entry
+                    .artist
+                    .split(" / ")
+                    .filter(|artist| !artist.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                album: String::new(),
+                duration_ms: entry.duration_ms,
+            }));
+            let loaded = usize::from(offset) + count;
+            let next = if count > 0 && loaded < usize::from(total) {
+                Next::Send(Request::List {
+                    req,
+                    offset: loaded as u16,
+                    max: PAGE_SIZE,
+                })
+            } else if state::snapshot().device_version >= PLAYLIST_VERSION {
+                listing.phase = Phase::Playlists;
+                Next::Send(Request::Playlists {
+                    req,
+                    offset: 0,
+                    max: PLAYLIST_PAGE,
+                })
+            } else {
+                Next::Done
+            };
+            drop(guard);
+            advance(addr, next).await;
+            true
+        }
+        Reply::Playlists {
+            req,
+            status,
+            total,
+            offset,
+            entries,
+        } => {
+            let mut guard = LISTING.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(listing) = guard.as_mut().filter(|l| l.req == req) else {
+                return false;
+            };
+            if status != Status::Ok {
+                drop(guard);
+                fail("手表拒绝了歌单列表请求。");
+                return true;
+            }
+            let count = entries.len();
+            listing.playlists.extend(entries.into_iter().map(|entry| state::DevicePlaylist {
+                id: entry.id,
+                name: entry.name,
+                tracks: Vec::new(),
+            }));
+            let loaded = usize::from(offset) + count;
+            let next = if count > 0 && loaded < usize::from(total) {
+                Next::Send(Request::Playlists {
+                    req,
+                    offset: loaded as u16,
+                    max: PLAYLIST_PAGE,
+                })
+            } else {
+                members_or_done(listing, 0)
+            };
+            drop(guard);
+            advance(addr, next).await;
+            true
+        }
+        Reply::PlaylistTracks {
+            req,
+            status,
+            id,
+            total,
+            offset,
+            tracks,
+        } => {
+            let mut guard = LISTING.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(listing) = guard.as_mut().filter(|l| l.req == req) else {
+                return false;
+            };
+            let Phase::Members(index) = listing.phase else {
+                return false;
+            };
+            if status != Status::Ok || listing.playlists.get(index).map(|list| list.id) != Some(id) {
+                drop(guard);
+                fail("手表拒绝了歌单内容请求。");
+                return true;
+            }
+            let count = tracks.len();
+            listing.playlists[index].tracks.extend(tracks);
+            let loaded = usize::from(offset) + count;
+            let next = if count > 0 && loaded < usize::from(total) {
+                Next::Send(Request::PlaylistTracks {
+                    req,
+                    id,
+                    offset: loaded as u16,
+                    max: MEMBER_PAGE,
+                })
+            } else {
+                members_or_done(listing, index + 1)
+            };
+            drop(guard);
+            advance(addr, next).await;
+            true
+        }
+        Reply::Ack {
+            op: reply_op,
+            req,
+            status,
+            ..
+        } if matches!(
+            reply_op,
+            op::MOVE
+                | op::DELETE
+                | op::PLAYLIST_UPSERT
+                | op::PLAYLIST_DELETE
+                | op::PLAYLIST_TRACK
+        ) =>
+        {
+            let mut guard = OPERATION.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard != Some(req) {
+                return false;
+            }
+            *guard = None;
+            drop(guard);
             state::with_state(|state| {
                 state.library_busy = false;
                 state.library_target = None;
-                state.status = format!("手表音乐响应无效：{error}");
             });
-            return;
+            if status == Status::Ok {
+                if reply_op == op::PLAYLIST_UPSERT {
+                    state::with_state(|state| state.playlist_editor = None);
+                }
+                refresh().await;
+            } else {
+                state::with_state(|state| state.status = format!("手表拒绝了该操作：{status:?}"));
+            }
+            true
         }
-    };
-
-    let next = state::with_state(|state| {
-        if state.selected_addr != addr || state.library_request_id != page.request_id {
-            return None;
-        }
-        if page.offset != state.device_library.len() || page.total < page.offset {
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = "手表音乐分页顺序无效，请重新刷新。".into();
-            return None;
-        }
-        if !state.library_revision.is_empty() && state.library_revision != page.revision {
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = "读取期间手表音乐列表已变化，请重新刷新。".into();
-            return None;
-        }
-
-        state.library_revision = page.revision;
-        state.library_total = page.total;
-        let received = page.tracks.len();
-        state
-            .device_library
-            .extend(
-                page.tracks
-                    .into_iter()
-                    .map(|track| state::DeviceLibraryTrack {
-                        id: track.id,
-                        name: track.name,
-                        artists: track.artists,
-                        album: track.album,
-                        duration_ms: track.duration_ms,
-                    }),
-            );
-        if state.device_library.len() > state.library_total {
-            state.device_library.truncate(state.library_total);
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = "手表音乐分页数量无效，请重新刷新。".into();
-            return None;
-        }
-        if received == 0 && state.device_library.len() < state.library_total {
-            state.library_busy = false;
-            state.library_target = None;
-            state.status = "手表音乐分页提前结束，请重新刷新。".into();
-            return None;
-        }
-
-        state.status = format!(
-            "已读取 {}/{} 首手表音乐。",
-            state.device_library.len(),
-            state.library_total
-        );
-        let has_next = state.device_library.len() < state.library_total;
-        if !has_next {
-            state.library_busy = false;
-            state.library_target = None;
-        }
-        has_next.then(|| (state.library_request_id.clone(), state.device_library.len()))
-    });
-
-    if let Some((request_id, offset)) = next {
-        send_list(addr, &request_id, offset);
+        _ => false,
     }
 }
 
-fn handle_error(addr: &str, value: &serde_json::Value) {
-    let request_id = value
-        .get("requestId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let code = value
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    state::with_state(|state| {
-        if state.selected_addr != addr || state.library_request_id != request_id {
-            return;
+/// The request for the members of the playlist at `index`, or `Done` past the last one.
+fn members_or_done(listing: &mut Refresh, index: usize) -> Next {
+    match listing.playlists.get(index) {
+        Some(list) => {
+            listing.phase = Phase::Members(index);
+            Next::Send(Request::PlaylistTracks {
+                req: listing.req,
+                id: list.id,
+                offset: 0,
+                max: MEMBER_PAGE,
+            })
         }
-        state.library_busy = false;
-        state.library_target = None;
-        state.status = match code {
-            "invalid-request" => "当前快应用不支持该音乐库操作，请更新 Lyra Import 快应用。".into(),
-            "busy" => "快应用正在导入音乐，请稍后重试。".into(),
-            "conflict" => "手表音乐列表已变化，请刷新后再操作。".into(),
-            "boundary" => "这首歌曲已经位于列表边界。".into(),
-            "not-found" => "目标歌曲已不存在，请刷新手表音乐列表。".into(),
-            "invalid-library" => "手表音乐库文件无效，未执行操作。".into(),
-            "io-error" => "快应用读写手表音乐库失败，旧列表未被替换。".into(),
-            "response-too-large" => "单首音乐元数据过长，无法通过设备消息读取。".into(),
-            _ => format!("手表音乐操作失败：{code}"),
-        };
-    });
-}
-
-fn handle_moved(addr: &str, value: &serde_json::Value) {
-    let request_id = value
-        .get("requestId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let track_id = value.get("trackId").and_then(serde_json::Value::as_u64);
-    let revision_valid = value
-        .get("revision")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|revision| !revision.is_empty());
-    let accepted = state::with_state(|state| {
-        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-            || !revision_valid
-            || state.selected_addr != addr
-            || state.library_request_id != request_id
-            || state.library_target != track_id
-        {
-            return false;
-        }
-        state.library_busy = false;
-        state.library_target = None;
-        true
-    });
-    if accepted {
-        refresh();
+        None => Next::Done,
     }
 }
 
-fn handle_deleted(addr: &str, value: &serde_json::Value) {
-    let request_id = value
-        .get("requestId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let track_id = value.get("trackId").and_then(serde_json::Value::as_u64);
-    let revision_valid = value
-        .get("revision")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|revision| !revision.is_empty());
-    let cleanup_pending = value
-        .get("cleanupPending")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let accepted = state::with_state(|state| {
-        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-            || !revision_valid
-            || state.selected_addr != addr
-            || state.library_request_id != request_id
-            || state.library_target != track_id
-        {
-            return false;
+async fn advance(addr: &str, next: Next) {
+    match next {
+        Next::Send(request) => {
+            if let Err(error) = send(addr, request).await {
+                fail(&format!("无法读取手表音乐：{error}"));
+            }
         }
-        state.library_busy = false;
-        state.library_target = None;
-        state.status = if cleanup_pending {
-            "音乐已从列表删除，文件清理将在稍后重试。".into()
-        } else {
-            "音乐已删除，正在刷新手表音乐列表…".into()
-        };
-        true
-    });
-    if accepted {
-        refresh();
+        Next::Done => {
+            let finished = LISTING.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(listing) = finished else { return };
+            state::with_state(|state| {
+                state.library_total = listing.tracks.len();
+                state.library_revision = "ok".to_string();
+                state.device_library = listing.tracks;
+                state.device_playlists = listing.playlists;
+                state.library_busy = false;
+                state.library_target = None;
+                state.status = format!(
+                    "手表上有 {} 首歌曲、{} 个歌单。",
+                    state.library_total,
+                    state.device_playlists.len()
+                );
+            });
+        }
     }
 }

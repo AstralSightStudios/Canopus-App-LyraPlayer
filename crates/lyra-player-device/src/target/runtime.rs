@@ -9,7 +9,6 @@ use lyra_player_core::LyraApp;
 pub enum PendingAudioCommand {
     Stream(String),
     Toggle,
-    SetVolume(u8),
     Stop,
 }
 
@@ -20,16 +19,52 @@ pub const APP_FAILED: u32 = 3;
 
 pub struct Core {
     pub app: LyraApp,
-    pub audio: super::audio::AudioDevice,
     pub pending_audio: Option<PendingAudioCommand>,
+    pub pending_volume: Option<u8>,
+    pub audio_epoch: u32,
+}
+
+/// Only the Bluetooth owner accesses this state. No filesystem operation or
+/// audio ioctl runs while holding the app/UI lock.
+pub struct AudioOwner {
+    pub audio: super::audio::AudioDevice,
+    pub player: lyra_player_core::playback::Player,
+    pub epoch: u32,
+    pub error: Option<String>,
+}
+
+impl AudioOwner {
+    unsafe fn initialize_at(pointer: *mut Self) {
+        unsafe {
+            core::ptr::addr_of_mut!((*pointer).audio).write(super::audio::AudioDevice::new());
+            core::ptr::addr_of_mut!((*pointer).player).write(Default::default());
+            core::ptr::addr_of_mut!((*pointer).epoch).write(0);
+            core::ptr::addr_of_mut!((*pointer).error).write(None);
+        }
+    }
 }
 
 impl Core {
+    pub fn toggle_audio(&mut self) {
+        if matches!(
+            self.pending_audio,
+            Some(PendingAudioCommand::Stream(_) | PendingAudioCommand::Stop)
+        ) {
+            return;
+        }
+        self.pending_audio = if matches!(self.pending_audio, Some(PendingAudioCommand::Toggle)) {
+            None
+        } else {
+            Some(PendingAudioCommand::Toggle)
+        };
+    }
+
     unsafe fn initialize_at(pointer: *mut Self) {
         unsafe {
             core::ptr::addr_of_mut!((*pointer).app).write(LyraApp::default());
-            core::ptr::addr_of_mut!((*pointer).audio).write(super::audio::AudioDevice::new());
             core::ptr::addr_of_mut!((*pointer).pending_audio).write(None);
+            core::ptr::addr_of_mut!((*pointer).pending_volume).write(None);
+            core::ptr::addr_of_mut!((*pointer).audio_epoch).write(0);
         }
     }
 }
@@ -41,7 +76,14 @@ pub struct Runtime {
     pub last_error: AtomicI32,
     pub active_page: AtomicU32,
     pub timer_ticks: AtomicU32,
-    pub library_poll_tick: AtomicU32,
+    pub ui_ticks: AtomicU32,
+    /// What `connect::start` returned: 0 when the phone can import.
+    pub connect_result: AtomicI32,
+    /// Raised by the importer when it changed the library on disk.
+    pub library_dirty: AtomicBool,
+    pub library_loaded: AtomicBool,
+    /// `storage::library_stamp()` of the file that was last loaded.
+    pub library_stamp: AtomicU32,
     pub player_media_refresh_pending: AtomicBool,
 }
 
@@ -54,7 +96,11 @@ impl Runtime {
             last_error: AtomicI32::new(0),
             active_page: AtomicU32::new(0),
             timer_ticks: AtomicU32::new(0),
-            library_poll_tick: AtomicU32::new(0),
+            ui_ticks: AtomicU32::new(0),
+            connect_result: AtomicI32::new(-38),
+            library_dirty: AtomicBool::new(false),
+            library_loaded: AtomicBool::new(false),
+            library_stamp: AtomicU32::new(0),
             player_media_refresh_pending: AtomicBool::new(false),
         }
     }
@@ -62,6 +108,7 @@ impl Runtime {
 
 static mut RUNTIME: core::mem::MaybeUninit<Runtime> = core::mem::MaybeUninit::uninit();
 static CORE_PTR: AtomicUsize = AtomicUsize::new(0);
+static AUDIO_PTR: AtomicUsize = AtomicUsize::new(0);
 static CORE_LOCK: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 
@@ -75,14 +122,30 @@ pub fn prepare() {
         }
         CORE_PTR.store(pointer as usize, Ordering::Release);
     }
+    let mut audio = AUDIO_PTR.load(Ordering::Acquire) as *mut AudioOwner;
+    if audio.is_null() {
+        audio = unsafe { bt_alloc(core::mem::size_of::<AudioOwner>() as u32) }.cast();
+        if audio.is_null() {
+            READY.store(false, Ordering::Release);
+            return;
+        }
+        AUDIO_PTR.store(audio as usize, Ordering::Release);
+    }
     unsafe {
         core::ptr::addr_of_mut!(RUNTIME)
             .cast::<Runtime>()
             .write(Runtime::new());
         Core::initialize_at(pointer);
+        AudioOwner::initialize_at(audio);
     }
     CORE_LOCK.store(false, Ordering::Release);
     READY.store(true, Ordering::Release);
+}
+
+/// # Safety
+/// Call only on the serialized Bluetooth owner after `prepare`.
+pub unsafe fn audio_owner() -> &'static mut AudioOwner {
+    unsafe { &mut *(AUDIO_PTR.load(Ordering::Acquire) as *mut AudioOwner) }
 }
 
 pub fn runtime() -> &'static Runtime {

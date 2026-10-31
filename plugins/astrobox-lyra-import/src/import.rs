@@ -1,170 +1,117 @@
+//! One import at a time: prepares the files, says hello to the module on the watch and
+//! then follows the transfer with the shared sender (`lyra-transfer`), sending frames
+//! over CanopusConnect and feeding it what the watch answers.
+
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::Path,
     sync::{Mutex, OnceLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use crc32fast::Hasher as Crc32;
-use serde_json::{Value, json};
+use lyra_protocol::{Asset, Incoming, MIN_VERSION, Reply, Request, Status, TrackMeta};
+use lyra_transfer::{Failure, Sender, Source, State, specs};
 
-use crate::{interconnect, state};
+use crate::{artwork::Palette, astrobox::psys_host_v4::timer, connect, lyrics, state};
 
-const PROTOCOL_VERSION: u64 = 2;
-// Keep the serialized Base64/JSON chunk below the 48 KiB outgoing frame cap.
-const DEFAULT_CHUNK_BYTES: usize = 35 * 1024;
-const FAST_CHUNK_BYTES: usize = 36_608;
-const ULTRA_CHUNK_BYTES: usize = 36_753;
-const MAX_CHUNK_RETRIES: u8 = 2;
+/// The watch has to answer within this time or the import is given up.
+const STALL: Duration = Duration::from_secs(45);
+const HELLO_REQ: u16 = 1;
+pub const STALL_TIMER_PAYLOAD: &str = "lyra-import-stall";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChunkMode {
-    Crc32,
-    NoneFast,
-    NoneUltra,
+#[derive(Clone, Debug)]
+pub struct ImportAsset {
+    pub kind: Asset,
+    pub path: String,
+    /// For lyrics: "lrc" or "json".
+    pub format: &'static str,
 }
 
-impl ChunkMode {
-    fn checksum(self) -> &'static str {
-        match self {
-            Self::Crc32 => "crc32",
-            Self::NoneFast | Self::NoneUltra => "none",
+impl ImportAsset {
+    pub fn audio(path: String) -> Self {
+        Self {
+            kind: Asset::Audio,
+            path,
+            format: "mp3",
         }
     }
 
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Crc32 => "crc32",
-            Self::NoneFast => "none",
-            Self::NoneUltra => "none-48k",
+    pub fn cover(path: String) -> Self {
+        Self {
+            kind: Asset::Cover,
+            path,
+            format: "bin",
         }
     }
 
-    fn max_chunk_bytes(self) -> usize {
-        match self {
-            Self::Crc32 => DEFAULT_CHUNK_BYTES,
-            Self::NoneFast => FAST_CHUNK_BYTES,
-            Self::NoneUltra => ULTRA_CHUNK_BYTES,
+    pub fn lyrics(path: String, format: &'static str) -> Self {
+        Self {
+            kind: Asset::Lyrics,
+            path,
+            format,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct ImportAsset {
-    pub kind: &'static str,
-    pub path: String,
-    pub size: u64,
-    pub extension: Option<&'static str>,
-    pub format: Option<&'static str>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
+pub struct ImportRequest {
+    pub addr: String,
+    pub track_id: u64,
+    pub name: String,
+    pub artists: Vec<String>,
+    pub album: String,
+    pub duration_ms: u32,
+    pub palette: Palette,
+    pub assets: Vec<ImportAsset>,
 }
 
-impl ImportAsset {
-    pub fn audio(path: String, size: u64) -> Self {
-        Self {
-            kind: "audio",
-            path,
-            size,
-            extension: None,
-            format: None,
-            width: None,
-            height: None,
-        }
-    }
-
-    pub fn cover_bin(path: String, size: u64) -> Self {
-        Self {
-            kind: "cover",
-            path,
-            size,
-            extension: Some("bin"),
-            format: Some(crate::artwork::LVGL_V9_FORMAT),
-            width: Some(crate::artwork::COVER_WIDTH),
-            height: Some(crate::artwork::COVER_HEIGHT),
-        }
-    }
-
-    pub fn background_bin(background: crate::artwork::PreparedBackground) -> Self {
-        Self {
-            kind: "background",
-            path: background.path,
-            size: background.size,
-            extension: Some("bin"),
-            format: Some(crate::artwork::LVGL_V9_FORMAT),
-            width: Some(background.width),
-            height: Some(crate::artwork::BACKGROUND_HEIGHT),
-        }
-    }
-
-    pub fn lyrics(path: String, size: u64, format: &'static str) -> Self {
-        Self {
-            kind: "lyrics",
-            path,
-            size,
-            extension: None,
-            format: Some(format),
-            width: None,
-            height: None,
-        }
-    }
-}
-
-struct TransferAsset {
-    metadata: ImportAsset,
+/// `len` bytes of a file from `start` on.
+struct FileSource {
     file: File,
+    start: u64,
+    len: u32,
 }
 
-struct PendingChunk {
-    asset: &'static str,
-    seq: u64,
-    offset: u64,
-    bytes: Vec<u8>,
-    crc32: Option<String>,
-    retries: u8,
+impl Source for FileSource {
+    fn len(&self) -> u32 {
+        self.len
+    }
+
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<usize, String> {
+        let want = buf.len().min(self.len.saturating_sub(offset) as usize);
+        self.file
+            .seek(SeekFrom::Start(self.start + u64::from(offset)))
+            .and_then(|_| self.file.read(&mut buf[..want]))
+            .map_err(|error| error.to_string())
+    }
 }
 
-struct Transfer {
+struct Active {
     addr: String,
-    id: String,
-    track_id: u64,
-    name: String,
-    artists: Vec<String>,
-    album: String,
-    album_id: u64,
-    duration_ms: u32,
-    assets: Vec<TransferAsset>,
-    asset_index: usize,
-    chunk_bytes: usize,
-    seq: u64,
-    offset: u64,
-    sent_total: u64,
-    pending_chunk: Option<PendingChunk>,
-    last_ack_at: Option<Instant>,
-    last_ack_bytes: u64,
-    speed_bytes_per_second: u64,
-    artwork_supported: bool,
-    prefer_no_checksum: bool,
-    prefer_ultra: bool,
-    mode: ChunkMode,
-    awaiting: Awaiting,
+    sender: Sender,
+    /// The module has answered `HELLO`; until then nothing else is sent.
+    greeted: bool,
+    total: u64,
+    started: Instant,
+    last_progress: Instant,
+    /// Another call is already sending frames; others only feed events in.
+    pumping: bool,
+    speed_mark: (Instant, u64),
+    /// Time from handing a frame to the host until the watch took it, summed over the frames
+    /// answered since the speed was last published, and their count.
+    round_trips: (Duration, u32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Awaiting {
-    Hello,
-    Ready,
-    Ack,
-    AssetsDone,
-    Done,
+static ACTIVE: OnceLock<Mutex<Option<Active>>> = OnceLock::new();
+
+fn active() -> &'static Mutex<Option<Active>> {
+    ACTIVE.get_or_init(|| Mutex::new(None))
 }
 
-static TRANSFER: OnceLock<Mutex<Option<Transfer>>> = OnceLock::new();
-
-fn transfer() -> &'static Mutex<Option<Transfer>> {
-    TRANSFER.get_or_init(|| Mutex::new(None))
+fn lock() -> std::sync::MutexGuard<'static, Option<Active>> {
+    active().lock().unwrap_or_else(|item| item.into_inner())
 }
 
 /// Checks a picked file by its content rather than its name: on Android the
@@ -175,7 +122,7 @@ pub fn inspect_file(path: &str, name: &str, kind: &str) -> Result<state::Selecte
         return Err("selected file is empty".to_string());
     }
     let limit = match kind {
-        "audio" => 64 * 1024 * 1024,
+        "audio" => u64::from(lyra_protocol::MAX_AUDIO_BYTES),
         "cover" => 4 * 1024 * 1024,
         "lyrics" => 2 * 1024 * 1024,
         _ => return Err("unknown asset kind".to_string()),
@@ -217,80 +164,93 @@ pub fn inspect_file(path: &str, name: &str, kind: &str) -> Result<state::Selecte
     })
 }
 
-#[derive(Clone, Debug)]
-pub struct ImportRequest {
-    pub addr: String,
-    pub track_id: u64,
-    pub name: String,
-    pub artists: Vec<String>,
-    pub album: String,
-    pub album_id: u64,
-    pub duration_ms: u32,
-    pub assets: Vec<ImportAsset>,
+fn open(path: &str) -> Result<Box<dyn Source>, String> {
+    let file = File::open(path).map_err(|error| format!("无法打开 {path}：{error}"))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("无法读取 {path}：{error}"))?
+        .len();
+    let len = u32::try_from(len).map_err(|_| "文件过大".to_string())?;
+    Ok(Box::new(FileSource {
+        file,
+        start: 0,
+        len,
+    }))
+}
+
+/// The audio frames of an MP3 without its tags (see [`crate::id3::audio_range`]).
+fn open_audio(path: &str) -> Result<Box<dyn Source>, String> {
+    let mut file = File::open(path).map_err(|error| format!("无法打开 {path}：{error}"))?;
+    let (start, end) =
+        crate::id3::audio_range(&mut file).map_err(|error| format!("无法读取 {path}：{error}"))?;
+    let len = u32::try_from(end - start).map_err(|_| "文件过大".to_string())?;
+    Ok(Box::new(FileSource { file, start, len }))
+}
+
+/// The sender for a request: files opened, lyrics normalised to LRC, sizes and CRCs
+/// computed.
+fn prepare(request: &ImportRequest) -> Result<Sender, String> {
+    if request.addr.is_empty() {
+        return Err("请选择已连接设备".to_string());
+    }
+    let mut sources: Vec<(Asset, Box<dyn Source>)> = Vec::new();
+    for asset in &request.assets {
+        let source: Box<dyn Source> = match asset.kind {
+            Asset::Lyrics => {
+                let bytes = fs::read(&asset.path).map_err(|error| format!("无法读取歌词：{error}"))?;
+                match lyrics::to_lrc(&bytes, asset.format) {
+                    Ok(lrc) => Box::new(lrc),
+                    Err(error) => {
+                        tracing::warn!(%error, "lyrics skipped");
+                        continue;
+                    }
+                }
+            }
+            Asset::Audio => open_audio(&asset.path)?,
+            Asset::Cover => open(&asset.path)?,
+        };
+        sources.push((asset.kind, source));
+    }
+    if !sources.iter().any(|(kind, _)| *kind == Asset::Audio) {
+        return Err("缺少音频文件".to_string());
+    }
+    sources.sort_by_key(|(kind, _)| *kind as u8);
+    let assets = specs(&mut sources)?;
+    let meta = TrackMeta {
+        id: request.track_id,
+        duration_ms: request.duration_ms,
+        name: request.name.clone(),
+        artists: request.artists.clone(),
+        album: request.album.clone(),
+        palette_top: request.palette.top,
+        palette_bottom: request.palette.bottom,
+        assets,
+    };
+    Ok(Sender::new(meta, sources.into_iter().map(|(_, source)| source).collect()))
 }
 
 pub async fn start(request: ImportRequest) -> Result<(), String> {
-    let ImportRequest {
-        addr,
-        track_id,
-        name,
-        artists,
-        album,
-        album_id,
-        duration_ms,
-        assets,
-    } = request;
-    if addr.is_empty() {
-        return Err("请选择已连接设备".to_string());
+    if lock().is_some() {
+        return Err("已有导入任务正在运行".to_string());
     }
-    validate_assets(&assets)?;
-    let mut transfer_assets = Vec::with_capacity(assets.len());
-    for asset in assets {
-        let file = File::open(&asset.path)
-            .map_err(|error| format!("cannot open {}: {error}", asset.kind))?;
-        transfer_assets.push(TransferAsset {
-            metadata: asset,
-            file,
-        });
-    }
-    let total = transfer_assets
-        .iter()
-        .map(|asset| asset.metadata.size)
-        .sum();
-    let id = new_id();
-    let started_at = Instant::now();
-    let transfer_mode = state::snapshot().transfer_mode;
-    let prefer_no_checksum = transfer_mode != state::TransferMode::Crc32;
-    let prefer_ultra = transfer_mode == state::TransferMode::Ultra;
+    let sender = prepare(&request)?;
+    let total = sender.total_bytes();
+    let addr = request.addr;
     {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
+        let mut guard = lock();
         if guard.is_some() {
             return Err("已有导入任务正在运行".to_string());
         }
-        *guard = Some(Transfer {
+        *guard = Some(Active {
             addr: addr.clone(),
-            id,
-            track_id,
-            name,
-            artists,
-            album,
-            album_id,
-            duration_ms,
-            assets: transfer_assets,
-            asset_index: 0,
-            chunk_bytes: DEFAULT_CHUNK_BYTES,
-            seq: 0,
-            offset: 0,
-            sent_total: 0,
-            pending_chunk: None,
-            last_ack_at: Some(started_at),
-            last_ack_bytes: 0,
-            speed_bytes_per_second: 0,
-            artwork_supported: false,
-            prefer_no_checksum,
-            prefer_ultra,
-            mode: ChunkMode::Crc32,
-            awaiting: Awaiting::Hello,
+            sender,
+            greeted: false,
+            total,
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            pumping: false,
+            speed_mark: (Instant::now(), 0),
+            round_trips: (Duration::ZERO, 0),
         });
     }
     state::with_state(|state| {
@@ -298,741 +258,259 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
         state.sent = 0;
         state.total = total;
         state.speed_bytes_per_second = 0;
-        state.status = "正在连接 Lyra Import 快应用…".to_string();
+        state.round_trip_ms = 0;
+        state.status = "正在连接手表上的 Lyra Player…".to_string();
     });
-    if let Err(error) = interconnect::send(
-        &addr,
-        &json!({ "tag": "lyra-import-hello", "version": PROTOCOL_VERSION }),
-    )
-    .await
-    {
-        finish_error(&error);
-        return Err(error);
+    let hello = Request::Hello {
+        req: HELLO_REQ,
+        version: MIN_VERSION,
     }
+    .encode()
+    .map_err(|_| "内部错误".to_string());
+    let result = match hello {
+        Ok(frame) => match connect::ensure_listening(&addr).await {
+            Ok(()) => connect::send(&addr, &frame).await,
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        let message = format!("无法联系手表上的 Lyra Player（请确认模块已启用、手表已连接）：{error}");
+        finish_error(&message);
+        return Err(message);
+    }
+    arm_watchdog();
     Ok(())
 }
 
-pub async fn handle(addr: &str, package: &str, payload: &str) {
-    if package != interconnect::ROUTE_PACKAGE {
-        return;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return;
-    };
-    let Some(tag) = value.get("tag").and_then(Value::as_str) else {
-        return;
-    };
-    if !tag.starts_with("lyra-import-") || !matches_active_peer(addr, tag, &value) {
-        return;
-    }
-    let result = match tag {
-        "lyra-import-hello" => handle_hello(addr, &value).await,
-        "lyra-import-ready" => handle_ready(addr, &value).await,
-        "lyra-import-ack" => handle_ack(addr, &value).await,
-        "lyra-import-retry" => handle_retry(addr, &value).await,
-        "lyra-import-assets-done" => handle_assets_done(addr, &value).await,
-        "lyra-import-done" => handle_done(addr, &value),
-        "lyra-import-cancelled" => Err("快应用已取消导入".to_string()),
-        "lyra-import-error" => {
-            let code = value.get("code").and_then(Value::as_str).unwrap_or("error");
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("quick app rejected import");
-            Err(format!("{code}: {message}"))
-        }
-        _ => Ok(()),
-    };
-    if let Err(error) = result {
-        finish_error(&error);
-    }
+fn arm_watchdog() {
+    timer::set_timeout(STALL.as_millis() as u64, STALL_TIMER_PAYLOAD);
 }
 
-/// Background widths the quick app declared in its hello. Quick apps without
-/// the field accept only the original 10 Pro width.
-fn accepted_background_widths(hello: &Value) -> Vec<u32> {
-    match hello.get("backgroundWidths").and_then(Value::as_array) {
-        Some(items) => items
-            .iter()
-            .filter_map(Value::as_u64)
-            .filter_map(|width| u32::try_from(width).ok())
-            .collect(),
-        None => vec![crate::artwork::DeviceProfile::Band10Pro.background_width()],
-    }
-}
-
-async fn handle_hello(addr: &str, value: &Value) -> Result<(), String> {
-    if value.get("version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
-        || value.get("window").and_then(Value::as_u64) != Some(1)
+/// A frame the Lyra Player module sent; `true` when it belonged to the running import.
+pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
+    let Ok(incoming) = Incoming::decode(frame) else {
+        return false;
+    };
+    let mut hello_failed = None;
+    let mut start_pumping = false;
     {
-        return Err("快应用不支持 Lyra Import v2 单窗口协议".to_string());
-    }
-    let supports_base64 = value
-        .get("encodings")
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("base64")));
-    if !supports_base64 {
-        return Err("快应用不支持 base64 分片".to_string());
-    }
-    let supports_no_checksum = value
-        .get("checksums")
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("none")));
-    let supports_ultra = value
-        .get("chunkModes")
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("none-48k")));
-    let supports_artwork = value
-        .get("assets")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| item.as_str() == Some("cover"))
-                && items.iter().any(|item| item.as_str() == Some("background"))
-        })
-        && value
-            .get("imageFormats")
-            .and_then(Value::as_array)
-            .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item.as_str() == Some(crate::artwork::LVGL_V9_FORMAT))
-            });
-    let begin = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        validate_peer(item, addr, Awaiting::Hello, None)?;
-        item.artwork_supported = supports_artwork;
-        item.mode = if item.prefer_ultra && supports_no_checksum && supports_ultra {
-            ChunkMode::NoneUltra
-        } else if item.prefer_no_checksum && supports_no_checksum {
-            ChunkMode::NoneFast
-        } else {
-            ChunkMode::Crc32
+        let mut guard = lock();
+        let Some(active) = guard.as_mut() else {
+            return false;
         };
-        let max = value
-            .get("maxChunkBytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_CHUNK_BYTES as u64) as usize;
-        let mode_limit = item.mode.max_chunk_bytes();
-        let asset_count = item.assets.len();
-        if !supports_artwork {
-            item.assets.retain(|asset| {
-                asset.metadata.kind != "background"
-                    && asset.metadata.format != Some(crate::artwork::LVGL_V9_FORMAT)
-            });
-        } else {
-            // A quick app that predates per-device backgrounds only accepts
-            // the 10 Pro width and would reject the whole import otherwise.
-            let background_widths = accepted_background_widths(value);
-            item.assets.retain(|asset| {
-                asset.metadata.kind != "background"
-                    || asset
-                        .metadata
-                        .width
-                        .is_some_and(|width| background_widths.contains(&width))
-            });
+        if active.addr != addr {
+            return false;
         }
-        if item.assets.len() != asset_count {
-            let total = item.assets.iter().map(|asset| asset.metadata.size).sum();
-            state::with_state(|state| state.total = total);
-        }
-        item.chunk_bytes = mode_limit.min(max.max(1));
-        item.awaiting = Awaiting::Ready;
-        let assets = item
-            .assets
-            .iter()
-            .map(|asset| {
-                let mut value = json!({ "kind": asset.metadata.kind, "size": asset.metadata.size });
-                if let Some(extension) = asset.metadata.extension {
-                    value["extension"] = Value::String(extension.to_string());
-                }
-                if let Some(format) = asset.metadata.format {
-                    value["format"] = Value::String(format.to_string());
-                }
-                if let Some(width) = asset.metadata.width {
-                    value["width"] = Value::from(width);
-                }
-                if let Some(height) = asset.metadata.height {
-                    value["height"] = Value::from(height);
-                }
-                value
-            })
-            .collect::<Vec<_>>();
-        json!({
-            "tag": "lyra-import-begin",
-            "version": PROTOCOL_VERSION,
-            "id": item.id,
-            "track": {
-                "id": item.track_id,
-                "name": item.name,
-                "artists": item.artists,
-                "album": item.album,
-                "albumId": item.album_id,
-                "durationMs": item.duration_ms,
-            },
-            "assets": assets,
-            "checksum": item.mode.checksum(),
-            "chunkMode": item.mode.as_str(),
-        })
-    };
-    let mode = transfer()
-        .lock()
-        .unwrap_or_else(|item| item.into_inner())
-        .as_ref()
-        .map(|item| item.mode)
-        .unwrap_or(ChunkMode::Crc32);
-    let mode_label = match mode {
-        ChunkMode::Crc32 => "CRC32 校验模式",
-        ChunkMode::NoneFast => "无校验高速模式",
-        ChunkMode::NoneUltra => "无校验超高速模式（48 KiB 单包上限）",
-    };
-    state::with_state(|state| {
-        state.status = if supports_artwork {
-            format!("快应用已连接，正在准备存储（{mode_label}）…")
-        } else {
-            format!("快应用版本不支持 BIN 封面/背景，将仅导入音频和歌词（{mode_label}）…")
-        };
-    });
-    interconnect::send(addr, &begin).await
-}
-
-async fn handle_ready(addr: &str, value: &Value) -> Result<(), String> {
-    {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        validate_peer(
-            item,
-            addr,
-            Awaiting::Ready,
-            value.get("id").and_then(Value::as_str),
-        )?;
-        let asset = item
-            .assets
-            .get(item.asset_index)
-            .ok_or_else(|| "资源索引越界".to_string())?;
-        if value.get("asset").and_then(Value::as_str) != Some(asset.metadata.kind)
-            || value.get("nextSeq").and_then(Value::as_u64) != Some(0)
-            || value.get("nextOffset").and_then(Value::as_u64) != Some(0)
-            || value.get("window").and_then(Value::as_u64) != Some(1)
+        active.last_progress = Instant::now();
+        if active.greeted {
+            active.sender.on_frame(frame);
+            start_pumping = true;
+        } else if let Incoming::Reply(Reply::Hello {
+            req,
+            status,
+            version,
+            ..
+        }) = incoming
         {
-            return Err("快应用返回了无效资源起点".to_string());
-        }
-        let ready_checksum = value.get("checksum").and_then(Value::as_str);
-        if (ready_checksum.is_some() && ready_checksum != Some(item.mode.checksum()))
-            || (item.mode != ChunkMode::Crc32 && ready_checksum.is_none())
-        {
-            return Err("快应用返回的校验模式不一致".to_string());
-        }
-        let ready_mode = value.get("chunkMode").and_then(Value::as_str);
-        if (ready_mode.is_some() && ready_mode != Some(item.mode.as_str()))
-            || (item.mode == ChunkMode::NoneUltra && ready_mode.is_none())
-        {
-            return Err("快应用返回的分片模式不一致".to_string());
-        }
-        let max = value
-            .get("maxChunkBytes")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "快应用未返回分片上限".to_string())? as usize;
-        let mode_limit = item.mode.max_chunk_bytes();
-        item.chunk_bytes = item.chunk_bytes.min(max.clamp(1, mode_limit));
-    }
-    update_asset_status();
-    send_next_chunk(addr).await
-}
-
-async fn handle_ack(addr: &str, value: &Value) -> Result<(), String> {
-    let (completed, confirmed, speed) = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        validate_peer(
-            item,
-            addr,
-            Awaiting::Ack,
-            value.get("id").and_then(Value::as_str),
-        )?;
-        let asset = &item.assets[item.asset_index].metadata;
-        let pending = item
-            .pending_chunk
-            .as_ref()
-            .ok_or_else(|| "没有等待确认的分片".to_string())?;
-        if pending.asset != asset.kind
-            || value.get("asset").and_then(Value::as_str) != Some(asset.kind)
-            || value.get("nextSeq").and_then(Value::as_u64) != Some(item.seq)
-            || value.get("nextOffset").and_then(Value::as_u64) != Some(item.offset)
-            || value.get("receivedBytes").and_then(Value::as_u64) != Some(item.sent_total)
-        {
-            return Err("累计 ACK 与已发送位置不一致".to_string());
-        }
-        item.pending_chunk = None;
-        let now = Instant::now();
-        let speed = item.last_ack_at.map_or(0, |last| {
-            let elapsed = now.duration_since(last).as_secs_f64();
-            let delta = item.sent_total.saturating_sub(item.last_ack_bytes);
-            if elapsed == 0.0 {
-                item.speed_bytes_per_second
-            } else {
-                let sample = (delta as f64 / elapsed) as u64;
-                if item.speed_bytes_per_second == 0 {
-                    sample
+            if req == HELLO_REQ {
+                if status == Status::Ok && version >= 1 {
+                    active.greeted = true;
+                    start_pumping = true;
                 } else {
-                    (item.speed_bytes_per_second.saturating_mul(3) + sample) / 4
+                    hello_failed = Some("手表上的 Lyra Player 版本过旧，请先更新模块。".to_string());
                 }
             }
-        });
-        item.last_ack_at = Some(now);
-        item.last_ack_bytes = item.sent_total;
-        item.speed_bytes_per_second = speed;
-        (item.offset == asset.size, item.sent_total, speed)
+        }
+    }
+    if let Some(error) = hello_failed {
+        *lock() = None;
+        finish_error(&error);
+        return true;
+    }
+    if start_pumping {
+        pump().await;
+    }
+    true
+}
+
+/// Frames kept on their way to the watch at once. Every frame waits a Bluetooth round trip for its
+/// answer, so this many frames per round trip is the speed of an import. The host decides how many
+/// really are in flight: as many as the watch's request ring holds less the slot it keeps for the
+/// Manager -- 15 on a Supervisor with the deep ring, 3 on older ones -- and holds the rest back,
+/// in order. Asking for more than the host allows only queues them there.
+const IN_FLIGHT: usize = 15;
+
+/// Sends every frame the sender has ready, [`IN_FLIGHT`] at a time. Only one call does this at a
+/// time; events that arrive meanwhile are fed in by `on_frame` and picked up by the running loop.
+async fn pump() {
+    {
+        let mut guard = lock();
+        let Some(active) = guard.as_mut() else { return };
+        if active.pumping {
+            return;
+        }
+        active.pumping = true;
+    }
+    let mut sends = FuturesUnordered::new();
+    loop {
+        // Top the window up with whatever the sender has ready. The frames are started in the order
+        // the sender made them, and the host queues them to the watch in that order.
+        while sends.len() < IN_FLIGHT {
+            let next = {
+                let mut guard = lock();
+                let Some(active) = guard.as_mut() else { return };
+                if !active.greeted {
+                    active.pumping = false;
+                    return;
+                }
+                publish_progress(
+                    active.total,
+                    &mut active.speed_mark,
+                    &mut active.round_trips,
+                    &active.sender,
+                );
+                match active.sender.state() {
+                    State::Done => {
+                        active.pumping = false;
+                        let seconds = active.started.elapsed().as_secs_f64().max(0.001);
+                        let total = active.total;
+                        *guard = None;
+                        drop(guard);
+                        state::with_state(|state| {
+                            state.active = false;
+                            state.sent = total;
+                            state.speed_bytes_per_second = (total as f64 / seconds) as u64;
+                            state.status = "导入完成，歌曲已出现在手表的 Lyra Player 中。".to_string();
+                        });
+                        crate::library::refresh().await;
+                        return;
+                    }
+                    State::Failed(failure) => {
+                        *guard = None;
+                        drop(guard);
+                        finish_error(&failure_text(failure));
+                        return;
+                    }
+                    _ => {}
+                }
+                active.sender.poll().map(|frame| (active.addr.clone(), frame))
+            };
+            match next {
+                Some((addr, frame)) => sends.push(async move {
+                    let started = Instant::now();
+                    let result = connect::send(&addr, &frame).await;
+                    (result, started.elapsed())
+                }),
+                None => break,
+            }
+        }
+        if sends.is_empty() {
+            // Nothing to send and nothing on its way: the watch's next frame starts the loop again.
+            if let Some(active) = lock().as_mut() {
+                active.pumping = false;
+            }
+            return;
+        }
+        match sends.next().await {
+            Some((Err(error), _)) => {
+                *lock() = None;
+                finish_error(&format!("发送失败：{error}"));
+                return;
+            }
+            Some((Ok(()), elapsed)) => {
+                if let Some(active) = lock().as_mut() {
+                    active.round_trips.0 += elapsed;
+                    active.round_trips.1 += 1;
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// Publishes the confirmed bytes, and every two seconds the speed and the average time a frame
+/// took to be answered: with a fixed number of frames in flight, that round trip is what sets
+/// the speed, so a slow import can be told apart from a slow link.
+fn publish_progress(
+    total: u64,
+    mark: &mut (Instant, u64),
+    round_trips: &mut (Duration, u32),
+    sender: &Sender,
+) {
+    let confirmed = sender.confirmed_bytes();
+    let elapsed = mark.0.elapsed();
+    let speed = if elapsed >= Duration::from_secs(2) {
+        let speed = confirmed.saturating_sub(mark.1) as f64 / elapsed.as_secs_f64();
+        *mark = (Instant::now(), confirmed);
+        let (sum, count) = std::mem::replace(round_trips, (Duration::ZERO, 0));
+        let round_trip_ms = sum.as_millis() as u64 / u64::from(count.max(1));
+        Some((speed as u64, round_trip_ms as u32))
+    } else {
+        None
     };
     state::with_state(|state| {
         state.sent = confirmed;
-        state.speed_bytes_per_second = speed;
-    });
-    if completed {
-        send_asset_end(addr).await
-    } else {
-        send_next_chunk(addr).await
-    }
-}
-
-async fn handle_retry(addr: &str, value: &Value) -> Result<(), String> {
-    let (packet, retry) = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        validate_peer(
-            item,
-            addr,
-            Awaiting::Ack,
-            value.get("id").and_then(Value::as_str),
-        )?;
-        let pending = item
-            .pending_chunk
-            .as_mut()
-            .ok_or_else(|| "没有可重传的分片".to_string())?;
-        let retry = claim_chunk_retry(
-            pending,
-            value.get("asset").and_then(Value::as_str),
-            value.get("seq").and_then(Value::as_u64),
-            value.get("offset").and_then(Value::as_u64),
-        )?;
-        let mut packet = json!({
-            "tag": "lyra-import-chunk",
-            "id": item.id,
-            "asset": pending.asset,
-            "seq": pending.seq,
-            "offset": pending.offset,
-            "encoding": "base64",
-            "data": BASE64.encode(&pending.bytes),
-        });
-        if let Some(crc32) = pending.crc32.as_deref() {
-            packet["crc32"] = Value::String(crc32.to_string());
+        state.total = total;
+        if let Some((speed, round_trip_ms)) = speed {
+            state.speed_bytes_per_second = speed;
+            state.round_trip_ms = round_trip_ms;
         }
-        (packet, retry)
-    };
-    state::with_state(|state| {
-        state.status = format!("分片校验失败，正在进行第 {retry}/2 次重传…");
-    });
-    interconnect::send(addr, &packet).await
-}
-
-fn claim_chunk_retry(
-    pending: &mut PendingChunk,
-    asset: Option<&str>,
-    seq: Option<u64>,
-    offset: Option<u64>,
-) -> Result<u8, String> {
-    if asset != Some(pending.asset) || seq != Some(pending.seq) || offset != Some(pending.offset) {
-        return Err("重传请求与等待确认的分片不一致".to_string());
-    }
-    if pending.retries >= MAX_CHUNK_RETRIES {
-        return Err("分片已达到最多 2 次重传".to_string());
-    }
-    pending.retries += 1;
-    Ok(pending.retries)
-}
-
-async fn send_next_chunk(addr: &str) -> Result<(), String> {
-    let packet = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        let asset = item
-            .assets
-            .get_mut(item.asset_index)
-            .ok_or_else(|| "资源索引越界".to_string())?;
-        if item.addr != addr || item.offset >= asset.metadata.size {
-            return Err("导入会话设备或资源偏移无效".to_string());
-        }
-        asset
-            .file
-            .seek(SeekFrom::Start(item.offset))
-            .map_err(|error| format!("cannot seek {}: {error}", asset.metadata.kind))?;
-        let remaining = (asset.metadata.size - item.offset) as usize;
-        let mut bytes = vec![0u8; item.chunk_bytes.min(remaining)];
-        asset
-            .file
-            .read_exact(&mut bytes)
-            .map_err(|error| format!("cannot read {} chunk: {error}", asset.metadata.kind))?;
-        if item.pending_chunk.is_some() {
-            return Err("上一分片仍在等待确认".to_string());
-        }
-        let crc32 = if item.mode == ChunkMode::Crc32 {
-            let mut crc = Crc32::new();
-            crc.update(&bytes);
-            Some(format!("{:08x}", crc.finalize()))
-        } else {
-            None
+        state.status = match sender.state() {
+            State::Streaming(_) | State::AwaitAssetEnd(_) => "正在传输到手表…".to_string(),
+            State::AwaitCommit => "正在保存歌曲…".to_string(),
+            _ => state.status.clone(),
         };
-        let count = bytes.len() as u64;
-        let mut packet = json!({
-            "tag": "lyra-import-chunk",
-            "id": item.id,
-            "asset": asset.metadata.kind,
-            "seq": item.seq,
-            "offset": item.offset,
-            "encoding": "base64",
-            "data": BASE64.encode(&bytes),
-        });
-        if let Some(crc32) = crc32.as_deref() {
-            packet["crc32"] = Value::String(crc32.to_string());
-        }
-        item.pending_chunk = Some(PendingChunk {
-            asset: asset.metadata.kind,
-            seq: item.seq,
-            offset: item.offset,
-            bytes,
-            crc32,
-            retries: 0,
-        });
-        item.seq += 1;
-        item.offset += count;
-        item.sent_total += count;
-        item.awaiting = Awaiting::Ack;
-        packet
-    };
-    interconnect::send(addr, &packet).await
-}
-
-async fn send_asset_end(addr: &str) -> Result<(), String> {
-    let packet = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        let kind = item.assets[item.asset_index].metadata.kind;
-        let packet = json!({ "tag": "lyra-import-asset-end", "id": item.id, "asset": kind });
-        item.asset_index += 1;
-        item.seq = 0;
-        item.offset = 0;
-        item.awaiting = if item.asset_index == item.assets.len() {
-            Awaiting::AssetsDone
-        } else {
-            Awaiting::Ready
-        };
-        packet
-    };
-    interconnect::send(addr, &packet).await
-}
-
-async fn handle_assets_done(addr: &str, value: &Value) -> Result<(), String> {
-    let packet = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        let item = guard.as_mut().ok_or_else(|| "没有活动导入".to_string())?;
-        validate_peer(
-            item,
-            addr,
-            Awaiting::AssetsDone,
-            value.get("id").and_then(Value::as_str),
-        )?;
-        item.awaiting = Awaiting::Done;
-        json!({ "tag": "lyra-import-commit", "id": item.id })
-    };
-    state::with_state(|state| state.status = "正在发布曲目与音乐库…".to_string());
-    interconnect::send(addr, &packet).await
-}
-
-fn handle_done(addr: &str, value: &Value) -> Result<(), String> {
-    let guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-    let item = guard.as_ref().ok_or_else(|| "没有活动导入".to_string())?;
-    validate_peer(
-        item,
-        addr,
-        Awaiting::Done,
-        value.get("id").and_then(Value::as_str),
-    )?;
-    drop(guard);
-    *transfer().lock().unwrap_or_else(|item| item.into_inner()) = None;
-    state::with_state(|state| {
-        state.active = false;
-        state.sent = state.total;
-        state.speed_bytes_per_second = 0;
-        state.status = "导入完成；Lyra Player 将自动刷新音乐库。".to_string();
-    });
-    Ok(())
-}
-
-pub async fn cancel() {
-    let pending = {
-        let mut guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-        guard.take().map(|item| (item.addr, item.id))
-    };
-    if let Some((addr, id)) = pending {
-        let _ = interconnect::send(&addr, &json!({ "tag": "lyra-import-cancel", "id": id })).await;
-    }
-    state::with_state(|state| {
-        state.active = false;
-        state.speed_bytes_per_second = 0;
-        state.status = "已取消导入。".to_string();
     });
 }
 
-fn validate_assets(assets: &[ImportAsset]) -> Result<(), String> {
-    if assets.is_empty() || assets.len() > 4 || assets[0].kind != "audio" {
-        return Err("导入必须以一个音频资源开始".to_string());
+fn failure_text(failure: Failure) -> String {
+    match failure {
+        Failure::Refused(Status::NoSpace) => "手表存储空间不足。".to_string(),
+        Failure::Refused(Status::Crc) => "数据校验失败，请重试。".to_string(),
+        Failure::Refused(Status::Io) => "手表写入文件失败。".to_string(),
+        Failure::Refused(Status::Busy) => "手表正忙，请稍后重试。".to_string(),
+        Failure::Refused(Status::BadRequest) => "手表拒绝了这首歌曲（文件或信息无效）。".to_string(),
+        Failure::Refused(status) => format!("手表拒绝了导入：{status:?}"),
+        Failure::Source => "读取本地文件失败。".to_string(),
+        Failure::Protocol => "手表的回复与导入流程不符，请更新插件与模块。".to_string(),
     }
-    let mut seen = Vec::new();
-    let mut previous_order = 0usize;
-    for asset in assets {
-        if asset.size == 0 || seen.contains(&asset.kind) {
-            return Err("导入资源为空或重复".to_string());
-        }
-        let order = match asset.kind {
-            "audio" => 0,
-            "cover" => 1,
-            "background" => 2,
-            "lyrics" => 3,
-            _ => return Err("导入包含未知资源".to_string()),
-        };
-        if order < previous_order {
-            return Err("导入资源顺序无效".to_string());
-        }
-        previous_order = order;
-        if asset.format == Some(crate::artwork::LVGL_V9_FORMAT) {
-            let valid = match asset.kind {
-                "cover" => {
-                    asset.extension == Some("bin")
-                        && asset.width == Some(crate::artwork::COVER_WIDTH)
-                        && asset.height == Some(crate::artwork::COVER_HEIGHT)
-                        && asset.size == crate::artwork::COVER_BIN_BYTES
-                }
-                "background" => {
-                    asset.extension == Some("bin")
-                        && asset.height == Some(crate::artwork::BACKGROUND_HEIGHT)
-                        && crate::artwork::DeviceProfile::ALL.iter().any(|profile| {
-                            asset.width == Some(profile.background_width())
-                                && asset.size == profile.background_bin_bytes()
-                        })
-                }
-                _ => false,
-            };
-            if !valid {
-                return Err("LVGL 图片资源元数据无效".to_string());
-            }
-        } else if asset.kind == "background" {
-            return Err("背景必须是 LVGL v9 BIN".to_string());
-        }
-        seen.push(asset.kind);
-    }
-    Ok(())
-}
-
-fn update_asset_status() {
-    let guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-    if let Some(item) = guard.as_ref() {
-        let kind = item.assets[item.asset_index].metadata.kind;
-        let label = match kind {
-            "audio" => "音频",
-            "cover" => "封面",
-            "background" => "播放页背景",
-            "lyrics" => "歌词",
-            _ => "资源",
-        };
-        let compatibility = if item.artwork_supported {
-            ""
-        } else {
-            "（当前快应用不支持 BIN 封面/背景）"
-        };
-        state::with_state(|state| {
-            state.status = format!("正在传输{label}{compatibility}…");
-        });
-    }
-}
-
-fn matches_active_peer(addr: &str, tag: &str, value: &Value) -> bool {
-    let guard = transfer().lock().unwrap_or_else(|item| item.into_inner());
-    let Some(item) = guard.as_ref() else {
-        return false;
-    };
-    if item.addr != addr {
-        return false;
-    }
-    if tag == "lyra-import-hello" {
-        return item.awaiting == Awaiting::Hello;
-    }
-    value.get("id").and_then(Value::as_str) == Some(item.id.as_str())
-}
-
-fn validate_peer(
-    item: &Transfer,
-    addr: &str,
-    awaiting: Awaiting,
-    id: Option<&str>,
-) -> Result<(), String> {
-    if item.addr != addr || item.awaiting != awaiting {
-        return Err("意外的导入响应状态".to_string());
-    }
-    if awaiting == Awaiting::Hello && id.is_none() {
-        return Ok(());
-    }
-    if id != Some(item.id.as_str()) {
-        return Err("导入响应 ID 不匹配".to_string());
-    }
-    Ok(())
 }
 
 fn finish_error(error: &str) {
-    *transfer().lock().unwrap_or_else(|item| item.into_inner()) = None;
     state::with_state(|state| {
         state.active = false;
-        state.speed_bytes_per_second = 0;
-        state.status = format!("导入失败：{error}");
+        state.status = error.to_string();
     });
 }
 
-fn new_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{nanos:032x}")
+/// The stall timer fired: give up when the watch has been silent for too long, otherwise
+/// keep watching.
+pub fn check_stall() {
+    let stalled = {
+        let guard = lock();
+        match guard.as_ref() {
+            None => return,
+            Some(active) => active.last_progress.elapsed() >= STALL,
+        }
+    };
+    if stalled {
+        *lock() = None;
+        finish_error("手表长时间没有响应，导入已中止。");
+    } else {
+        arm_watchdog();
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transfer_requires_audio_first_and_unique_assets() {
-        let audio = ImportAsset::audio("audio.mp3".into(), 10);
-        let cover = ImportAsset {
-            kind: "cover",
-            path: "cover.jpg".into(),
-            size: 5,
-            extension: Some("jpg"),
-            format: None,
-            width: None,
-            height: None,
-        };
-        assert!(validate_assets(&[audio.clone(), cover]).is_ok());
-        assert!(validate_assets(&[audio.clone(), audio]).is_err());
-        assert!(validate_assets(&[ImportAsset::lyrics("lyrics.lrc".into(), 4, "lrc")]).is_err());
-    }
-
-    #[test]
-    fn accepts_fixed_lvgl_cover_and_background_assets() {
-        for profile in crate::artwork::DeviceProfile::ALL {
-            let assets = [
-                ImportAsset::audio("audio.mp3".into(), 10),
-                ImportAsset::cover_bin("cover.bin".into(), crate::artwork::COVER_BIN_BYTES),
-                ImportAsset::background_bin(crate::artwork::PreparedBackground {
-                    path: "background.bin".into(),
-                    size: profile.background_bin_bytes(),
-                    width: profile.background_width(),
-                }),
-            ];
-            assert!(validate_assets(&assets).is_ok(), "{profile:?}");
+pub async fn cancel() {
+    let target = lock().take().map(|active| active.addr);
+    if let Some(addr) = target {
+        if let Ok(frame) = (Request::Abort { req: 2 }).encode() {
+            let _ = connect::send(&addr, &frame).await;
         }
     }
-
-    #[test]
-    fn legacy_quick_app_accepts_only_the_original_background_width() {
-        assert_eq!(accepted_background_widths(&json!({})), vec![336]);
-        assert_eq!(
-            accepted_background_widths(&json!({ "backgroundWidths": [336, 212] })),
-            vec![336, 212]
-        );
-    }
-
-    #[test]
-    fn rejects_background_whose_size_disagrees_with_its_width() {
-        let assets = [
-            ImportAsset::audio("audio.mp3".into(), 10),
-            ImportAsset::background_bin(crate::artwork::PreparedBackground {
-                path: "background.bin".into(),
-                size: crate::artwork::DeviceProfile::Band10Pro.background_bin_bytes(),
-                width: crate::artwork::DeviceProfile::Band11.background_width(),
-            }),
-        ];
-        assert!(validate_assets(&assets).is_err());
-    }
-
-    #[test]
-    fn chunk_retry_is_exact_and_limited_to_two_attempts() {
-        let mut pending = PendingChunk {
-            asset: "audio",
-            seq: 7,
-            offset: 24_576,
-            bytes: vec![1, 2, 3],
-            crc32: Some("55bc801d".to_string()),
-            retries: 0,
-        };
-        assert_eq!(
-            claim_chunk_retry(&mut pending, Some("audio"), Some(7), Some(24_576)),
-            Ok(1)
-        );
-        assert_eq!(
-            claim_chunk_retry(&mut pending, Some("audio"), Some(7), Some(24_576)),
-            Ok(2)
-        );
-        assert!(claim_chunk_retry(&mut pending, Some("audio"), Some(7), Some(24_576)).is_err());
-        assert!(claim_chunk_retry(&mut pending, Some("cover"), Some(7), Some(24_576)).is_err());
-    }
-
-    #[test]
-    fn no_checksum_fast_chunk_fits_outgoing_frame() {
-        let bytes = vec![0xff; FAST_CHUNK_BYTES];
-        let frame = json!({
-            "tag": "lyra-import-chunk",
-            "id": "0123456789abcdef0123456789abcdef",
-            "asset": "audio",
-            "seq": 99_999_999,
-            "offset": 67_108_864,
-            "encoding": "base64",
-            "data": BASE64.encode(bytes),
-        })
-        .to_string();
-        assert!(frame.len() <= interconnect::OUTGOING_FRAME_CAPACITY);
-    }
-
-    #[test]
-    fn no_checksum_ultra_chunk_fits_expanded_outgoing_frame() {
-        let bytes = vec![0xff; ULTRA_CHUNK_BYTES];
-        let frame = json!({
-            "tag": "lyra-import-chunk",
-            "id": "0123456789abcdef0123456789abcdef",
-            "asset": "audio",
-            "seq": 99_999_999,
-            "offset": 67_108_864,
-            "encoding": "base64",
-            "data": BASE64.encode(bytes),
-        })
-        .to_string();
-        assert!(frame.len() <= interconnect::OUTGOING_FRAME_CAPACITY);
-        assert_eq!(frame.len(), interconnect::OUTGOING_FRAME_CAPACITY - 2);
-    }
-
-    #[test]
-    fn configured_base64_chunk_fits_outgoing_frame() {
-        let bytes = vec![0xff; DEFAULT_CHUNK_BYTES];
-        let frame = json!({
-            "tag": "lyra-import-chunk",
-            "id": "0123456789abcdef0123456789abcdef",
-            "asset": "lyrics",
-            "seq": 99_999_999,
-            "offset": 67_108_864,
-            "encoding": "base64",
-            "data": BASE64.encode(bytes),
-            "crc32": "ffffffff",
-        })
-        .to_string();
-        assert!(frame.len() > interconnect::INCOMING_FRAME_CAPACITY);
-        assert!(frame.len() <= interconnect::OUTGOING_FRAME_CAPACITY);
-    }
+    state::with_state(|state| {
+        state.active = false;
+        state.status = "已取消导入。".to_string();
+    });
 }

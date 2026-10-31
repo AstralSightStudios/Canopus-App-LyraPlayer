@@ -1,35 +1,48 @@
 schema = 1
 
 [module]
-id = "org.canopus.lyra-player"
-version = "0.1.1"
+id = "lyra_player"
+version = "0.2.1"
+version_code = 2
+kind = "target"
 language = "rust"
 lifecycle = "resident-after-activation"
-canopus_abi = "1"
+canopus_abi = "2"
+description = "Canopus native local music player for Lyra"
+
+[build]
+sources = ["crates/lyra-player-device/Cargo.toml"]
+allowed_constants = [
+  "0x0c03020a",
+  "0x0c020103",
+  "0x0c07266a",
+  "0x0c04071a",
+  "0x0c147a46",
+  "0x0c000f06",
+  "0x0c000000",
+  "0x0c59011a",
+  "0x0c070201",
+  "0x0c092603",
+  "0x0c010101",
+  # Every pixel of crates/lyra-player-device/assets/appicon.bin with alpha 0x0c reads like a flash
+  # address to the verifier (a test in the device crate keeps this list complete).
+  "0x0c2b1515",
+  "0x0c2b2b2b",
+  "0x0c6a2b2b",
+  "0x0c6a806a",
+  "0x0c802b2b",
+  "0x0c806a6a",
+  "0x0cbf6a40",
+  "0x0cbfaa80",
+  "0x0cd5406a",
+  "0x0cd56a95",
+]
 
 [targets]
 include = [
   "xiaomi-band-10-pro-3.101.036",
   "xiaomi-band-10-pro-3.101.043",
-  "xiaomi-band-9-pro-3.1.175",
   "xiaomi-band-11-4.100.139",
   "xiaomi-band-11-4.100.155",
-  "xiaomi-band-9-3.1.32",
+  "xiaomi-band-11-4.100.179",
 ]
-
-[capabilities]
-required = [
-  "identity-guard",
-  "native-app.register",
-  "launcher.entry",
-  "ui.dispatch",
-  "interconnect.client",
-  "nuttx.fs",
-]
-
-[native_app]
-enabled = true
-app_id = "org.canopus.lyra-player"
-name = "Lyra"
-entry = "canopus_module_descriptor"
-role = "standalone"

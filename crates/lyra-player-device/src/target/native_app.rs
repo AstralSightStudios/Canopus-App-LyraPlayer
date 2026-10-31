@@ -1,4 +1,4 @@
-//! Supervisor-owned native app registration and the local player's four pages.
+//! Supervisor-owned native app registration and the local player's three pages.
 //! Stage 1 queues the writable page descriptors; the Supervisor installs the
 //! application and launcher entry before it dispatches stage 2.
 
@@ -9,24 +9,39 @@ use canopus_runtime::launcher;
 use canopus_target_private::*;
 
 use super::runtime::*;
-use super::ui_backend;
+use super::ui;
 
-pub const PAGE_COUNT: usize = 4;
-pub const PAGE_OVERVIEW: usize = 0;
-pub const PAGE_LIBRARY: usize = 1;
-pub const PAGE_PLAYER: usize = 2;
+pub const PAGE_COUNT: usize = 3;
+pub const PAGE_LIBRARY: usize = 0;
+pub const PAGE_PLAYER: usize = 1;
+pub const PAGE_COLLECTION: usize = 2;
 
 pub const DISPLAY_NAME: &[u8] = b"Lyra\0";
-pub const LAUNCHER_ICON: &[u8] = b"/data/canopus/appicon_lyra.bin\0";
-const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [
-    b"lyra_home\0",
-    b"lyra_library\0",
-    b"lyra_player\0",
-    b"lyra_lyrics\0",
-];
+pub const LAUNCHER_ICON: &[u8] = b"/data/canopus/m.lyra_player/appicon.bin\0";
+const PAGE_NAMES: [&[u8]; PAGE_COUNT] = [b"lyra_library\0", b"lyra_player\0", b"lyra_collection\0"];
 
 static mut PAGE_DESCRIPTORS: core::mem::MaybeUninit<[firmware_page_descriptor; PAGE_COUNT]> =
     core::mem::MaybeUninit::uninit();
+
+/// The descriptor the firmware itself passes to a page's callbacks. It need
+/// not be the registered copy, and `page_finish` only recognises its own.
+static mut LIVE_PAGES: [*mut firmware_page_descriptor; PAGE_COUNT] =
+    [core::ptr::null_mut(); PAGE_COUNT];
+
+fn remember_live_page(index: usize, page: *mut firmware_page_descriptor) {
+    // SAFETY: page callbacks run on the UI thread.
+    unsafe { (*core::ptr::addr_of_mut!(LIVE_PAGES))[index] = page };
+}
+
+pub fn live_page_ptr(index: usize) -> *mut firmware_page_descriptor {
+    // SAFETY: as above.
+    let live = unsafe { (*core::ptr::addr_of!(LIVE_PAGES))[index] };
+    if live.is_null() {
+        page_descriptor_ptr(index)
+    } else {
+        live
+    }
+}
 
 pub fn page_descriptor_ptr(index: usize) -> *mut firmware_page_descriptor {
     // SAFETY: PAGE_DESCRIPTORS is initialized before registration queues these
@@ -43,6 +58,7 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
     let descriptor = page_descriptor_ptr(index);
     // SAFETY: descriptor points at the static array, which is initialized
     // before registration. The Supervisor later writes its assigned app ID.
+    // Cast to bytes because `write_bytes` counts elements, not bytes.
     unsafe {
         core::ptr::write_bytes(
             descriptor.cast::<u8>(),
@@ -54,19 +70,27 @@ fn descriptor_init(index: usize, name: &[u8], page_id: u16) {
         (*descriptor).on_signal = page_on_signal as *const () as *mut core::ffi::c_void;
         (*descriptor).on_create = page_on_create as *const () as *mut core::ffi::c_void;
         (*descriptor).on_resume = page_on_resume as *const () as *mut core::ffi::c_void;
-        (*descriptor).on_pause = page_on_pause as *const () as *mut core::ffi::c_void;
         #[cfg(not(any(
             feature = "target-xiaomi-band-11-4-100-139",
-            feature = "target-xiaomi-band-11-4-100-155"
+            feature = "target-xiaomi-band-11-4-100-155",
+            feature = "target-xiaomi-band-11-4-100-179"
         )))]
         {
-            (*descriptor).on_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
+            // The generated Band 10 field names after +0x54 are stale:
+            // +0x58 is START, +0x5c PAUSE, +0x60 STOP, +0x64 UI_DESTROY.
+            // Registering destroy at +0x5c tears down our timers on screen-off
+            // while the firmware keeps the root alive: wake shows a dead page.
+            (*descriptor).on_destroy = page_on_pause as *const () as *mut core::ffi::c_void;
+            (*descriptor).extension_callback_100 =
+                page_on_destroy as *const () as *mut core::ffi::c_void;
         }
         #[cfg(any(
             feature = "target-xiaomi-band-11-4-100-139",
-            feature = "target-xiaomi-band-11-4-100-155"
+            feature = "target-xiaomi-band-11-4-100-155",
+            feature = "target-xiaomi-band-11-4-100-179"
         ))]
         {
+            (*descriptor).on_pause = page_on_pause as *const () as *mut core::ffi::c_void;
             (*descriptor).on_ui_destroy = page_on_destroy as *const () as *mut core::ffi::c_void;
         }
     }
@@ -86,6 +110,7 @@ pub unsafe fn install_stage(ctx: *const ContextV1, stage: u32) -> Result<(), i32
     let r = runtime();
     match stage {
         1 => {
+            ui::assets::ensure_launcher_icon();
             if r.app_id.load(Ordering::Acquire) != 0 {
                 return Ok(());
             }
@@ -172,7 +197,8 @@ extern "C" fn page_on_create(
         return -1;
     }
     runtime().active_page.store(index as u32, Ordering::Release);
-    ui_backend::page_create(index, root)
+    remember_live_page(index, page);
+    ui::page_create(index, root)
 }
 
 extern "C" fn page_on_resume(page: *mut firmware_page_descriptor) -> i32 {
@@ -181,7 +207,8 @@ extern "C" fn page_on_resume(page: *mut firmware_page_descriptor) -> i32 {
         return -1;
     }
     runtime().active_page.store(index as u32, Ordering::Release);
-    ui_backend::page_resume(index)
+    remember_live_page(index, page);
+    ui::page_resume(index)
 }
 
 extern "C" fn page_on_pause(page: *mut firmware_page_descriptor) -> i32 {
@@ -189,7 +216,7 @@ extern "C" fn page_on_pause(page: *mut firmware_page_descriptor) -> i32 {
     if index >= PAGE_COUNT {
         return -1;
     }
-    ui_backend::page_pause(index)
+    ui::page_pause(index)
 }
 
 extern "C" fn page_on_destroy(page: *mut firmware_page_descriptor) -> i32 {
@@ -197,5 +224,5 @@ extern "C" fn page_on_destroy(page: *mut firmware_page_descriptor) -> i32 {
     if index >= PAGE_COUNT {
         return -1;
     }
-    ui_backend::page_destroy(index)
+    ui::page_destroy(index)
 }

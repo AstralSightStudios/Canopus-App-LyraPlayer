@@ -2,7 +2,7 @@
 
 [package]
 name = "astrobox-plugin-lyra-import"
-version = "0.3.0"
+version = "0.7.1"
 edition = "2024"
 license = "MIT"
 
@@ -10,11 +10,13 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = { version = "0.47.0", features = ["async", "async-spawn"] }
+wit-bindgen = { version = "0.63.0", features = ["async", "async-spawn"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-crc32fast = "1"
+lyra-protocol = { path = "../../crates/lyra-protocol" }
+lyra-transfer = { path = "../../crates/lyra-transfer" }
 aes = "0.8"
 cipher = { version = "0.4", features = ["block-padding"] }
 md-5 = "0.10"

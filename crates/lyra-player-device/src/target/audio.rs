@@ -8,9 +8,14 @@ use canopus_target_private::{
     O_RDONLY, O_RDWR, canopus_fw_clock_gettime, get_errno, nuttx_close, nuttx_ioctl, nuttx_lseek,
     nuttx_open, nuttx_read, nuttx_write, stock_timespec_t,
 };
-use lyra_player_core::playback::{AudioSink, MediaControl, Player};
+use lyra_player_core::playback::{
+    AudioSink, MediaControl, PlaybackState, Player, SampleClock, id3v2_tag_len,
+};
 
-use super::storage;
+use super::{
+    feeder::{self, Front},
+    storage,
+};
 
 const DEVICE_PATH: &[u8] = b"/dev/canopus_audio\0";
 const FORMAT_MP3: u32 = 1;
@@ -31,6 +36,8 @@ const AUDIO_STATE_CONFIGURED: u32 = 2;
 const AUDIO_STATE_BUFFERING: u32 = 3;
 const AUDIO_STATE_PLAYING: u32 = 4;
 const AUDIO_STATE_PAUSED: u32 = 5;
+const AUDIO_STATE_DRAINING: u32 = 6;
+const AUDIO_STATE_STOPPED: u32 = 7;
 const AUDIO_STATE_ERROR: u32 = 8;
 const EAGAIN: i32 = -11;
 const EPIPE: i32 = -32;
@@ -38,6 +45,14 @@ const LOCAL_READ_CHUNK: usize = 4096;
 const LOCAL_BURST_CHUNKS: usize = 8;
 const SEEK_SET: i32 = 0;
 const SEEK_SCAN_WINDOW: usize = 8 * 1024;
+/// The tail of a track (the input ring and the decoder's last frames) plays out in a few
+/// seconds. A pipeline that has not reported "stopped" this long after the file ended is stuck,
+/// say because the headset went away, and the track counts as over instead of hanging forever.
+const DRAIN_LIMIT_MS: u64 = 20_000;
+/// The UI owner's reader normally hands over a chunk every 10 ms. If it has nothing for this long
+/// while the track is playing, its thread is stuck, and this thread reads the file itself from
+/// where the reader stopped.
+const FEED_STALL_MS: u64 = 1_000;
 const EINVAL: i32 = -22;
 const EIO: i32 = -5;
 const CLOCK_MONOTONIC: u32 = 1;
@@ -298,22 +313,65 @@ fn find_mp3_seek_point(fd: i32, target_ms: u32) -> Result<(u64, u32), i32> {
     }
 }
 
+/// Bytes per millisecond a dry-run "sink" swallows: 128 kbit/s, so the
+/// emulated playback runs at the speed of a 128 kbit/s MP3.
+const DRY_BYTES_PER_MS: u64 = 16;
+
+/// A sink that plays nothing. Mirage has no Bluetooth audio sink, so the
+/// emulator tests switch it on with a `dry-run` file in the module directory.
+#[derive(Clone, Copy)]
+struct DryRun {
+    volume: u32,
+    credit: u64,
+    last_ms: u64,
+}
+
 pub struct AudioDevice {
+    dry: Option<DryRun>,
     fd: i32,
     local_fd: i32,
     last_stage: u8,
     position_base_ms: u32,
     position_started_at_ms: Option<u64>,
+    samples: SampleClock,
+    stream_active: bool,
+    /// Nonzero while the UI owner's reader (`feeder`) supplies the file: its request epoch.
+    /// Zero with `local_fd` open means this thread reads the file itself.
+    feed_epoch: u32,
+    feed_path: String,
+    /// Audio bytes taken from the reader for this track: where reading here would resume.
+    feed_taken: u64,
+    /// When the reader first had nothing for us (0: it had).
+    feed_dry_since_ms: u64,
+    draining: bool,
+    /// When the file ended and the driver was asked to drain.
+    drain_started_ms: u64,
+    // Reused on every owner tick: never allocate/drop a chunk while LVGL is drawing.
+    buffer: Vec<u8>,
+    buffered: usize,
+    offset: usize,
 }
 
 impl AudioDevice {
     pub const fn new() -> Self {
         Self {
+            dry: None,
             fd: -1,
             local_fd: -1,
             last_stage: STAGE_NONE,
             position_base_ms: 0,
             position_started_at_ms: None,
+            samples: SampleClock::new(),
+            stream_active: false,
+            feed_epoch: 0,
+            feed_path: String::new(),
+            feed_taken: 0,
+            feed_dry_since_ms: 0,
+            draining: false,
+            drain_started_ms: 0,
+            buffer: Vec::new(),
+            buffered: 0,
+            offset: 0,
         }
     }
 
@@ -400,6 +458,14 @@ impl AudioDevice {
     }
 
     fn ioctl_value(&mut self, command: u32, argument: usize) -> Result<(), i32> {
+        if let Some(dry) = &mut self.dry {
+            match command {
+                IOC_GET_VOLUME => unsafe { (argument as *mut u32).write(dry.volume) },
+                IOC_SET_VOLUME => dry.volume = unsafe { (argument as *const u32).read() },
+                _ => {}
+            }
+            return Ok(());
+        }
         self.last_stage = Self::ioctl_stage(command);
         let fd = self.ensure_open()?;
         let result = unsafe { nuttx_ioctl(fd, command, argument) };
@@ -428,7 +494,7 @@ impl AudioDevice {
     }
 
     pub fn local_is_open(&self) -> bool {
-        self.local_fd >= 0
+        self.stream_active
     }
 
     pub fn volume_percent(&mut self) -> Result<u8, i32> {
@@ -450,19 +516,32 @@ impl AudioDevice {
     }
 
     pub fn start_local(&mut self, path: &str, player: &mut Player) -> Result<(), i32> {
-        self.close_local();
-        let resolved = storage::resolve_path(path).ok_or(-2)?;
-        let mut c_path = Vec::with_capacity(resolved.len() + 1);
-        c_path.extend_from_slice(resolved.as_bytes());
-        c_path.push(0);
-        self.last_stage = STAGE_LOCAL_OPEN;
-        let fd = unsafe { nuttx_open(c_path.as_ptr(), O_RDONLY) };
-        if fd < 0 {
-            return Err(neg_errno(fd));
+        self.stop_local();
+        self.dry = storage::dry_run_enabled().then(|| DryRun {
+            volume: self.dry.map_or(100, |dry| dry.volume),
+            credit: 0,
+            last_ms: monotonic_ms().unwrap_or(0),
+        });
+        if !storage::is_module_path(path) {
+            return Err(-2);
         }
-        self.local_fd = fd;
         self.position_base_ms = 0;
         self.position_started_at_ms = None;
+        self.samples.reset(0);
+        self.buffer.resize(LOCAL_READ_CHUNK, 0);
+        self.buffered = 0;
+        self.offset = 0;
+        self.draining = false;
+        self.last_stage = STAGE_LOCAL_OPEN;
+        match feeder::request(path) {
+            Some(epoch) => {
+                self.feed_epoch = epoch;
+                self.feed_path = String::from(path);
+                self.feed_taken = 0;
+                self.feed_dry_since_ms = 0;
+            }
+            None => self.open_local(path)?,
+        }
 
         // Imported metadata supplies duration when available. Do not probe the
         // file with lseek here: some Band 10 storage backends can read the
@@ -471,7 +550,67 @@ impl AudioDevice {
             self.close_local();
             return Err(error);
         }
+        self.stream_active = true;
         self.pump_local(player)
+    }
+
+    /// Opens the file for reading on this thread (firmware without the UI owner's reader) and
+    /// steps over a leading ID3v2 tag: fed through the decoder's ring it took seconds.
+    fn open_local(&mut self, path: &str) -> Result<(), i32> {
+        let mut c_path = Vec::with_capacity(path.len() + 1);
+        c_path.extend_from_slice(path.as_bytes());
+        c_path.push(0);
+        let fd = unsafe { nuttx_open(c_path.as_ptr(), O_RDONLY) };
+        if fd < 0 {
+            return Err(neg_errno(fd));
+        }
+        self.local_fd = fd;
+        let filled = feeder::read_full(fd, &mut self.buffer[..10]);
+        let Some(tag) = id3v2_tag_len(&self.buffer[..filled]) else {
+            // Audio from the first byte: the header bytes are the start of the stream.
+            self.buffered = filled;
+            return Ok(());
+        };
+        let position = unsafe { nuttx_lseek(fd, i64::from(tag), SEEK_SET) };
+        if position == i64::from(tag) {
+            return Ok(());
+        }
+        let mut skip = tag as usize - filled;
+        while skip != 0 {
+            let want = skip.min(self.buffer.len());
+            let count = feeder::read_full(fd, &mut self.buffer[..want]);
+            if count == 0 {
+                break;
+            }
+            skip -= count;
+        }
+        Ok(())
+    }
+
+    /// Opens the file here, `taken` bytes into its audio (past a leading tag), to carry on where
+    /// the UI owner's reader stopped. False when the file system cannot seek there: reading up
+    /// to that point on this thread would hold up the headset longer than waiting.
+    fn resume_local(&mut self, path: &str, taken: u64) -> bool {
+        let mut c_path = Vec::with_capacity(path.len() + 1);
+        c_path.extend_from_slice(path.as_bytes());
+        c_path.push(0);
+        let fd = unsafe { nuttx_open(c_path.as_ptr(), O_RDONLY) };
+        if fd < 0 {
+            return false;
+        }
+        let filled = feeder::read_full(fd, &mut self.buffer[..10]);
+        let start = id3v2_tag_len(&self.buffer[..filled]).map_or(0, u64::from);
+        let target = start + taken;
+        let seeked = i64::try_from(target)
+            .is_ok_and(|target| unsafe { nuttx_lseek(fd, target, SEEK_SET) } == target);
+        if seeked {
+            self.local_fd = fd;
+            self.buffered = 0;
+            self.offset = 0;
+            return true;
+        }
+        let _ = unsafe { nuttx_close(fd) };
+        false
     }
 
     fn prepare_and_prebuffer(&mut self) -> Result<(), i32> {
@@ -481,37 +620,148 @@ impl AudioDevice {
     }
 
     pub fn pump_local(&mut self, player: &mut Player) -> Result<(), i32> {
+        if !self.stream_active {
+            return Ok(());
+        }
+        self.sync_status(player)?;
+        if player.state == PlaybackState::Paused {
+            return Ok(());
+        }
+        if self.feed_epoch != 0 {
+            return self.pump_feeder();
+        }
         if self.local_fd < 0 {
             return Ok(());
         }
-        for _ in 0..LOCAL_BURST_CHUNKS {
-            if !player.flush_audio(self)? {
-                return Ok(());
-            }
-            let mut chunk = alloc::vec![0u8; LOCAL_READ_CHUNK];
-            let count = unsafe {
-                nuttx_read(
-                    self.local_fd,
-                    chunk.as_mut_ptr().cast::<c_void>(),
-                    chunk.len() as u32,
-                )
-            };
-            if count < 0 {
-                self.last_stage = STAGE_LOCAL_READ;
-                self.close_local();
-                return Err(neg_errno(count));
-            }
-            if count == 0 {
-                if player.stream_ended(self)? {
-                    self.close_local();
+        let mut buffer = core::mem::take(&mut self.buffer);
+        let result = (|| {
+            for _ in 0..LOCAL_BURST_CHUNKS {
+                if self.offset < self.buffered {
+                    let accepted = self.write(&buffer[self.offset..self.buffered])?;
+                    self.offset += accepted;
+                    if self.offset < self.buffered {
+                        return Ok(());
+                    }
                 }
-                return Ok(());
+                self.last_stage = STAGE_LOCAL_READ;
+                let count = unsafe {
+                    nuttx_read(
+                        self.local_fd,
+                        buffer.as_mut_ptr().cast::<c_void>(),
+                        buffer.len() as u32,
+                    )
+                };
+                if count < 0 {
+                    return Err(neg_errno(count));
+                }
+                self.buffered = count as usize;
+                self.offset = 0;
+                if count == 0 {
+                    // EOF is not playback completion. The decoder and headset still
+                    // own the tail. Keep polling until the driver marks it STOPPED.
+                    AudioSink::drain(self)?;
+                    self.draining = true;
+                    self.drain_started_ms = monotonic_ms().unwrap_or(0);
+                    self.close_local();
+                    return Ok(());
+                }
             }
-            chunk.truncate(count as usize);
-            if !player.push_audio(chunk, self)? {
-                return Ok(());
+            Ok(())
+        })();
+        self.buffer = buffer;
+        result
+    }
+
+    /// Moves what the UI owner's reader has ready into the decoder's ring; never touches a file.
+    fn pump_feeder(&mut self) -> Result<(), i32> {
+        // The reader's chunks are as large as the local ones: allow as many per tick.
+        for _ in 0..LOCAL_BURST_CHUNKS {
+            match feeder::front(self.feed_epoch) {
+                Front::Data(bytes) => {
+                    self.feed_dry_since_ms = 0;
+                    let accepted = self.write(bytes)?;
+                    feeder::consume(accepted);
+                    self.feed_taken += accepted as u64;
+                    if accepted < bytes.len() {
+                        return Ok(());
+                    }
+                }
+                Front::Pending => {
+                    let now = monotonic_ms().unwrap_or(0).max(1);
+                    if self.feed_dry_since_ms == 0 {
+                        self.feed_dry_since_ms = now;
+                    } else if now.saturating_sub(self.feed_dry_since_ms) >= FEED_STALL_MS {
+                        let path = core::mem::take(&mut self.feed_path);
+                        if self.resume_local(&path, self.feed_taken) {
+                            feeder::stop();
+                            self.feed_epoch = 0;
+                        } else {
+                            self.feed_path = path;
+                            self.feed_dry_since_ms = now;
+                        }
+                    }
+                    return Ok(());
+                }
+                Front::End => {
+                    AudioSink::drain(self)?;
+                    self.draining = true;
+                    self.drain_started_ms = monotonic_ms().unwrap_or(0);
+                    self.close_local();
+                    return Ok(());
+                }
+                Front::Failed(error) => {
+                    self.last_stage = STAGE_LOCAL_READ;
+                    return Err(error);
+                }
             }
         }
+        Ok(())
+    }
+
+    fn sync_status(&mut self, player: &mut Player) -> Result<(), i32> {
+        if self.dry.is_some() {
+            if self.draining {
+                self.stream_active = false;
+                player.state = PlaybackState::Draining;
+            } else if player.state != PlaybackState::Paused {
+                player.state = PlaybackState::Playing;
+            }
+            if let Some(position) = self.playback_position_ms() {
+                player.sync_position(position);
+            }
+            return Ok(());
+        }
+        let status = self.status()?;
+        if self.draining
+            && monotonic_ms()
+                .is_some_and(|now| now.saturating_sub(self.drain_started_ms) > DRAIN_LIMIT_MS)
+        {
+            self.stream_active = false;
+            player.state = PlaybackState::Draining;
+            return Ok(());
+        }
+        if status.state == AUDIO_STATE_ERROR {
+            return Err(if status.last_error < 0 {
+                status.last_error
+            } else {
+                EIO
+            });
+        }
+        let position = self
+            .samples
+            .observe(status.pcm_frames, status.decoded_sample_rate);
+        player.sync_position(position);
+        player.state = match status.state {
+            AUDIO_STATE_PAUSED => PlaybackState::Paused,
+            AUDIO_STATE_STOPPED if self.draining => {
+                self.stream_active = false;
+                PlaybackState::Draining
+            }
+            AUDIO_STATE_PLAYING | AUDIO_STATE_DRAINING if status.pcm_frames != 0 => {
+                PlaybackState::Playing
+            }
+            _ => PlaybackState::Buffering,
+        };
         Ok(())
     }
 
@@ -533,6 +783,11 @@ impl AudioDevice {
         }
         self.prepare_and_prebuffer()?;
         self.position_base_ms = position_ms;
+        self.samples.reset(position_ms);
+        self.buffered = 0;
+        self.offset = 0;
+        self.draining = false;
+        self.stream_active = true;
         player.prebuffered_stream_started_at(String::from("local"), position_ms);
         self.pump_local(player)?;
         if remain_paused {
@@ -543,10 +798,15 @@ impl AudioDevice {
     }
 
     pub fn playback_position_ms(&self) -> Option<u32> {
-        if self.local_fd < 0 {
+        if !self.stream_active {
             return None;
         }
-        let started_at = self.position_started_at_ms?;
+        if self.dry.is_none() {
+            return Some(self.samples.position_ms());
+        }
+        let Some(started_at) = self.position_started_at_ms else {
+            return Some(self.position_base_ms);
+        };
         let elapsed_ms = monotonic_ms()?.saturating_sub(started_at);
         Some(
             self.position_base_ms
@@ -555,9 +815,13 @@ impl AudioDevice {
     }
 
     pub fn stop_local(&mut self) {
-        if self.local_fd >= 0 {
+        if self.stream_active || self.local_fd >= 0 || self.feed_epoch != 0 {
             let _ = AudioSink::stop(self);
         }
+        self.stream_active = false;
+        self.draining = false;
+        self.buffered = 0;
+        self.offset = 0;
         self.close_local();
     }
 
@@ -569,8 +833,10 @@ impl AudioDevice {
         if self.local_fd >= 0 {
             let _ = unsafe { nuttx_close(self.local_fd) };
             self.local_fd = -1;
-            self.position_base_ms = 0;
-            self.position_started_at_ms = None;
+        }
+        if self.feed_epoch != 0 {
+            feeder::stop();
+            self.feed_epoch = 0;
         }
     }
 }
@@ -592,11 +858,26 @@ impl AudioSink for AudioDevice {
 
     fn start(&mut self) -> Result<(), Self::Error> {
         self.ioctl(IOC_START)?;
-        self.position_started_at_ms = monotonic_ms();
+        // Only Mirage's null sink uses wall time. Real playback starts when the
+        // driver actually decodes media, potentially seconds after this ioctl.
+        self.position_started_at_ms = if self.dry.is_some() {
+            monotonic_ms()
+        } else {
+            None
+        };
         Ok(())
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
+        if let Some(dry) = &mut self.dry {
+            let now = monotonic_ms().unwrap_or(dry.last_ms);
+            dry.credit =
+                (dry.credit + now.saturating_sub(dry.last_ms) * DRY_BYTES_PER_MS).min(64 * 1024);
+            dry.last_ms = now;
+            let accepted = (bytes.len() as u64).min(dry.credit);
+            dry.credit -= accepted;
+            return Ok(accepted as usize);
+        }
         self.last_stage = STAGE_AUDIO_WRITE;
         let fd = self.ensure_open()?;
         let count = u32::try_from(bytes.len()).map_err(|_| -1)?;
@@ -630,7 +911,11 @@ impl AudioSink for AudioDevice {
 
     fn resume(&mut self) -> Result<(), Self::Error> {
         self.ioctl(IOC_RESUME)?;
-        self.position_started_at_ms = monotonic_ms();
+        self.position_started_at_ms = if self.dry.is_some() {
+            monotonic_ms()
+        } else {
+            None
+        };
         Ok(())
     }
 
@@ -638,6 +923,8 @@ impl AudioSink for AudioDevice {
         self.ioctl(IOC_STOP)?;
         self.position_base_ms = 0;
         self.position_started_at_ms = None;
+        self.samples.reset(0);
+        self.stream_active = false;
         Ok(())
     }
 

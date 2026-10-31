@@ -1,10 +1,16 @@
 use canopus_abi::*;
 use canopus_runtime::{status_put_u32, status_writer_publish};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 static LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+/// The Supervisor's service context, kept for the module's lifetime.
+static CONTEXT: AtomicPtr<CanopusContext> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn context() -> *const CanopusContext {
+    CONTEXT.load(Ordering::Acquire)
+}
 
 const MAGIC: u32 = 0x4C59_5241;
 
@@ -36,7 +42,8 @@ const CANOPUS_DEVICE_PATH: &[u8] = b"/dev/canopus\0";
 const TARGET_ID: &[u8] = b"host-test";
 
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
+pub extern "C" fn canopus_mod_prepare(ctx: *const ContextV1) -> i32 {
+    CONTEXT.store(ctx as *mut CanopusContext, Ordering::Release);
     ACTIVE.store(false, Ordering::Release);
     RESIDENT.store(false, Ordering::Release);
     LAST_ERROR.store(0, Ordering::Release);
@@ -47,7 +54,10 @@ pub extern "C" fn canopus_mod_prepare(_ctx: *const ContextV1) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn canopus_mod_activate(_ctx: *const ContextV1) -> i32 {
+pub extern "C" fn canopus_mod_activate(ctx: *const ContextV1) -> i32 {
+    if !ctx.is_null() {
+        CONTEXT.store(ctx as *mut CanopusContext, Ordering::Release);
+    }
     #[cfg(feature = "device")]
     let result = {
         crate::target::prepare();
@@ -230,5 +240,27 @@ mod tests {
         assert!(unsafe { status_writer_init(&mut writer, bytes.as_mut_ptr(), bytes.len() as u32) });
         assert_eq!(canopus_mod_query(&mut writer), -1);
         assert_eq!(writer.dropped, 1);
+    }
+
+    /// The launcher icon is embedded in the module; the verifier takes any word 0x0cXXXXXX in the
+    /// module's data for a flash address unless `Canopus.toml` lists it. Alpha 0x0c pixels are such
+    /// words, so every one of them has to be listed.
+    #[test]
+    fn every_icon_pixel_that_looks_like_a_flash_address_is_allowed_in_the_manifest() {
+        let icon = include_bytes!("../assets/appicon.bin");
+        assert_eq!(icon.len(), 12 + 117 * 117 * 4, "a 117x117 ARGB8888 LVGL image");
+        let manifest = include_str!("../../../Canopus.toml");
+        let allowed: Vec<u32> = manifest
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').trim_matches('"').strip_prefix("0x"))
+            .filter_map(|hex| u32::from_str_radix(hex, 16).ok())
+            .collect();
+        let missing: Vec<String> = icon
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .filter(|word| word >> 24 == 0x0c && !allowed.contains(word))
+            .map(|word| format!("{word:#010x}"))
+            .collect();
+        assert!(missing.is_empty(), "add to allowed_constants in Canopus.toml: {missing:?}");
     }
 }

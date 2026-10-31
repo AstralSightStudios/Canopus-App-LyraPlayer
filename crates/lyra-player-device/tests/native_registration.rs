@@ -22,6 +22,8 @@ pub struct firmware_page_descriptor {
     on_resume: *mut c_void,
     on_pause: *mut c_void,
     on_destroy: *mut c_void,
+    on_ui_destroy: *mut c_void,
+    extension_callback_100: *mut c_void,
 }
 
 mod runtime {
@@ -54,8 +56,12 @@ mod runtime {
     }
 }
 
-mod ui_backend {
+mod ui {
     use core::ffi::c_void;
+
+    pub mod assets {
+        pub fn ensure_launcher_icon() {}
+    }
 
     pub fn page_create(_: usize, _: *mut c_void) -> i32 {
         0
@@ -85,7 +91,7 @@ unsafe extern "C" fn register(_: *const ContextV1, entry: *const AppEntryV1) -> 
     assert_eq!(unsafe { CStr::from_ptr(entry.label) }.to_bytes(), b"Lyra");
     assert_eq!(
         unsafe { CStr::from_ptr(entry.icon) }.to_bytes(),
-        b"/data/canopus/appicon_lyra.bin"
+        b"/data/canopus/m.lyra_player/appicon.bin"
     );
     assert_eq!(entry.page_count as usize, native_app::PAGE_COUNT);
     let pages = unsafe { std::slice::from_raw_parts(entry.pages, entry.page_count as usize) };

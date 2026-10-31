@@ -226,6 +226,68 @@ fn utf16(bytes: &[u8], default_big_endian: bool) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
+/// The part of an MP3 file that holds its audio: leading ID3v2 tags and trailing APEv2 and ID3v1
+/// tags are left out. The watch only plays the frames, and a tag with embedded artwork is often
+/// larger than a minute of audio: it took that much longer to send, and seconds at the start of
+/// every playback to read past.
+pub fn audio_range<R: Read + Seek>(file: &mut R) -> std::io::Result<(u64, u64)> {
+    let len = file.seek(SeekFrom::End(0))?;
+    let mut start = 0u64;
+    // Some writers stack several tags.
+    loop {
+        let mut header = [0u8; 10];
+        file.seek(SeekFrom::Start(start))?;
+        if read_up_to(file, &mut header)? < header.len()
+            || &header[..3] != b"ID3"
+            || header[3] == 0xFF
+            || header[4] == 0xFF
+            || header[6..10].iter().any(|byte| byte & 0x80 != 0)
+        {
+            break;
+        }
+        let footer = if header[5] & 0x10 != 0 { 10 } else { 0 };
+        let next = start + 10 + syncsafe(&header[6..10]) + footer;
+        if next >= len {
+            // A tag that claims the rest of the file is damaged; send the file as it is.
+            return Ok((0, len));
+        }
+        start = next;
+    }
+    let mut end = len;
+    if end - start >= ID3V1_BYTES as u64 {
+        let mut marker = [0u8; 3];
+        file.seek(SeekFrom::Start(end - ID3V1_BYTES as u64))?;
+        if read_up_to(file, &mut marker)? == marker.len() && &marker == b"TAG" {
+            end -= ID3V1_BYTES as u64;
+        }
+    }
+    // An APEv2 footer: "APETAGEX", version, size (footer and items), item count, flags.
+    if end - start >= 32 {
+        let mut footer = [0u8; 32];
+        file.seek(SeekFrom::Start(end - 32))?;
+        if read_up_to(file, &mut footer)? == footer.len() && &footer[..8] == b"APETAGEX" {
+            let size = u64::from(u32::from_le_bytes([footer[12], footer[13], footer[14], footer[15]]));
+            let flags = u32::from_le_bytes([footer[20], footer[21], footer[22], footer[23]]);
+            let header = if flags & (1 << 31) != 0 { 32 } else { 0 };
+            if size >= 32 && size + header <= end - start {
+                end -= size + header;
+            }
+        }
+    }
+    Ok((start, end))
+}
+
+fn read_up_to<R: Read>(file: &mut R, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            count => filled += count,
+        }
+    }
+    Ok(filled)
+}
+
 fn read_id3v1(file: &mut File) -> Option<TrackTags> {
     file.seek(SeekFrom::End(-ID3V1_BYTES)).ok()?;
     let mut block = [0u8; ID3V1_BYTES as usize];
@@ -327,6 +389,61 @@ mod tests {
         let tags = read_tags(&path);
         let _ = fs::remove_dir_all(directory);
         tags
+    }
+
+    fn ape_tag(items: &[u8], with_header: bool) -> Vec<u8> {
+        let size = (items.len() + 32) as u32;
+        let flags: u32 = if with_header { 1 << 31 } else { 0 };
+        let block = |marker_flags: u32| {
+            let mut out = b"APETAGEX".to_vec();
+            out.extend(2000u32.to_le_bytes());
+            out.extend(size.to_le_bytes());
+            out.extend(1u32.to_le_bytes());
+            out.extend((flags | marker_flags).to_le_bytes());
+            out.extend([0u8; 8]);
+            out
+        };
+        let mut out = Vec::new();
+        if with_header {
+            out.extend(block(1 << 29));
+        }
+        out.extend(items);
+        out.extend(block(0));
+        out
+    }
+
+    fn range_of(bytes: &[u8]) -> (u64, u64) {
+        audio_range(&mut std::io::Cursor::new(bytes)).unwrap()
+    }
+
+    #[test]
+    fn audio_range_leaves_out_every_tag() {
+        let audio = [0xFFu8, 0xFB, 0x90, 0x64, 1, 2, 3, 4, 5, 6];
+        let first = tag(4, &[frame(4, b"APIC", &[7u8; 5000])]);
+        let second = tag(3, &[frame(3, b"TIT2", &text(0, b"Title"))]);
+        let mut v1 = vec![0u8; 128];
+        v1[..3].copy_from_slice(b"TAG");
+        let ape = ape_tag(b"some items", true);
+        let file = [first.clone(), second.clone(), audio.to_vec(), ape, v1].concat();
+        let start = (first.len() + second.len()) as u64;
+        assert_eq!(range_of(&file), (start, start + audio.len() as u64));
+    }
+
+    #[test]
+    fn audio_range_of_an_untagged_file_is_the_file() {
+        let audio = vec![0xFFu8; 4096];
+        assert_eq!(range_of(&audio), (0, 4096));
+        let ape_without_header = [audio.clone(), ape_tag(b"x", false)].concat();
+        assert_eq!(range_of(&ape_without_header), (0, 4096));
+    }
+
+    #[test]
+    fn audio_range_keeps_a_file_whose_tag_claims_too_much() {
+        let mut file = tag(4, &[frame(4, b"TIT2", &text(3, b"x"))]);
+        // The size now runs past the end of the file.
+        file[6..10].copy_from_slice(&syncsafe_bytes(1 << 20));
+        file.extend([0xFF, 0xFB, 0x90, 0x64]);
+        assert_eq!(range_of(&file), (0, file.len() as u64));
     }
 
     #[test]

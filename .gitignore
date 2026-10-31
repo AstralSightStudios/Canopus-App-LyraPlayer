@@ -2,9 +2,6 @@
 /build/
 /.claude/worktrees/
 /plugins/*/target/
-/quickapps/*/node_modules/
-/quickapps/*/build/
-/quickapps/*/dist/
 __pycache__/
 /watchfaces/lyra-player/module.bin
 /watchfaces/lyra-player/receipt.bin
@@ -17,3 +14,6 @@ __pycache__/
 !/watchfaces/lyra-player-prod/xiaomi-band-*/main.lua
 !/watchfaces/lyra-player-prod/xiaomi-band-*/docs/
 .DS_Store
+dist/
+/Canopus.dev-*.toml
+/shots/

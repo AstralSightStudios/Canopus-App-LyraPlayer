@@ -1,14 +1,22 @@
-//! Read-only adapter for the Lyra Import quick application's shared files.
+//! Reads the library the importer maintains under the module directory.
+//! Raw firmware file calls are used for reads because the Bluetooth thread
+//! streams the same files; the module context is only needed for `stat`.
 
 use alloc::{string::String, vec::Vec};
 use core::ffi::c_void;
 
-use canopus_target_private::{O_RDONLY, nuttx_close, nuttx_lseek, nuttx_open, nuttx_read};
-use lyra_player_core::persistence::Store;
+use canopus_runtime::fs;
+use canopus_target_private::{O_RDONLY, nuttx_close, nuttx_open, nuttx_read};
+use lyra_player_core::{
+    ROOT,
+    lyrics::{Lyrics, parse_lrc},
+    persistence::{LIBRARY_FILE, Library, PersistenceError, Store},
+};
 
-pub const IMPORT_ROOT: &str = "/data/files/com.canopus.lyraimport/lyra";
-const LEGACY_IMPORT_ROOT: &str = "/data/quickapp/files/com.canopus.lyraimport/lyra";
-const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+use crate::module::context;
+
+const MAX_LIBRARY_BYTES: usize = 256 * 1024;
+const MAX_LYRICS_BYTES: usize = 64 * 1024;
 
 pub struct FsStore;
 
@@ -22,34 +30,23 @@ fn c_path(path: &str) -> Result<Vec<u8>, i32> {
     Ok(output)
 }
 
-fn path_exists(path: &str) -> bool {
-    let Ok(path) = c_path(path) else {
-        return false;
-    };
-    let fd = unsafe { nuttx_open(path.as_ptr(), O_RDONLY) };
-    if fd < 0 {
-        return false;
-    }
-    unsafe { nuttx_close(fd) >= 0 }
-}
-
-pub fn resolve_path(path: &str) -> Option<String> {
-    if !path.starts_with(IMPORT_ROOT) && !path.starts_with(LEGACY_IMPORT_ROOT) {
-        return None;
-    }
-    if path_exists(path) {
-        return Some(String::from(path));
-    }
-    let relative = path.strip_prefix(IMPORT_ROOT)?.strip_prefix('/')?;
-    let legacy = alloc::format!("{LEGACY_IMPORT_ROOT}/{relative}");
-    path_exists(&legacy).then_some(legacy)
+/// Whether `path` names something inside the module directory.
+pub fn is_module_path(path: &str) -> bool {
+    path.strip_prefix(ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest.len() <= 200
+                && !rest.contains("..")
+                && !rest.bytes().any(|byte| byte == 0 || byte.is_ascii_control())
+        })
 }
 
 fn read_bounded(path: &str, limit: usize) -> Result<Option<Vec<u8>>, i32> {
-    let Some(path) = resolve_path(path) else {
-        return Ok(None);
-    };
-    let path = c_path(&path)?;
+    if !is_module_path(path) {
+        return Err(-7);
+    }
+    let path = c_path(path)?;
     let fd = unsafe { nuttx_open(path.as_ptr(), O_RDONLY) };
     if fd < 0 {
         return Ok(None);
@@ -83,63 +80,40 @@ impl Store for FsStore {
     type Error = i32;
 
     fn read(&mut self, path: &str) -> Result<Option<Vec<u8>>, Self::Error> {
-        read_bounded(path, MAX_MANIFEST_BYTES)
+        read_bounded(path, MAX_LIBRARY_BYTES)
     }
 }
 
-pub fn load_library() -> Result<Vec<lyra_player_core::Song>, i32> {
-    lyra_player_core::persistence::load_library(&mut FsStore).map_err(map_error)
+pub fn load_library() -> Result<Library, i32> {
+    lyra_player_core::persistence::load_library(&mut FsStore).map_err(|error| match error {
+        PersistenceError::Storage(error) => error,
+        PersistenceError::Json => -5,
+        PersistenceError::Version => -6,
+    })
 }
 
-pub fn validate_lvgl_v9_image(path: &str, width: u16, height: u16) -> bool {
-    lvgl_v9_image_size(path) == Some((width, height))
+/// A cheap fingerprint of the library file (size and modification time), 0
+/// when there is none. A changed stamp is what makes the page reload it.
+pub fn library_stamp() -> u32 {
+    let ctx = context();
+    if ctx.is_null() {
+        return 0;
+    }
+    fs::stat(ctx, LIBRARY_FILE)
+        .map(|stat| stat.size.rotate_left(16) ^ stat.mtime ^ 0x4C59_0000)
+        .unwrap_or(0)
 }
 
-/// Dimensions of a well-formed ARGB8888 LVGL v9 BIN whose length matches its
-/// header, or `None` for anything else.
-pub fn lvgl_v9_image_size(path: &str) -> Option<(u16, u16)> {
-    let path = resolve_path(path)?;
-    let path = c_path(&path).ok()?;
-    let fd = unsafe { nuttx_open(path.as_ptr(), O_RDONLY) };
-    if fd < 0 {
-        return None;
-    }
-    let mut header = [0u8; 12];
-    let mut read = 0usize;
-    while read < header.len() {
-        let count = unsafe {
-            nuttx_read(
-                fd,
-                header[read..].as_mut_ptr().cast::<c_void>(),
-                (header.len() - read) as u32,
-            )
-        };
-        if count <= 0 {
-            let _ = unsafe { nuttx_close(fd) };
-            return None;
-        }
-        read += count as usize;
-    }
-    let length = unsafe { nuttx_lseek(fd, 0, 2) };
-    let close = unsafe { nuttx_close(fd) };
-    let width = u16::from_le_bytes([header[4], header[5]]);
-    let height = u16::from_le_bytes([header[6], header[7]]);
-    let expected = 12i64 + i64::from(width) * i64::from(height) * 4;
-    let valid = close >= 0
-        && length == expected
-        && header[0..4] == [0x19, 0x10, 0, 0]
-        && width
-            .checked_mul(4)
-            .is_some_and(|stride| u16::from_le_bytes([header[8], header[9]]) == stride)
-        && header[10..12] == [0, 0];
-    valid.then_some((width, height))
+pub fn read_lyrics(path: &str) -> Option<Lyrics> {
+    let bytes = read_bounded(path, MAX_LYRICS_BYTES).ok()??;
+    let text: String = String::from_utf8(bytes).ok()?;
+    let lyrics = parse_lrc(&text);
+    (!lyrics.is_empty()).then_some(lyrics)
 }
 
-fn map_error(error: lyra_player_core::persistence::PersistenceError<i32>) -> i32 {
-    match error {
-        lyra_player_core::persistence::PersistenceError::Storage(error) => error,
-        lyra_player_core::persistence::PersistenceError::Json => -5,
-        lyra_player_core::persistence::PersistenceError::Version => -6,
-        lyra_player_core::persistence::PersistenceError::UnsafePath => -7,
-    }
+/// Emulator aid: a `dry-run` file in the module directory makes the player
+/// run without an audio sink.
+pub fn dry_run_enabled() -> bool {
+    let ctx = context();
+    !ctx.is_null() && fs::exists(ctx, "dry-run")
 }

@@ -1,0 +1,622 @@
+// AstroBox 插件 API Level 4 的宿主接口。
+//
+// 与 `astrobox:psys-host`（Level 2/3）相比有三点**刻意的**不同，不是随手改的：
+//
+//  1. 所有会等待的接口一律是 `async func`，而不再是 `func() -> future<T>`。
+//     组件模型把 `async` 记在**函数类型**上，宿主运行时据此决定一个 guest task
+//     是否允许阻塞（wasmtime: `may_block = ty.async_ || 已返回`）。声明成普通
+//     `func` 的导出/导入里一旦 await 宿主调用就会 trap（CannotBlockSyncTask）。
+//     用 `async func` 之后，即使某些语言的工具链只会做同步 lift/lower（例如
+//     JavaScript 的 ComponentizeJS），也依然被允许阻塞等待宿主返回——这是
+//     JS / Python 能被官方支持的前提。
+//
+//  2. 不再出现 `future<T>`。`future<T>` 在 Rust 之外的 guest 绑定里基本不可用，
+//     去掉之后 JS / Python 拿到的就是普通的异步函数。
+//
+//  3. 失败一律是 `result<_, string>` 而不是裸 `result`，插件能拿到错误原因。
+//
+// 纯粹的本地操作（构建 UI 节点、注册回调、投递事件）保持同步 `func`，因为它们
+// 不会等待，声明成 async 只会徒增 guest 侧开销。
+
+package astrobox:psys-host-v4;
+
+interface os {
+    // 持久的宿主安装标识；不是硬件序列号，清除应用数据后会改变。
+    device-id: async func() -> result<string, string>;
+    arch: async func() -> string;
+    hostname: async func() -> string;
+    locale: async func() -> string;
+    platform: async func() -> string;
+    version: async func() -> string;
+    astrobox-language: async func() -> string;
+    appearance: async func() -> string;
+    timezone-offset-minutes: async func() -> s32;
+}
+
+interface transport {
+    enum protocol {
+        XIAOMI-VELA-V5-PROTOBUF,
+    }
+
+    send: async func(device-addr: string, data: list<u8>) -> result<_, string>;
+    request: async func(device-addr: string, data: list<u8>) -> result<list<u8>, string>;
+
+    // 纯编解码，不涉及等待。
+    to-json: func(protocol: protocol, data: list<u8>) -> string;
+    from-json: func(protocol: protocol, data: string) -> result<list<u8>, string>;
+}
+
+interface clipboard {
+    read-text: async func() -> result<string, string>;
+    write-text: async func(text: string) -> result<_, string>;
+}
+
+interface dialog {
+    enum dialog-type {
+        ALERT,
+        INPUT
+    }
+
+    enum dialog-style {
+        WEBSITE,
+        SYSTEM
+    }
+
+    record dialog-button {
+        id: string,
+        primary: bool,
+        content: string
+    }
+
+    record dialog-info {
+        title: string,
+        content: string,
+        buttons: list<dialog-button>
+    }
+
+    record dialog-result {
+        clicked-btn-id: string,
+        input-result: string
+    }
+
+    record pick-config {
+        read: bool,
+        copy-to: option<string>,
+    }
+
+    record filter-config {
+        multiple: bool,
+        extensions: list<string>,
+        default-directory: string,
+        default-file-name: string,
+    }
+
+    record pick-result {
+        name: string,
+        data: list<u8>,
+    }
+
+    record save-session {
+        session-id: u64,
+        name: string,
+    }
+
+    show-dialog: async func(dialog-type: dialog-type, style: dialog-style, info: dialog-info) -> dialog-result;
+
+    pick-file: async func(config: pick-config, filter: filter-config) -> result<pick-result, string>;
+
+    save-file-start: async func(filter: filter-config) -> result<save-session, string>;
+    save-file-write-chunk: async func(session-id: u64, data: list<u8>) -> result<_, string>;
+    save-file-finish: async func(session-id: u64) -> result<_, string>;
+    save-file-abort: async func(session-id: u64);
+
+    open-url: func(url: string);
+}
+
+interface ui {
+    enum element-type {
+        BUTTON,
+        INPUT,
+        SELECT,
+        OPTION,
+        IMAGE,
+        VIDEO,
+        AUDIO,
+        SVG,
+        DIV,
+        SPAN,
+        P,
+        TEXTAREA,
+        SWITCH,
+        SLIDER,
+        PROGRESS,
+        GRID,
+        SCROLL-AREA,
+        CODE,
+        CARD,
+        TABS-ROOT,
+        TABS-LIST,
+        TABS-TRIGGER,
+        TABS-CONTENT,
+        CONTEXT-MENU-ROOT,
+        CONTEXT-MENU-TRIGGER,
+        CONTEXT-MENU-CONTENT,
+        CONTEXT-MENU-ITEM,
+        CONTEXT-MENU-SEPARATOR,
+        DIALOG-ROOT,
+        DIALOG-TRIGGER,
+        DIALOG-CONTENT,
+        DIALOG-TITLE,
+        DIALOG-DESCRIPTION,
+        DIALOG-CLOSE,
+        DROPDOWN-MENU-ROOT,
+        DROPDOWN-MENU-TRIGGER,
+        DROPDOWN-MENU-CONTENT,
+        DROPDOWN-MENU-ITEM,
+        DROPDOWN-MENU-SEPARATOR,
+        TOOLTIP,
+        CHECKBOX,
+        SEPARATOR,
+        BADGE,
+    }
+
+    enum flex-direction {
+        ROW,
+        COLUMN,
+        ROW-REVERSE,
+        COLUMN-REVERSE,
+    }
+
+    // 构建 UI 树的过程全是本地操作，保持同步。
+    resource element{
+        constructor(element-type:element-type,content:option<string>);
+        content:func(content:option<string>) -> element;
+        prop:func(name:string,value:string) -> element;
+
+        flex:func() -> element;
+        flex-direction:func(direction:flex-direction) -> element;
+
+        margin:func(margin:u32) -> element;
+        margin-top:func(margin:u32) -> element;
+        margin-bottom:func(margin:u32) -> element;
+        margin-left:func(margin:u32) -> element;
+        margin-right:func(margin:u32) -> element;
+
+        padding:func(padding:u32) -> element;
+        padding-top:func(padding:u32) -> element;
+        padding-bottom:func(padding:u32) -> element;
+        padding-left:func(padding:u32) -> element;
+        padding-right:func(padding:u32) -> element;
+
+        align-center:func() -> element;
+        align-end:func() -> element;
+        align-start:func() -> element;
+
+        justify-center:func() -> element;
+        justify-start:func() -> element;
+        justify-end:func() -> element;
+
+        bg:func(color:string) -> element;
+        text-color:func(color:string) -> element;
+
+        size:func(size:u32) -> element;
+        width:func(width:u32) -> element;
+        width-full:func() -> element;
+        width-half:func() -> element;
+        height:func(height:u32) -> element;
+        height-full:func() -> element;
+        height-half:func() -> element;
+        radius:func(radius:u32) -> element;
+        border:func(width:u32,color:string) -> element;
+
+        relative:func() -> element;
+        absolute:func() -> element;
+
+        top:func(position:u32) -> element;
+        bottom:func(position:u32) -> element;
+        left:func(position:u32) -> element;
+        right:func(position:u32) -> element;
+
+        opacity:func(opacity:f32) -> element;
+        transition:func(transition:string) -> element;
+        transform:func(value:string) -> element;
+        transform-origin:func(value:string) -> element;
+        animation:func(value:string) -> element;
+        animation-name:func(name:string) -> element;
+        animation-duration-ms:func(ms:u32) -> element;
+        animation-delay-ms:func(ms:u32) -> element;
+        animation-easing:func(easing:string) -> element;
+        animation-iteration-count:func(count:string) -> element;
+        animation-direction:func(direction:string) -> element;
+        animation-fill-mode:func(fill-mode:string) -> element;
+        animation-play-state:func(play-state:string) -> element;
+        animation-preset:func(name:string) -> element;
+        will-change:func(value:string) -> element;
+        filter:func(value:string) -> element;
+        backdrop-filter:func(value:string) -> element;
+        perspective:func(value:string) -> element;
+        backface-visibility:func(value:string) -> element;
+        without-default-styles:func() -> element;
+        autofocus:func() -> element;
+        tab-index:func(index:s32) -> element;
+
+        z-index:func(z:s32) -> element;
+        disabled:func() -> element;
+
+        child:func(child:element) -> element;
+
+        on:func(event:event,id:string) -> element;
+
+        grid-template-columns:func(columns:string) -> element;
+        gap:func(spacing:u32) -> element;
+
+        max-width:func(width:u32) -> element;
+        max-height:func(height:u32) -> element;
+        min-width:func(width:u32) -> element;
+        min-height:func(height:u32) -> element;
+        scroll-top:func(position:u32) -> element;
+        scroll-left:func(position:u32) -> element;
+        scroll-to:func(top:u32, left:u32) -> element;
+        scroll-behavior:func(behavior:string) -> element;
+
+        flex-grow:func(value:f32) -> element;
+        flex-shrink:func(value:f32) -> element;
+    }
+
+    enum event {
+        CLICK,
+        HOVER,
+        CHANGE,
+        INPUT,
+        FOCUS,
+        BLUR,
+        MOUSE-ENTER,
+        MOUSE-LEAVE,
+        POINTER-DOWN,
+        POINTER-UP,
+        POINTER-MOVE,
+        KEY-DOWN,
+        KEY-UP,
+        LONG-PRESS,
+    }
+
+    // 插件UI实际可渲染区域的尺寸（CSS像素，已向下取整）。
+    record render-size {
+        width: u32,
+        height: u32,
+    }
+
+    render:func(id:string,el:element);
+    render-to-text-card:func(id:string,text:string);
+
+    // 获取当前插件UI渲染容器的尺寸，供插件做自适应布局。
+    // 若渲染区域尚未挂载或不可知，width/height 返回 0。
+    get-render-size: async func() -> render-size;
+}
+
+interface device {
+    record device-info {
+        name: string,
+        addr: string
+    }
+
+    get-device-list: async func() -> list<device-info>;
+    get-connected-device-list: async func() -> list<device-info>;
+    disconnect-device: async func(addr: string) -> result<_, string>;
+}
+
+interface register {
+    record transport-recv-filer {
+        xiaomi-vela-v5-channel-id: u32,
+        xiaomi-vela-v5-protobuf-typeid: u32,
+    }
+
+    enum provider-type {
+        URL,
+        CUSTOM
+    }
+
+    enum card-type {
+        ELEMENT,
+        TEXT
+    }
+
+    register-transport-recv: async func(addr: string, filter: transport-recv-filer) -> result<_, string>;
+    register-interconnect-recv: async func(addr: string, pkg-name: string) -> result<_, string>;
+    register-deeplink-action: async func() -> result<_, string>;
+    register-provider: async func(name: string, provider-type: provider-type) -> result<_, string>;
+    register-card: async func(card-type: card-type, id: string, name: string) -> result<_, string>;
+}
+
+interface event {
+    send-event: func(event-name: string, payload: string);
+}
+
+interface provider-callback {
+    resolve-provider-action: func(request-id: string, response: string) -> bool;
+    report-provider-action-progress: func(request-id: string, progress: f32, status: string) -> bool;
+}
+
+interface queue {
+    enum resource-type {
+        quickapp,
+        watchface,
+        firmware
+    }
+
+    add-resource-to-queue: func(res-type: resource-type, file-path: string);
+}
+
+interface timer {
+    // 定时器的建立与取消都是本地操作，立刻返回；到期通过 on-event 的 timer 事件送达。
+    set-timeout: func(delay-ms: u64, payload: string) -> u64;
+    set-interval: func(interval-ms: u64, payload: string) -> u64;
+    clear-timer: func(timer-id: u64);
+}
+
+interface interconnect {
+    send-qaic-message: async func(device-addr: string, pkg-name: string, data: string) -> result<_, string>;
+}
+
+interface thirdpartyapp {
+    record app-info {
+        package-name: string,
+        fingerprint: list<u32>,
+        version-code: u32,
+        can-remove: bool,
+        app-name: string
+    }
+
+    launch-qa: async func(addr: string, app-info: app-info, page-name: string) -> result<_, string>;
+    get-thirdparty-app-list: async func(addr: string) -> result<list<app-info>, string>;
+}
+
+interface watchface {
+    record watchface-info {
+        id: string,
+        name: string,
+        is-current: bool,
+    }
+
+    get-watchface-list: async func(addr: string) -> result<list<watchface-info>, string>;
+    set-current-watchface: async func(addr: string, watchface-id: string) -> result<_, string>;
+}
+
+interface i18n {
+    load-json: async func(content: string) -> result<_, string>;
+}
+
+// 插件内建 HTTP 服务器。
+//
+// 典型用途是在本机起一个回环端口接 OAuth 回调，或给外部工具暴露一个小接口。
+// 插件要处理请求，需实现 `astrobox:psys-plugin-v4/http` 并把世界换成
+// `psys-world-v4-http`；没实现就调用 `start` 会直接报错。
+//
+// 请求/响应类型定义在宿主包里，插件侧的 handler 接口 `use` 这里的定义，
+// 保证两边是同一套类型。
+interface http-server {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record request {
+        // GET / POST / ... 已大写
+        method: string,
+        // 不含查询串的路径，例如 /callback
+        path: string,
+        // 查询串，不含前导 `?`；没有则为空串
+        query: string,
+        headers: list<header>,
+        body: list<u8>,
+    }
+
+    record response {
+        status: u16,
+        headers: list<header>,
+        body: list<u8>,
+    }
+
+    record server-options {
+        // 0 表示让系统分配一个空闲端口，实际端口看返回的 server-info
+        port: u16,
+        // 默认只绑 127.0.0.1。绑到所有网卡会让局域网内其他设备可访问，
+        // 需要额外的 `http-server.lan` 权限。
+        bind-all-interfaces: bool,
+    }
+
+    record server-info {
+        id: u32,
+        host: string,
+        port: u16,
+        // 可直接使用的基地址，例如 http://127.0.0.1:53124
+        url: string,
+    }
+
+    start: async func(options: server-options) -> result<server-info, string>;
+    stop: async func(id: u32) -> result<_, string>;
+    list-servers: func() -> list<server-info>;
+}
+
+// 应用内浏览器。
+//
+// 主用途是复刻第三方应用的登录流程：用它打开对方的 OAuth 授权页，并把回调地址
+// （通常是一个自定义 scheme，如 `xxxapp://oauth`）登记成拦截前缀。一旦页面要跳到
+// 该地址，宿主会**取消这次导航**并把完整 URL（带 code/state）交还插件，
+// 而不是让系统去唤起那个 App。
+interface browser {
+    record open-options {
+        url: string,
+        // 窗口/导航栏标题，留空则用页面标题
+        title: option<string>,
+        // 覆盖 UA，常用于让站点走移动版页面
+        user-agent: option<string>,
+        // 命中任一前缀即拦截。前缀按字符串前缀匹配，自定义 scheme 直接写
+        // `xxxapp://` 即可。
+        intercept-prefixes: list<string>,
+        // 命中后是否自动关闭浏览器
+        close-on-intercept: bool,
+        // 尽量使用独立/无痕的数据区，避免与用户正常浏览数据混在一起。
+        // 各平台能力不同，属尽力而为。
+        ephemeral: bool,
+        // 仅桌面端有效
+        width: option<u32>,
+        height: option<u32>,
+    }
+
+    record cookie {
+        name: string,
+        value: string,
+        domain: string,
+        path: string,
+    }
+
+    enum event-kind {
+        // 发生了一次导航（未被拦截）
+        NAVIGATED,
+        // 命中拦截前缀，导航已被取消
+        INTERCEPTED,
+        // 页面加载完成
+        LOAD-FINISHED,
+        // 浏览器被关闭（用户关闭或插件调用 close）
+        CLOSED,
+    }
+
+    record browser-event {
+        id: u32,
+        kind: event-kind,
+        url: string,
+    }
+
+    open: async func(options: open-options) -> result<u32, string>;
+
+    // 阻塞直到命中拦截前缀，返回被拦截的完整 URL。
+    // 浏览器先被关闭则返回错误；timeout-ms 省略表示一直等。
+    // 这是劫持 OAuth 回调最直接的用法。
+    wait-for-intercept: async func(id: u32, timeout-ms: option<u64>) -> result<string, string>;
+
+    navigate: async func(id: u32, url: string) -> result<_, string>;
+    current-url: async func(id: u32) -> result<string, string>;
+
+    // 在页面里执行 JS，返回 JSON 序列化后的结果。
+    eval: async func(id: u32, script: string) -> result<string, string>;
+
+    get-cookies: async func(id: u32, url: string) -> result<list<cookie>, string>;
+
+    close: async func(id: u32) -> result<_, string>;
+}
+
+interface notification {
+    record text {
+        chars: string,
+        color: option<list<u8>>,
+    }
+
+    record progress {
+        section-count: u32,
+        progress: u32,
+        color: option<list<u8>>,
+    }
+
+    record info {
+        title: text,
+        sub-title: option<text>,
+        content: option<text>,
+        sub-content: option<text>,
+        special-title: option<text>,
+        special-title-bg: option<list<u8>>,
+    }
+
+    record focus {
+        style: u32,
+        title: text,
+        content: text,
+        desc: text,
+        progress: option<progress>,
+        updatable: bool,
+        sequence: u32,
+    }
+
+    record focus-v2 {
+        scene: u32,
+        ticker: string,
+        basic-info: info,
+        hint-info: option<info>,
+        progress: option<progress>,
+        updatable: bool,
+        sequence: u32,
+    }
+
+    variant live-activity {
+        focus(focus),
+        focus-v2(focus-v2),
+    }
+
+    record message {
+        id: u32,
+        app-name: string,
+        title: string,
+        sub-title: string,
+        body: string,
+        timestamp-ms: option<u64>,
+        live-activity: option<live-activity>,
+    }
+
+    // 相同插件内 id 相同即更新；成功只表示传输入队，不保证设备显示。
+    send: async func(addr: string, message: message) -> result<_, string>;
+    remove: async func(addr: string, id: u32) -> result<_, string>;
+}
+
+interface account {
+    enum binding-status {
+        linked,
+        unlinked,
+        unavailable,
+    }
+
+    record binding {
+        provider: string,
+        status: binding-status,
+        id: option<string>,
+        username: option<string>,
+        display-name: option<string>,
+        avatar: option<string>,
+    }
+
+    record profile {
+        id: string,
+        name: string,
+        username: option<string>,
+        avatar: option<string>,
+        source: string,
+        bindings: list<binding>,
+    }
+
+    // 本地未登录时为 none；绑定查询失败时对应 status 为 unavailable。
+    get-current: async func() -> result<option<profile>, string>;
+}
+
+// CanopusConnect：与手环上的 Canopus 模块按模块名互发文本/二进制消息。
+//
+// 走 Canopus 的 L2 通道（0x43），和管理器的 RPC 共用一条流但互不干扰。一条消息就是
+// 一帧，data 最多 480 字节（按字节算，文本是 UTF-8）。需要手环上的 Supervisor 支持
+// CanopusConnect，旧版会报错。两个方向各要一个权限：
+//   * `canopusconnect.send`   —— 向模块发消息；
+//   * `canopusconnect.listen` —— 监听模块发来的消息。
+// 监听到的消息通过插件导出的 `astrobox:psys-plugin-v4/canopusconnect`（世界
+// `psys-world-v4-canopusconnect`）送达；没实现它的插件调用 `listen` 会报错。
+interface canopusconnect {
+    variant payload {
+        text(string),
+        binary(list<u8>),
+    }
+
+    // 把消息交给设备上 id 为 module 的模块。设备把消息交给该模块的监听回调后才返回；
+    // 模块不存在、没在监听、或设备不支持 CanopusConnect 都会返回原因。
+    send: async func(device-addr: string, module: string, payload: payload) -> result<_, string>;
+
+    // 开始监听 module 发来的消息。监听归当前插件所有：重复调用无副作用，插件停止时自动取消，
+    // 设备重连后宿主会补发。其他插件对同一模块的监听互不影响。
+    listen: async func(device-addr: string, module: string) -> result<_, string>;
+    unlisten: async func(device-addr: string, module: string) -> result<_, string>;
+}

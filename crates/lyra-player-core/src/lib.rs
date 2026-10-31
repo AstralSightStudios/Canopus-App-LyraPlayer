@@ -3,11 +3,16 @@
 extern crate alloc;
 
 pub mod app;
+pub mod import;
+pub mod layout;
+pub mod lyrics;
 pub mod model;
+pub mod motion;
 pub mod persistence;
 pub mod playback;
-pub mod player_layout;
-pub mod ui;
+mod playlist;
+pub mod thumbnail;
+pub mod view;
 
-pub use app::{Action, Effect, LIBRARY_PAGE_SIZE, LyraApp, Route};
+pub use app::{Action, Collection, Effect, LyraApp, Route};
 pub use model::*;
