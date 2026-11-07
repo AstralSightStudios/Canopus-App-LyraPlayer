@@ -49,6 +49,8 @@ mod allocator {
 static ALLOCATOR: allocator::FirmwareAllocator = allocator::FirmwareAllocator;
 
 mod module;
+#[cfg(any(feature = "device", test))]
+mod sleep_logic;
 
 #[cfg(feature = "device")]
 mod target;

@@ -5,7 +5,7 @@
 use alloc::{string::String, vec::Vec};
 use core::ffi::c_void;
 
-use canopus_runtime::fs;
+use canopus_runtime::{fs, kv};
 use canopus_target_private::{O_RDONLY, nuttx_close, nuttx_open, nuttx_read};
 use lyra_player_core::{
     ROOT,
@@ -17,6 +17,8 @@ use crate::module::context;
 
 const MAX_LIBRARY_BYTES: usize = 256 * 1024;
 const MAX_LYRICS_BYTES: usize = 64 * 1024;
+const TIMER_DURATION_KEY: &str = "sleep_duration_ms";
+const TIMER_AUTO_KEY: &str = "sleep_auto";
 
 pub struct FsStore;
 
@@ -90,6 +92,24 @@ pub fn load_library() -> Result<Library, i32> {
         PersistenceError::Json => -5,
         PersistenceError::Version => -6,
     })
+}
+
+pub fn load_sleep_settings() -> (u32, bool) {
+    let ctx = context();
+    let duration =
+        kv::get_int(ctx, TIMER_DURATION_KEY, 10 * 60_000).clamp(60_000, 24 * 60 * 60_000) as u32;
+    let auto = kv::get_bool(ctx, TIMER_AUTO_KEY, false);
+    (duration, auto)
+}
+
+pub fn save_sleep_settings(duration_ms: u32, auto: bool) -> Result<(), i32> {
+    let ctx = context();
+    kv::set_int(
+        ctx,
+        TIMER_DURATION_KEY,
+        duration_ms.min(i32::MAX as u32) as i32,
+    )?;
+    kv::set_bool(ctx, TIMER_AUTO_KEY, auto)
 }
 
 /// A cheap fingerprint of the library file (size and modification time), 0

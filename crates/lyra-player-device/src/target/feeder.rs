@@ -91,6 +91,7 @@ struct Shared {
 
 static SHARED: AtomicPtr<Shared> = AtomicPtr::new(core::ptr::null_mut());
 static STATE: AtomicU32 = AtomicU32::new(STATE_IDLE);
+static SETTINGS_RETRY_TICKS: AtomicU32 = AtomicU32::new(0);
 
 fn shared() -> Option<&'static Shared> {
     let pointer = SHARED.load(Ordering::Acquire);
@@ -289,6 +290,13 @@ unsafe extern "C" fn tick(_ctx: *const ContextV1, _timer: i32, user: *mut c_void
     // SAFETY: `user` is the `Shared` this timer was created with; it is never freed once the timer
     // runs. Only this timer touches `reader` and the chunk at `tail`.
     let shared = unsafe { &*user.cast::<Shared>() };
+    if super::runtime::runtime()
+        .sleep_settings_dirty
+        .load(Ordering::Acquire)
+        && SETTINGS_RETRY_TICKS.fetch_add(1, Ordering::Relaxed) % 100 == 0
+    {
+        super::persist_sleep_settings();
+    }
     let reader = unsafe { &mut *shared.reader.get() };
     read_ahead(shared, reader);
 }
@@ -406,7 +414,8 @@ impl Reader {
         let mut budget = SKIP_PER_TICK;
         while self.skip != 0 && budget != 0 {
             let want = (scratch.len() as u32).min(self.skip).min(budget);
-            let count = unsafe { nuttx_read(self.fd(), scratch.as_mut_ptr().cast::<c_void>(), want) };
+            let count =
+                unsafe { nuttx_read(self.fd(), scratch.as_mut_ptr().cast::<c_void>(), want) };
             if count <= 0 {
                 // The file ends inside its tag: the next read reports the end.
                 self.skip = 0;

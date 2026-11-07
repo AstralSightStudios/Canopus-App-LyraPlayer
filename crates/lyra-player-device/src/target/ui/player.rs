@@ -1,8 +1,7 @@
-//! The player: a horizontal pager with two pages -- the now-playing page and
-//! the lyrics page -- over a colour wash taken from the cover.
+//! The player, lyrics and sleep timer share a cover-colour background.
 //!
 //! The pager is a plain LVGL container that scrolls horizontally and snaps to
-//! its two children, so the swipe is the firmware's own scroll physics. The
+//! its children, so the swipe is the firmware's own scroll physics. The
 //! lyric page is a vertically scrolling container: the user can browse it with
 //! a finger, and while nobody touches it the active line is kept at a fixed
 //! height by animated `scroll_to_y` calls.
@@ -46,6 +45,10 @@ const W_VOL_DOWN: usize = 6;
 const W_VOL_UP: usize = 7;
 const W_PAGER: usize = 8;
 const W_VIEW: usize = 9;
+const W_SLEEP_OPEN: usize = 10;
+const W_SLEEP_MINUS: usize = 11;
+const W_SLEEP_PLUS: usize = 12;
+const W_SLEEP_AUTO: usize = 13;
 
 /// Ticks are 100 ms. The lyric view returns to the active line this long after
 /// the finger leaves it.
@@ -174,7 +177,11 @@ struct PlayerPage {
     mode: Button,
     vol_down: Button,
     vol_up: Button,
-    dots: [Obj; 2],
+    dots: [Obj; 3],
+    sleep_value: Obj,
+    sleep_auto: Obj,
+    sleep_start: Obj,
+    sleep_shown: Option<(u32, bool, bool)>,
     // lyric page
     ly_title: Obj,
     ly_view: Obj,
@@ -417,11 +424,12 @@ unsafe fn build(root: Obj) -> i32 {
     }
     let page_a = unsafe { lv::container(pager, 0, 0, M.width, M.height) };
     let page_b = unsafe { lv::container(pager, M.width, 0, M.width, M.height) };
-    if page_a.is_null() || page_b.is_null() {
+    let page_c = unsafe { lv::container(pager, 2 * M.width, 0, M.width, M.height) };
+    if page_a.is_null() || page_b.is_null() || page_c.is_null() {
         return -1;
     }
     unsafe {
-        for page in [page_a, page_b] {
+        for page in [page_a, page_b, page_c] {
             lv::add_flag(page, flag::SNAPPABLE);
             lv::clear_flag(page, flag::SCROLLABLE | flag::CLICKABLE);
         }
@@ -555,12 +563,71 @@ unsafe fn build(root: Obj) -> i32 {
         lv::show(label, false);
         label
     };
+    let timer_header = unsafe {
+        text_label(
+            page_c,
+            Rect::new(16, 24, M.width - 32, M.small_line()),
+            false,
+            true,
+            true,
+            190,
+        )
+    };
+    unsafe { set_text(timer_header, "定时关闭") };
+    let sleep_value = unsafe {
+        text_label(
+            page_c,
+            Rect::new(56, M.height / 2 - 42, M.width - 112, 40),
+            true,
+            true,
+            true,
+            255,
+        )
+    };
+    let sleep_start = unsafe {
+        let label = text_label(
+            page_c,
+            Rect::new(30, M.height / 2 + 22, M.width - 60, M.small_line()),
+            false,
+            true,
+            true,
+            255,
+        );
+        lv::add_flag(label, flag::CLICKABLE);
+        lv::on_event(label, sleep_menu_event, event::CLICKED, W_SLEEP_OPEN);
+        label
+    };
+    let sleep_auto = unsafe {
+        let label = text_label(
+            page_c,
+            Rect::new(12, M.height / 2 + 78, M.width - 24, M.small_line()),
+            false,
+            true,
+            true,
+            255,
+        );
+        lv::add_flag(label, flag::CLICKABLE);
+        lv::on_event(label, sleep_menu_event, event::CLICKED, W_SLEEP_AUTO);
+        label
+    };
+    unsafe {
+        for (x, widget, glyph) in [
+            (16, W_SLEEP_MINUS, Glyph::Minus),
+            (M.width - 64, W_SLEEP_PLUS, Glyph::Plus),
+        ] {
+            let button = lv::container(page_c, x, M.height / 2 - 46, 48, 48);
+            lv::clear_flag(button, flag::SCROLLABLE);
+            lv::add_flag(button, flag::CLICKABLE);
+            lv::on_event(button, sleep_menu_event, event::CLICKED, widget);
+            glyph_image(button, glyph, 255);
+        }
+    }
 
     // --- page indicator ----------------------------------------------------
     let dots = unsafe {
-        let mut dots = [lv::NULL; 2];
+        let mut dots = [lv::NULL; 3];
         for (index, dot) in dots.iter_mut().enumerate() {
-            let x = M.width / 2 - 11 + 16 * index as i32;
+            let x = M.width / 2 - 19 + 16 * index as i32;
             *dot = lv::container(root, x, M.dots_y - 3, 6, 6);
             if !dot.is_null() {
                 lv::style(
@@ -599,6 +666,10 @@ unsafe fn build(root: Obj) -> i32 {
             vol_down,
             vol_up,
             dots,
+            sleep_value,
+            sleep_auto,
+            sleep_start,
+            sleep_shown: None,
             ly_title,
             ly_view,
             ly_empty,
@@ -670,6 +741,32 @@ pub fn resume() {
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
+
+extern "C" fn sleep_menu_event(event: *mut c_void) {
+    if event.is_null() || !super::page_accepts_input(PAGE_PLAYER) {
+        return;
+    }
+    let code = unsafe { lvx_event_get_code(event) };
+    let widget = unsafe { lvx_event_get_user_data(event) as usize };
+    if code != event::CLICKED {
+        return;
+    }
+    match widget {
+        W_SLEEP_OPEN => crate::target::handle_player_event(crate::target::PlayerEvent::SleepTimer),
+        W_SLEEP_MINUS => {
+            crate::target::handle_player_event(crate::target::PlayerEvent::AdjustSleep(-1))
+        }
+        W_SLEEP_PLUS => {
+            crate::target::handle_player_event(crate::target::PlayerEvent::AdjustSleep(1))
+        }
+        W_SLEEP_AUTO => {
+            let enabled = crate::target::player_frame().sleep_timer_auto;
+            crate::target::handle_player_event(crate::target::PlayerEvent::SleepAuto(!enabled));
+        }
+        _ => {}
+    }
+    refresh();
+}
 
 extern "C" fn button_event(event: *mut c_void) {
     if event.is_null() {
@@ -745,7 +842,7 @@ extern "C" fn pager_event(event: *mut c_void) {
         crate::target::handle_player_event(crate::target::PlayerEvent::Back);
         return;
     }
-    let index = usize::from(scrolled > M.width / 2);
+    let index = ((scrolled + M.width / 2) / M.width).clamp(0, 2) as usize;
     if index != page.dot_page {
         page.dot_page = index;
         unsafe {
@@ -786,7 +883,36 @@ pub fn refresh() {
     let Some(page) = page() else { return };
     page.tick = page.tick.wrapping_add(1);
     let mut frame = crate::target::player_frame();
+    let timer_ms = if frame.sleep_timer_ms == 0 {
+        frame.sleep_timer_duration_ms
+    } else {
+        frame.sleep_timer_ms
+    };
+    let seconds = timer_ms.saturating_add(999) / 1_000;
+    let running = frame.sleep_timer_ms != 0;
+    let automatic = frame.sleep_timer_auto;
+    let previous = page.sleep_shown;
     unsafe {
+        if previous.is_none_or(|old| old.0 != seconds) {
+            set_text(
+                page.sleep_value,
+                &alloc::format!("{}:{:02}", seconds / 60, seconds % 60),
+            );
+        }
+        if previous.is_none_or(|old| old.1 != running) {
+            set_text(page.sleep_start, if running { "关闭" } else { "开启" });
+        }
+        if previous.is_none_or(|old| old.2 != automatic) {
+            set_text(
+                page.sleep_auto,
+                if automatic {
+                    "每次播放自动：开"
+                } else {
+                    "每次播放自动：关"
+                },
+            );
+        }
+        page.sleep_shown = Some((seconds, running, automatic));
         page.apply_view(frame.view.take());
         page.apply_lyrics(&frame);
     }

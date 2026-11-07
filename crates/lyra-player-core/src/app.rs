@@ -84,6 +84,10 @@ pub enum Action {
     /// The audio driver, not the file reader, has finished draining the track.
     TrackEnded,
     Tick(u32),
+    SetSleepTimer(u32),
+    SetSleepAuto(bool),
+    AdjustSleepTimer(i8),
+    SleepTick(u32),
     /// Advance the repeat/shuffle mode by one step.
     CycleMode,
     /// The queue ran out with nothing left to play.
@@ -112,6 +116,9 @@ pub struct LyraApp {
     /// answer for a skipped track is dropped.
     pub lyrics: Lyrics,
     pub lyrics_for: Option<u64>,
+    pub sleep_timer_ms: u32,
+    pub sleep_timer_duration_ms: u32,
+    pub sleep_timer_auto: bool,
 }
 
 impl Default for LyraApp {
@@ -129,6 +136,9 @@ impl Default for LyraApp {
             shuffle_seed: 0x6d2b_79f5,
             lyrics: Lyrics::default(),
             lyrics_for: None,
+            sleep_timer_ms: 0,
+            sleep_timer_duration_ms: 10 * 60_000,
+            sleep_timer_auto: false,
         }
     }
 }
@@ -261,6 +271,53 @@ impl LyraApp {
                 }
             }
             Action::Tick(ms) => self.player.tick(ms),
+            Action::SetSleepTimer(ms) => {
+                self.sleep_timer_ms = ms;
+                if ms != 0 {
+                    self.sleep_timer_duration_ms = ms.clamp(60_000, 24 * 60 * 60_000);
+                    self.sleep_timer_ms = self.sleep_timer_duration_ms;
+                }
+            }
+            Action::SetSleepAuto(enabled) => self.sleep_timer_auto = enabled,
+            Action::AdjustSleepTimer(minutes) => {
+                let timer_was_active = self.sleep_timer_ms != 0;
+                let delta = u32::from(minutes.unsigned_abs()) * 60_000;
+                if !timer_was_active {
+                    self.sleep_timer_duration_ms = if minutes < 0 {
+                        self.sleep_timer_duration_ms
+                            .saturating_sub(delta)
+                            .max(60_000)
+                    } else {
+                        self.sleep_timer_duration_ms
+                            .saturating_add(delta)
+                            .min(24 * 60 * 60_000)
+                    };
+                } else if minutes < 0 {
+                    self.sleep_timer_ms = self.sleep_timer_ms.saturating_sub(delta);
+                } else {
+                    self.sleep_timer_ms = self
+                        .sleep_timer_ms
+                        .saturating_add(delta)
+                        .min(24 * 60 * 60_000);
+                }
+                if timer_was_active && self.sleep_timer_ms == 0 {
+                    self.player.clear();
+                    self.lyrics = Lyrics::default();
+                    self.lyrics_for = None;
+                    effects.push(Effect::StopAudio);
+                }
+            }
+            Action::SleepTick(ms) => {
+                if self.sleep_timer_ms != 0 {
+                    self.sleep_timer_ms = self.sleep_timer_ms.saturating_sub(ms);
+                    if self.sleep_timer_ms == 0 {
+                        self.player.clear();
+                        self.lyrics = Lyrics::default();
+                        self.lyrics_for = None;
+                        effects.push(Effect::StopAudio);
+                    }
+                }
+            }
             Action::CycleMode => self.mode = self.mode.next(),
             Action::PlaybackExhausted => {
                 self.player.clear();
@@ -343,6 +400,9 @@ impl LyraApp {
 
     fn play(&mut self, song: Song, effects: &mut Vec<Effect>) {
         self.shuffle_seed = shuffle_noise(song.id, self.shuffle_seed).max(1);
+        if self.sleep_timer_auto && self.sleep_timer_ms == 0 {
+            self.sleep_timer_ms = self.sleep_timer_duration_ms.clamp(60_000, 24 * 60 * 60_000);
+        }
         self.player.select(song.clone(), core::iter::empty());
         self.error = None;
         self.lyrics = Lyrics::default();
@@ -396,6 +456,103 @@ mod tests {
         effects
             .iter()
             .any(|effect| matches!(effect, Effect::StreamAudio { .. }))
+    }
+
+    #[test]
+    fn sleep_timer_defaults_to_ten_minutes_and_remembers_adjustments() {
+        let mut app = LyraApp::default();
+        assert_eq!(app.sleep_timer_duration_ms, 10 * 60_000);
+        app.update(Action::AdjustSleepTimer(1));
+        assert_eq!(app.sleep_timer_ms, 0);
+        assert_eq!(app.sleep_timer_duration_ms, 11 * 60_000);
+        app.update(Action::AdjustSleepTimer(-1));
+        assert_eq!(app.sleep_timer_ms, 0);
+        assert_eq!(app.sleep_timer_duration_ms, 10 * 60_000);
+        app.update(Action::SetSleepTimer(0));
+        assert_eq!(app.sleep_timer_duration_ms, 10 * 60_000);
+    }
+
+    #[test]
+    fn zero_cancels_countdown_without_losing_last_duration_and_can_restart() {
+        let mut app = LyraApp::default();
+        app.update(Action::SetSleepTimer(60_000));
+        app.update(Action::SetSleepTimer(0));
+        assert_eq!(app.sleep_timer_ms, 0);
+        assert_eq!(app.sleep_timer_duration_ms, 60_000);
+        app.update(Action::AdjustSleepTimer(1));
+        assert_eq!(app.sleep_timer_ms, 0);
+        assert_eq!(app.sleep_timer_duration_ms, 120_000);
+        app.update(Action::SetSleepTimer(app.sleep_timer_duration_ms));
+        assert_eq!(app.sleep_timer_ms, 120_000);
+    }
+
+    #[test]
+    fn active_sleep_adjustment_uses_remaining_time_and_preserves_preset() {
+        let mut app = LyraApp::default();
+        app.update(Action::SetSleepTimer(600_000));
+        app.update(Action::SleepTick(45_000));
+        app.update(Action::AdjustSleepTimer(1));
+        assert_eq!(app.sleep_timer_ms, 615_000);
+        app.update(Action::AdjustSleepTimer(-1));
+        assert_eq!(app.sleep_timer_ms, 555_000);
+        assert_eq!(app.sleep_timer_duration_ms, 600_000);
+    }
+
+    #[test]
+    fn reducing_active_timer_to_zero_stops_playback_and_keeps_duration() {
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(library(&[1])));
+        app.update(Action::SelectSong(song(1)));
+        app.update(Action::SetSleepTimer(60_000));
+        app.update(Action::SleepTick(50_000));
+
+        let effects = app.update(Action::AdjustSleepTimer(-1));
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StopAudio))
+        );
+        assert_eq!(app.sleep_timer_ms, 0);
+        assert_eq!(app.sleep_timer_duration_ms, 60_000);
+        assert!(app.player.current.is_none());
+    }
+
+    #[test]
+    fn sleep_timer_duration_is_bounded_to_one_day() {
+        let mut app = LyraApp::default();
+        app.update(Action::SetSleepTimer(u32::MAX));
+        assert_eq!(app.sleep_timer_ms, 24 * 60 * 60_000);
+        assert_eq!(app.sleep_timer_duration_ms, 24 * 60 * 60_000);
+    }
+
+    #[test]
+    fn auto_sleep_continues_across_tracks_and_expiry_stops_audio() {
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(library(&[1, 2])));
+        app.update(Action::SetSleepAuto(true));
+        app.update(Action::SelectSong(song(1)));
+        assert_eq!(app.sleep_timer_ms, 600_000);
+        app.update(Action::SleepTick(550_000));
+        app.update(Action::AdjustSleepTimer(1));
+        assert_eq!(app.sleep_timer_ms, 110_000);
+        app.update(Action::Next);
+        assert_eq!(app.sleep_timer_ms, 110_000);
+        assert!(
+            app.update(Action::SleepTick(110_000))
+                .iter()
+                .any(|effect| matches!(effect, Effect::StopAudio))
+        );
+        assert!(app.player.current.is_none());
+    }
+
+    #[test]
+    fn sleep_timer_without_active_countdown_does_not_stop_playback() {
+        let mut app = LyraApp::default();
+        app.update(Action::Boot(library(&[1])));
+        app.update(Action::SelectSong(song(1)));
+        assert!(app.update(Action::SleepTick(50)).is_empty());
+        assert!(app.player.current.is_some());
     }
 
     #[test]
