@@ -109,6 +109,12 @@ pub struct UiState {
     /// Average time the watch took to take one frame, over the last speed sample.
     pub round_trip_ms: u32,
     pub active: bool,
+    pub cloud_downloading: Vec<u64>,
+    pub cloud_current: Option<u64>,
+    pub cloud_queue: Vec<crate::import::ImportRequest>,
+    pub cloud_driving: bool,
+    pub cloud_error: String,
+    pub cloud_warnings: Vec<String>,
     pub device_library: Vec<DeviceLibraryTrack>,
     pub library_revision: String,
     pub library_total: usize,
@@ -128,6 +134,14 @@ pub struct UiState {
     pub netease_playlist_page: usize,
     pub qr_key: String,
     pub qr_url: String,
+}
+
+impl UiState {
+    pub fn cloud_song_pending(&self, id: u64) -> bool {
+        self.cloud_downloading.contains(&id)
+            || self.cloud_current == Some(id)
+            || self.cloud_queue.iter().any(|request| request.track_id == id)
+    }
 }
 
 static STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
