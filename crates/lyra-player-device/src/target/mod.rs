@@ -78,6 +78,9 @@ pub struct PlayerFrame {
     pub active_lyric: Option<usize>,
     /// Set once the lyrics of the current track are known (possibly empty).
     pub lyrics_id: Option<u64>,
+    pub sleep_timer_ms: u32,
+    pub sleep_timer_duration_ms: u32,
+    pub sleep_timer_auto: bool,
 }
 
 pub fn player_frame() -> PlayerFrame {
@@ -87,6 +90,9 @@ pub fn player_frame() -> PlayerFrame {
             view: PlayerView::of(&core.app),
             active_lyric: core.app.active_lyric(),
             lyrics_id: core.app.lyrics_for.filter(|id| Some(*id) == current),
+            sleep_timer_ms: core.app.sleep_timer_ms,
+            sleep_timer_duration_ms: core.app.sleep_timer_duration_ms,
+            sleep_timer_auto: core.app.sleep_timer_auto,
         }
     })
 }
@@ -211,6 +217,9 @@ pub enum PlayerEvent {
     Mode,
     VolumeDown,
     VolumeUp,
+    AdjustSleep(i8),
+    SleepAuto(bool),
+    SleepTimer,
 }
 
 pub fn handle_library_event(target: LibraryTarget) {
@@ -262,7 +271,49 @@ pub fn handle_player_event(event: PlayerEvent) {
         PlayerEvent::Previous => Some(core.app.update(Action::Previous)),
         PlayerEvent::Next => Some(core.app.update(Action::Next)),
         PlayerEvent::Mode => Some(core.app.update(Action::CycleMode)),
+        PlayerEvent::AdjustSleep(minutes) => {
+            if core.app.sleep_timer_ms == 0 {
+                core.sleep.duration_edited = true;
+            } else {
+                core.sleep.timer_edited = true;
+            }
+            runtime()
+                .sleep_settings_dirty
+                .store(true, Ordering::Release);
+            Some(core.app.update(Action::AdjustSleepTimer(minutes)))
+        }
+        PlayerEvent::SleepAuto(enabled) => {
+            core.sleep.auto_edited = true;
+            runtime()
+                .sleep_settings_dirty
+                .store(true, Ordering::Release);
+            Some(core.app.update(Action::SetSleepAuto(enabled)))
+        }
+        PlayerEvent::SleepTimer => {
+            core.sleep.timer_edited = true;
+            if core.app.sleep_timer_ms == 0 {
+                core.sleep.duration_edited = true;
+                runtime()
+                    .sleep_settings_dirty
+                    .store(true, Ordering::Release);
+            }
+            Some(
+                core.app
+                    .update(Action::SetSleepTimer(if core.app.sleep_timer_ms == 0 {
+                        core.app.sleep_timer_duration_ms
+                    } else {
+                        0
+                    })),
+            )
+        }
     });
+    if matches!(
+        event,
+        PlayerEvent::AdjustSleep(_) | PlayerEvent::SleepAuto(_) | PlayerEvent::SleepTimer
+    ) {
+        feeder::start();
+        persist_sleep_settings();
+    }
     match effects {
         None => handle_back(page),
         Some(effects) => execute_effects(effects),
@@ -311,11 +362,6 @@ fn route_page(route: Route) -> usize {
     }
 }
 
-/// The module's control queue holds this many records and drops the newest
-/// when full, so draining exactly that many per tick can never leave a gesture
-/// stranded, while still bounding the work one tick may do.
-const MAX_HEADSET_CONTROLS_PER_TICK: usize = 8;
-
 /// Turns AVRCP gestures from the headset into the same actions the on-screen
 /// controls produce.
 ///
@@ -324,31 +370,37 @@ const MAX_HEADSET_CONTROLS_PER_TICK: usize = 8;
 /// state, and toggling on a repeat would invert playback instead of confirming
 /// it. Track changes are the app's decision, not the player's, so they go
 /// straight to `update`.
-fn apply_headset_controls(core: &mut runtime::Core, audio: &mut audio::AudioDevice) {
-    for _ in 0..MAX_HEADSET_CONTROLS_PER_TICK {
-        let control = match audio.poll_headset_control() {
-            Ok(Some(control)) => control,
-            Ok(None) => return,
-            Err(error) => {
-                runtime().last_error.store(error, Ordering::Release);
-                return;
-            }
-        };
-        match control {
-            MediaControl::Play | MediaControl::Pause => {
-                if core.app.player.transport_control_applies(control) {
-                    core.toggle_audio();
+fn apply_headset_controls(
+    core: &mut runtime::Core,
+    audio: &mut audio::AudioDevice,
+    discarding: &mut bool,
+    expired: bool,
+) {
+    let result = crate::sleep_logic::drain_headset_controls(
+        discarding,
+        expired,
+        || audio.poll_headset_control(),
+        |control| {
+            let Some(control) = control else { return };
+            match control {
+                MediaControl::Play | MediaControl::Pause => {
+                    if core.app.player.transport_control_applies(control) {
+                        core.toggle_audio();
+                    }
+                }
+                MediaControl::Next => {
+                    let effects = core.app.update(Action::Next);
+                    queue_audio_effects(core, effects);
+                }
+                MediaControl::Previous => {
+                    let effects = core.app.update(Action::Previous);
+                    queue_audio_effects(core, effects);
                 }
             }
-            MediaControl::Next => {
-                let effects = core.app.update(Action::Next);
-                queue_audio_effects(core, effects);
-            }
-            MediaControl::Previous => {
-                let effects = core.app.update(Action::Previous);
-                queue_audio_effects(core, effects);
-            }
-        }
+        },
+    );
+    if let Err(error) = result {
+        runtime().last_error.store(error, Ordering::Release);
     }
 }
 
@@ -358,7 +410,30 @@ pub fn audio_service_tick() {
     let tick = runtime().timer_ticks.fetch_add(1, Ordering::AcqRel) + 1;
     let owner = unsafe { runtime::audio_owner() };
     let commands = try_with_core(|core| {
-        apply_headset_controls(core, &mut owner.audio);
+        let now = audio::monotonic_ms();
+        let elapsed_ms = core.sleep.elapsed(&mut owner.sleep_last_ms, now);
+        let before_tick = core.app.sleep_timer_ms;
+        let effects = {
+            if core.app.sleep_timer_ms != 0 {
+                core.app.update(Action::SleepTick(elapsed_ms))
+            } else {
+                Vec::new()
+            }
+        };
+        let expired = crate::sleep_logic::SleepState::expired(before_tick, core.app.sleep_timer_ms);
+        queue_audio_effects(core, effects);
+        let before = core.app.sleep_timer_ms;
+        apply_headset_controls(
+            core,
+            &mut owner.audio,
+            &mut owner.discard_headset_controls,
+            expired,
+        );
+        core.sleep
+            .transition(before, core.app.sleep_timer_ms, audio::monotonic_ms());
+        if core.app.sleep_timer_ms == 0 {
+            core.app.sleep_timer_duration_ms = core.app.sleep_timer_duration_ms.max(60_000);
+        }
         (
             core.audio_epoch,
             core.pending_audio.take(),
@@ -446,6 +521,26 @@ fn fail_audio(owner: &mut runtime::AudioOwner, error: i32) {
     runtime().last_error.store(error, Ordering::Release);
 }
 
+pub fn persist_sleep_settings() {
+    let rt = runtime();
+    let result = crate::sleep_logic::persist_settings(
+        &rt.sleep_settings_loaded,
+        &rt.sleep_settings_dirty,
+        || {
+            let (duration, auto) = storage::load_sleep_settings();
+            with_core(|core| core.sleep.apply_loaded(&mut core.app, duration, auto));
+        },
+        || {
+            let settings =
+                with_core(|core| (core.app.sleep_timer_duration_ms, core.app.sleep_timer_auto));
+            storage::save_sleep_settings(settings.0, settings.1)
+        },
+    );
+    if let Err(error) = result {
+        rt.last_error.store(error, Ordering::Release);
+    }
+}
+
 pub fn ui_maintenance_tick() {
     // The track reader runs on this (UI owner) thread; starting it is cheap once it runs.
     feeder::start();
@@ -455,6 +550,7 @@ pub fn ui_maintenance_tick() {
             .last_error
             .store(service_result, Ordering::Release);
     }
+    persist_sleep_settings();
     let rt = runtime();
     let tick = rt.ui_ticks.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     // The library file is polled once a second; the importer also raises the

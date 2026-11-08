@@ -112,6 +112,7 @@ pub fn page_pause(index: usize) -> i32 {
         return -1;
     }
     slot(index).interactive = false;
+    super::persist_sleep_settings();
     if index != PAGE_LIBRARY && index != PAGE_COLLECTION {
         player::pause();
     }
@@ -122,6 +123,7 @@ pub fn page_destroy(index: usize) -> i32 {
     if index >= PAGE_COUNT {
         return -1;
     }
+    super::persist_sleep_settings();
     destroy_page(index);
     0
 }

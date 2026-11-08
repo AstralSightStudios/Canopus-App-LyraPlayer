@@ -68,7 +68,7 @@ const STAGE_IOCTL_START: u8 = 7;
 const STAGE_IOCTL_OTHER: u8 = 8;
 const STAGE_AUDIO_CONTROL: u8 = 9;
 
-fn monotonic_ms() -> Option<u64> {
+pub(super) fn monotonic_ms() -> Option<u64> {
     let mut time = stock_timespec_t {
         tv_sec: 0,
         tv_nsec: 0,
@@ -423,7 +423,7 @@ impl AudioDevice {
     /// is feeding us, so report "nothing pending" rather than an error. An
     /// empty queue answers `EAGAIN`, which is the steady state on almost every
     /// tick and must not be recorded as a failure.
-    pub fn poll_headset_control(&mut self) -> Result<Option<MediaControl>, i32> {
+    pub fn poll_headset_control(&mut self) -> Result<Option<Option<MediaControl>>, i32> {
         if self.fd < 0 {
             return Ok(None);
         }
@@ -447,14 +447,14 @@ impl AudioDevice {
             self.last_stage = STAGE_AUDIO_CONTROL;
             return Err(EIO);
         }
-        Ok(match event.kind {
+        Ok(Some(match event.kind {
             CONTROL_PLAY => Some(MediaControl::Play),
             CONTROL_PAUSE => Some(MediaControl::Pause),
             CONTROL_NEXT => Some(MediaControl::Next),
             CONTROL_PREVIOUS => Some(MediaControl::Previous),
             // A newer module may add kinds; ignoring them keeps the queue draining.
             _ => None,
-        })
+        }))
     }
 
     fn ioctl_value(&mut self, command: u32, argument: usize) -> Result<(), i32> {

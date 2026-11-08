@@ -22,6 +22,7 @@ pub struct Core {
     pub pending_audio: Option<PendingAudioCommand>,
     pub pending_volume: Option<u8>,
     pub audio_epoch: u32,
+    pub sleep: crate::sleep_logic::SleepState,
 }
 
 /// Only the Bluetooth owner accesses this state. No filesystem operation or
@@ -31,6 +32,8 @@ pub struct AudioOwner {
     pub player: lyra_player_core::playback::Player,
     pub epoch: u32,
     pub error: Option<String>,
+    pub sleep_last_ms: Option<u64>,
+    pub discard_headset_controls: bool,
 }
 
 impl AudioOwner {
@@ -40,6 +43,8 @@ impl AudioOwner {
             core::ptr::addr_of_mut!((*pointer).player).write(Default::default());
             core::ptr::addr_of_mut!((*pointer).epoch).write(0);
             core::ptr::addr_of_mut!((*pointer).error).write(None);
+            core::ptr::addr_of_mut!((*pointer).sleep_last_ms).write(None);
+            core::ptr::addr_of_mut!((*pointer).discard_headset_controls).write(false);
         }
     }
 }
@@ -65,6 +70,7 @@ impl Core {
             core::ptr::addr_of_mut!((*pointer).pending_audio).write(None);
             core::ptr::addr_of_mut!((*pointer).pending_volume).write(None);
             core::ptr::addr_of_mut!((*pointer).audio_epoch).write(0);
+            core::ptr::addr_of_mut!((*pointer).sleep).write(Default::default());
         }
     }
 }
@@ -85,6 +91,8 @@ pub struct Runtime {
     /// `storage::library_stamp()` of the file that was last loaded.
     pub library_stamp: AtomicU32,
     pub player_media_refresh_pending: AtomicBool,
+    pub sleep_settings_loaded: AtomicBool,
+    pub sleep_settings_dirty: AtomicBool,
 }
 
 impl Runtime {
@@ -102,6 +110,8 @@ impl Runtime {
             library_loaded: AtomicBool::new(false),
             library_stamp: AtomicU32::new(0),
             player_media_refresh_pending: AtomicBool::new(false),
+            sleep_settings_loaded: AtomicBool::new(false),
+            sleep_settings_dirty: AtomicBool::new(false),
         }
     }
 }
@@ -164,7 +174,14 @@ pub fn with_core<R>(function: impl FnOnce(&mut Core) -> R) -> R {
         core::hint::spin_loop();
     }
     let pointer = CORE_PTR.load(Ordering::Acquire) as *mut Core;
-    let result = unsafe { function(&mut *pointer) };
+    let core = unsafe { &mut *pointer };
+    let before = core.app.sleep_timer_ms;
+    let result = function(core);
+    core.sleep.transition(
+        before,
+        core.app.sleep_timer_ms,
+        super::audio::monotonic_ms(),
+    );
     CORE_LOCK.store(false, Ordering::Release);
     result
 }
@@ -177,7 +194,14 @@ pub fn try_with_core<R>(function: impl FnOnce(&mut Core) -> R) -> Option<R> {
         return None;
     }
     let pointer = CORE_PTR.load(Ordering::Acquire) as *mut Core;
-    let result = unsafe { function(&mut *pointer) };
+    let core = unsafe { &mut *pointer };
+    let before = core.app.sleep_timer_ms;
+    let result = function(core);
+    core.sleep.transition(
+        before,
+        core.app.sleep_timer_ms,
+        super::audio::monotonic_ms(),
+    );
     CORE_LOCK.store(false, Ordering::Release);
     Some(result)
 }
