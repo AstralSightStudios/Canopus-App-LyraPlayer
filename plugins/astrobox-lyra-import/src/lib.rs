@@ -33,6 +33,7 @@ impl event::Guest for LyraImportPlugin {
             EventType::Timer => {
                 if event_payload == import::STALL_TIMER_PAYLOAD {
                     import::check_stall();
+                    import::drive_queue().await;
                     ui::rerender();
                 }
             }
@@ -63,6 +64,7 @@ impl plugin_connect::Guest for LyraImportPlugin {
             if !import::on_frame(&device_addr, &frame).await {
                 library::on_frame(&device_addr, &frame).await;
             }
+            import::drive_queue().await;
             ui::rerender();
         }
     }

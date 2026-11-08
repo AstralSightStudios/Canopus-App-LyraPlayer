@@ -21,6 +21,7 @@ use waki::{Client, Method};
 use crate::{
     artwork,
     import::ImportAsset,
+    sniff,
     state::{CloudPlaylist, CloudSong},
 };
 
@@ -81,6 +82,13 @@ struct SearchEnvelope {
 
 #[derive(Default, Deserialize)]
 struct SearchResult {
+    #[serde(default)]
+    songs: Vec<SongWire>,
+}
+
+#[derive(Deserialize)]
+struct SongDetailEnvelope {
+    code: i32,
     #[serde(default)]
     songs: Vec<SongWire>,
 }
@@ -209,21 +217,69 @@ pub struct PreparedCloud {
     pub song: CloudSong,
     pub palette: artwork::Palette,
     pub assets: Vec<ImportAsset>,
+    pub warnings: Vec<String>,
+    pub temp_directory: PathBuf,
 }
 
 pub fn search(query: &str, cookie: &str) -> Result<Vec<CloudSong>, String> {
-    let request = eapi(
+    search_with(query, cookie, perform)
+}
+
+fn search_with(
+    query: &str,
+    cookie: &str,
+    mut request: impl FnMut(ApiRequest) -> Result<Vec<u8>, String>,
+) -> Result<Vec<CloudSong>, String> {
+    let bytes = request(eapi(
         "/api/search/get",
         json!({ "s": query, "type": 1, "limit": 20, "offset": 0 }),
         cookie,
-    );
-    let bytes = perform(request)?;
+    ))?;
     let value: SearchEnvelope =
         serde_json::from_slice(&bytes).map_err(|error| format!("无法解析搜索结果：{error}"))?;
     if value.code != 200 {
         return Err(format!("网易云搜索失败：{}", value.code));
     }
-    Ok(value.result.songs.into_iter().map(cloud_song).collect())
+    let mut songs: Vec<CloudSong> = value.result.songs.into_iter().map(cloud_song).collect();
+    let ids: Vec<u64> = songs
+        .iter()
+        .filter(|song| song.cover_url.trim().is_empty())
+        .map(|song| song.id)
+        .collect();
+    if !ids.is_empty() {
+        let detail = song_details(&ids, cookie, &mut request);
+        match detail {
+            Ok(details) => {
+                for detail in details {
+                    if !detail.al.pic_url.trim().is_empty() {
+                        for song in songs
+                            .iter_mut()
+                            .filter(|song| song.id == detail.id && song.cover_url.trim().is_empty())
+                        {
+                            song.cover_url = detail.al.pic_url.clone();
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "NetEase search cover lookup failed"),
+        }
+    }
+    Ok(songs)
+}
+
+fn song_details(
+    ids: &[u64],
+    cookie: &str,
+    request: &mut impl FnMut(ApiRequest) -> Result<Vec<u8>, String>,
+) -> Result<Vec<SongWire>, String> {
+    let data = json!({ "c": json!(ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>()).to_string() });
+    let bytes = request(eapi("/api/v3/song/detail", data, cookie))?;
+    let value: SongDetailEnvelope =
+        serde_json::from_slice(&bytes).map_err(|error| format!("无法解析歌曲详情：{error}"))?;
+    if value.code != 200 {
+        return Err(format!("歌曲详情请求失败：{}", value.code));
+    }
+    Ok(value.songs)
 }
 
 pub fn user_playlists(cookie: &str) -> Result<Vec<CloudPlaylist>, String> {
@@ -374,83 +430,224 @@ pub fn prepare(
         .unwrap_or_default()
         .as_nanos();
     let directory = PathBuf::from("media").join(format!("netease-{}-{nonce}", song.id));
-    fs::create_dir_all(&directory).map_err(|error| format!("无法创建下载目录：{error}"))?;
+    prepare_with(song, cookie, audio_bitrate, &directory, perform, download)
+}
 
-    let song_url_bytes = perform(eapi(
-        "/api/song/enhance/player/url",
-        json!({ "ids": format!("[\"{}\"]", song.id), "br": audio_bitrate }),
+fn prepare_with(
+    song: &CloudSong,
+    cookie: &str,
+    audio_bitrate: u32,
+    directory: &PathBuf,
+    mut request: impl FnMut(ApiRequest) -> Result<Vec<u8>, String>,
+    mut download_file: impl FnMut(&str, &PathBuf, u64) -> Result<u64, String>,
+) -> Result<PreparedCloud, String> {
+    if let Some(parent) = directory.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建下载目录：{error}"))?;
+    }
+    fs::create_dir(directory).map_err(|error| format!("无法创建下载目录：{error}"))?;
+    let result = prepare_in_directory(
+        song,
         cookie,
-    ))?;
-    let song_url: SongUrlEnvelope = serde_json::from_slice(&song_url_bytes)
-        .map_err(|error| format!("无法解析歌曲地址：{error}"))?;
-    if song_url.code != 200 {
-        return Err(format!("歌曲地址请求失败：{}", song_url.code));
+        audio_bitrate,
+        directory,
+        &mut request,
+        &mut download_file,
+    );
+    if result.is_err() {
+        if let Err(error) = fs::remove_dir_all(directory) {
+            tracing::warn!(path = %directory.display(), error = %error, "Unable to remove failed NetEase download directory");
+        }
     }
-    let item = song_url
-        .data
-        .into_iter()
-        .next()
-        .ok_or_else(|| "网易云未返回歌曲地址".to_string())?;
-    let url = if item.proxy_url.is_empty() {
-        item.url.unwrap_or_default()
-    } else {
-        item.proxy_url
-    };
-    if url.is_empty() {
-        return Err("歌曲因版权或区域限制无法下载".to_string());
-    }
+    result
+}
 
-    let audio_path = directory.join("audio.mp3");
-    download(&url, &audio_path, MAX_AUDIO_BYTES)?;
-    let mut assets = vec![ImportAsset::audio(path_text(&audio_path)?)];
-
-    let mut palette = artwork::Palette::default();
-    if song.cover_url.is_empty() {
-        tracing::warn!(song_id = song.id, "NetEase song has no album cover URL");
-    } else {
-        let source_path = directory.join("cover-source.jpg");
-        match download(&song.cover_url, &source_path, MAX_COVER_BYTES) {
-            Ok(size) => match artwork::prepare(&source_path, &directory) {
-                Ok(prepared) => {
-                    tracing::info!(
-                        song_id = song.id,
-                        source_bytes = size,
-                        cover_bytes = prepared.cover_size,
-                        "NetEase artwork prepared"
-                    );
-                    palette = prepared.palette;
-                    assets.push(ImportAsset::cover(prepared.cover_path));
+fn prepare_in_directory(
+    song: &CloudSong,
+    cookie: &str,
+    audio_bitrate: u32,
+    directory: &PathBuf,
+    request: &mut impl FnMut(ApiRequest) -> Result<Vec<u8>, String>,
+    download_file: &mut impl FnMut(&str, &PathBuf, u64) -> Result<u64, String>,
+) -> Result<PreparedCloud, String> {
+    let url = retry("歌曲地址", || {
+        let song_url_bytes = request(eapi(
+            "/api/song/enhance/player/url",
+            json!({ "ids": format!("[\"{}\"]", song.id), "br": audio_bitrate }),
+            cookie,
+        ))?;
+        let song_url: SongUrlEnvelope = serde_json::from_slice(&song_url_bytes)
+            .map_err(|error| format!("无法解析歌曲地址：{error}"))?;
+        if song_url.code != 200 {
+            return Err(format!("歌曲地址请求失败：{}", song_url.code));
+        }
+        let item = song_url
+            .data
+            .into_iter()
+            .next()
+            .ok_or_else(|| "网易云未返回歌曲地址".to_string())?;
+        let url = if item.proxy_url.is_empty() {
+            item.url.unwrap_or_default()
+        } else {
+            item.proxy_url
+        };
+        if url.trim().is_empty() {
+            return Err("歌曲因版权或区域限制无法下载".to_string());
+        }
+        Ok(url)
+    })?;
+    let mut song = song.clone();
+    let mut warnings = Vec::new();
+    if song.cover_url.trim().is_empty() {
+        match retry("歌曲封面详情", || {
+            song_details(&[song.id], cookie, request)
+        }) {
+            Ok(details) => {
+                if let Some(detail) = details.into_iter().find(|detail| detail.id == song.id) {
+                    song.cover_url = detail.al.pic_url;
                 }
-                Err(error) => tracing::warn!(
-                    song_id = song.id,
-                    error = %error,
-                    "NetEase artwork processing skipped"
-                ),
-            },
-            Err(error) => tracing::warn!(
-                song_id = song.id,
-                error = %error,
-                "NetEase artwork download skipped"
-            ),
+                if song.cover_url.trim().is_empty() {
+                    warnings.push("无法取得封面：歌曲详情未返回封面地址".to_string());
+                }
+            }
+            Err(error) => warnings.push(error),
         }
     }
 
-    let lyrics = perform(eapi(
-        "/api/song/lyric/v1",
-        json!({ "id": song.id, "cp": false, "tv": 0, "lv": 0, "rv": 0, "kv": 0, "yv": 0, "ytv": 0, "yrv": 0 }),
-        cookie,
-    ))?;
-    if lyrics.len() <= 2 * 1024 * 1024 {
-        let lyrics_path = directory.join("lyrics.json");
-        fs::write(&lyrics_path, &lyrics).map_err(|error| format!("无法保存歌词：{error}"))?;
-        assets.push(ImportAsset::lyrics(path_text(&lyrics_path)?, "json"));
+    let audio_path = directory.join("audio.mp3");
+    retry("歌曲音频", || {
+        let size = download_file(&url, &audio_path, MAX_AUDIO_BYTES)?;
+        validate_audio(&audio_path)?;
+        Ok(size)
+    })?;
+    let mut assets = vec![ImportAsset::audio(path_text(&audio_path)?)];
+
+    let mut palette = artwork::Palette::default();
+    if song.cover_url.trim().is_empty() {
+        tracing::warn!(song_id = song.id, "NetEase song has no album cover URL");
+    } else {
+        let source_path = directory.join("cover-source.jpg");
+        let cover_url = sized_cover_url(&song.cover_url);
+        match retry("歌曲封面", || {
+            let size = download_file(&cover_url, &source_path, MAX_COVER_BYTES)?;
+            let prepared = artwork::prepare(&source_path, &directory)?;
+            Ok((size, prepared))
+        }) {
+            Ok((size, prepared)) => {
+                tracing::info!(
+                    song_id = song.id,
+                    source_bytes = size,
+                    cover_bytes = prepared.cover_size,
+                    "NetEase artwork prepared"
+                );
+                palette = prepared.palette;
+                assets.push(ImportAsset::cover(prepared.cover_path));
+            }
+            Err(error) => {
+                tracing::warn!(song_id = song.id, error = %error, "NetEase artwork download skipped");
+                warnings.push(error);
+            }
+        }
+    }
+
+    let lyrics = retry("歌曲歌词", || {
+        let bytes = request(eapi(
+            "/api/song/lyric/v1",
+            json!({ "id": song.id, "cp": false, "tv": 0, "lv": 0, "rv": 0, "kv": 0, "yv": 0, "ytv": 0, "yrv": 0 }),
+            cookie,
+        ))?;
+        validate_lyrics(&bytes)?;
+        Ok(bytes)
+    });
+    match lyrics {
+        Ok(bytes) if validate_lyrics(&bytes)?.is_some() => {
+            let lyrics_path = directory.join("lyrics.json");
+            fs::write(&lyrics_path, &bytes).map_err(|error| format!("无法保存歌词：{error}"))?;
+            assets.push(ImportAsset::lyrics(path_text(&lyrics_path)?, "json"));
+        }
+        Ok(_) => tracing::info!(song_id = song.id, "NetEase song has no lyrics"),
+        Err(error) => {
+            tracing::warn!(song_id = song.id, error = %error, "NetEase lyrics download skipped");
+            warnings.push(error);
+        }
     }
 
     Ok(PreparedCloud {
-        song: song.clone(),
+        song,
         palette,
         assets,
+        warnings,
+        temp_directory: directory.clone(),
     })
+}
+
+fn sized_cover_url(source: &str) -> String {
+    let Ok(mut url) = url::Url::parse(source) else {
+        return source.to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.host_str().is_some_and(|host| host == "music.126.net" || host.ends_with(".music.126.net"))
+    {
+        return source.to_string();
+    }
+    let pairs: Vec<(String, String)> = url.query_pairs()
+        .filter(|(key, _)| key != "param")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    url.query_pairs_mut().extend_pairs(pairs).append_pair("param", "512y512");
+    url.into()
+}
+
+fn validate_audio(path: &Path) -> Result<(), String> {
+    if sniff::is_mp3(path).map_err(|error| format!("无法检查音频：{error}"))? {
+        Ok(())
+    } else {
+        Err("下载内容不是有效的 MP3".to_string())
+    }
+}
+
+fn retry<T>(label: &str, mut operation: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt == ATTEMPTS => {
+                return Err(format!("{label}失败（已尝试 {ATTEMPTS} 次）：{error}"));
+            }
+            Err(error) => {
+                tracing::warn!(attempt, error = %error, resource = label, "NetEase request retry")
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn validate_lyrics(bytes: &[u8]) -> Result<Option<()>, String> {
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err("歌词超过大小限制".into());
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("歌词 JSON 无效：{error}"))?;
+    if value.get("code").and_then(Value::as_i64) != Some(200) {
+        return Err("歌词接口返回错误状态".into());
+    }
+    if value.get("nolyric").and_then(Value::as_bool) == Some(true)
+        || value.get("uncollected").and_then(Value::as_bool) == Some(true)
+    {
+        return Ok(None);
+    }
+    let Some(lrc) = value.get("lrc") else {
+        return Err("歌词响应缺少 lrc".into());
+    };
+    let lyric = lrc
+        .get("lyric")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "歌词内容无效".to_string())?;
+    if lyric.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::lyrics::to_lrc(bytes, "json")?;
+    Ok(Some(()))
 }
 
 fn perform(request: ApiRequest) -> Result<Vec<u8>, String> {
@@ -729,6 +926,337 @@ fn url_encode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sized_cover_url_preserves_other_parameters_and_restricts_host() {
+        assert_eq!(sized_cover_url("https://p1.music.126.net/a?x=1&param=96y96#part"),
+                   "https://p1.music.126.net/a?x=1&param=512y512#part");
+        for source in ["https://example.com/a", "https://music.126.net.example.com/a", "file:///a", "invalid"] {
+            assert_eq!(sized_cover_url(source), source);
+        }
+    }
+
+    #[test]
+    fn prepare_requests_a_bounded_netease_cover() {
+        let directory = artwork::unique_output_directory("netease-cover-size-test");
+        let song = CloudSong {
+            id: 7,
+            name: "Track".into(),
+            artists: vec![],
+            album: String::new(),
+            duration_ms: 0,
+            cover_url: "https://p1.music.126.net/cover.jpg".into(),
+        };
+        let prepared = prepare_with(&song, "", AUDIO_BITRATE_LOW, &directory, |request| {
+            if request.url.ends_with("/song/enhance/player/url") {
+                Ok(br#"{"code":200,"data":[{"url":"https://audio"}]}"#.to_vec())
+            } else {
+                Ok(br#"{"code":200,"nolyric":true}"#.to_vec())
+            }
+        }, |url, path, _| {
+            if url == "https://audio" {
+                let mut frame = vec![0; 417];
+                frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+                fs::write(path, frame.repeat(2)).unwrap();
+                Ok(834)
+            } else if url == "https://p1.music.126.net/cover.jpg?param=512y512" {
+                image::RgbaImage::from_pixel(512, 512, image::Rgba([30, 120, 200, 255]))
+                    .save_with_format(path, image::ImageFormat::Png).unwrap();
+                Ok(fs::metadata(path).unwrap().len())
+            } else {
+                Err("original cover exceeds decode limit".into())
+            }
+        }).unwrap();
+        assert!(prepared.warnings.is_empty(), "{:?}", prepared.warnings);
+        assert!(directory.join("cover.bin").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn search_fills_missing_covers_by_id_without_overwriting_existing_covers() {
+        let mut calls = 0;
+        let songs = search_with("test", "", |request| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(request.url, format!("{API_BASE}/eapi/search/get"));
+                Ok(br#"{"code":200,"result":{"songs":[{"id":1,"name":"One","al":{"picUrl":"https://existing"}},{"id":2,"name":"Two"},{"id":3,"name":"Three"}]}}"#.to_vec())
+            } else {
+                assert_eq!(request.url, format!("{API_BASE}/eapi/v3/song/detail"));
+                Ok(br#"{"code":200,"songs":[{"id":3,"name":"Other","al":{"picUrl":"https://three"}},{"id":1,"name":"Other","al":{"picUrl":"https://replacement"}},{"id":2,"name":"Other","al":{"picUrl":"https://two"}}]}"#.to_vec())
+            }
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            songs
+                .iter()
+                .map(|song| song.cover_url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://existing", "https://two", "https://three"]
+        );
+        assert_eq!(songs[1].name, "Two");
+    }
+
+    #[test]
+    fn search_does_not_request_detail_when_covers_are_present() {
+        let mut calls = 0;
+        let songs = search_with("test", "", |_| {
+            calls += 1;
+            Ok(br#"{"code":200,"result":{"songs":[{"id":1,"name":"One","al":{"picUrl":"https://existing"}}]}}"#.to_vec())
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(songs[0].cover_url, "https://existing");
+    }
+
+    #[test]
+    fn search_keeps_results_when_detail_fails() {
+        for detail in [
+            Err("network".to_string()),
+            Ok(b"invalid".to_vec()),
+            Ok(br#"{"code":500,"songs":[]}"#.to_vec()),
+        ] {
+            let mut calls = 0;
+            let songs = search_with("test", "", |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(br#"{"code":200,"result":{"songs":[{"id":1,"name":"One"}]}}"#.to_vec())
+                } else {
+                    detail.clone()
+                }
+            })
+            .unwrap();
+            assert_eq!(calls, 2);
+            assert_eq!(songs[0].name, "One");
+            assert!(songs[0].cover_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn audio_validation_rejects_non_mp3_and_accepts_frames() {
+        let directory = artwork::unique_output_directory("netease-audio-test");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("audio");
+        fs::write(&path, b"<html>error</html>").unwrap();
+        assert!(validate_audio(&path).is_err());
+        let mut frame = vec![0; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+        fs::write(&path, frame.repeat(2)).unwrap();
+        assert!(validate_audio(&path).is_ok());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retries_are_bounded_and_return_eventual_success() {
+        let mut attempts = 0;
+        let value = retry("test", || {
+            attempts += 1;
+            if attempts < 3 {
+                Err("bad response".to_string())
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 3);
+        let mut attempts = 0;
+        assert!(
+            retry::<()>("test", || {
+                attempts += 1;
+                Err("failure".into())
+            })
+            .is_err()
+        );
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn lyrics_responses_validate_errors_and_allow_missing_lyrics() {
+        assert!(
+            validate_lyrics(br#"{"code":200,"nolyric":true}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            validate_lyrics(br#"{"code":200,"lrc":{"lyric":""}}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            validate_lyrics(br#"{"code":200,"lrc":{"lyric":"[00:01.00]hello"}}"#)
+                .unwrap()
+                .is_some()
+        );
+        for bytes in [
+            &b""[..],
+            &b"not json"[..],
+            &br#"{"code":500}"#[..],
+            &br#"{"code":200,"lrc":42}"#[..],
+            &br#"{}"#[..],
+        ] {
+            assert!(validate_lyrics(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn prepare_retries_address_and_cover_lookup_and_reports_optional_failures() {
+        let directory = artwork::unique_output_directory("netease-prepare-test");
+        let song = CloudSong {
+            id: 7,
+            name: "Track".into(),
+            artists: vec![],
+            album: String::new(),
+            duration_ms: 0,
+            cover_url: String::new(),
+        };
+        let mut addresses = 0;
+        let mut details = 0;
+        let mut lyrics = 0;
+        let mut covers = 0;
+        let prepared = prepare_with(&song, "", AUDIO_BITRATE_LOW, &directory, |request| {
+            if request.url.ends_with("/song/enhance/player/url") {
+                addresses += 1;
+                if addresses == 1 { return Err("HTTP 503".into()); }
+                if addresses == 2 { return Ok(b"invalid".to_vec()); }
+                Ok(br#"{"code":200,"data":[{"url":"https://audio"}]}"#.to_vec())
+            } else if request.url.ends_with("/v3/song/detail") {
+                details += 1;
+                Ok(br#"{"code":200,"songs":[{"id":7,"name":"Track","al":{"picUrl":"https://cover"}}]}"#.to_vec())
+            } else {
+                lyrics += 1;
+                Err("HTTP 500".into())
+            }
+        }, |url, path, _| {
+            if url == "https://cover" { covers += 1; return Err("HTTP 404".into()); }
+            let mut frame = vec![0; 417];
+            frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+            fs::write(path, frame.repeat(2)).unwrap();
+            Ok(834)
+        }).unwrap();
+        assert_eq!((addresses, details, covers, lyrics), (3, 1, 3, 3));
+        assert_eq!(prepared.song.cover_url, "https://cover");
+        assert_eq!(prepared.warnings.len(), 2);
+        assert!(prepared.warnings[0].contains("HTTP 404"));
+        assert!(prepared.warnings[1].contains("HTTP 500"));
+        assert_eq!(prepared.temp_directory, directory);
+        assert!(directory.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_cleans_directory_on_failure_and_retries_address() {
+        let directory = artwork::unique_output_directory("netease-cleanup-test");
+        let song = CloudSong {
+            id: 7,
+            name: "Track".into(),
+            artists: vec![],
+            album: String::new(),
+            duration_ms: 0,
+            cover_url: String::new(),
+        };
+        let mut attempts = 0;
+        let error = match prepare_with(
+            &song,
+            "",
+            AUDIO_BITRATE_LOW,
+            &directory,
+            |_| {
+                attempts += 1;
+                fs::write(directory.join("partial"), b"partial").unwrap();
+                Ok(b"invalid".to_vec())
+            },
+            |_, _, _| panic!("download must not run"),
+        ) {
+            Ok(_) => panic!("expected failure"),
+            Err(error) => error,
+        };
+        assert_eq!(attempts, 3);
+        assert!(error.contains("歌曲地址"));
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn prepare_no_lyrics_is_not_a_warning() {
+        let directory = artwork::unique_output_directory("netease-no-lyrics-test");
+        let song = CloudSong {
+            id: 7,
+            name: "Track".into(),
+            artists: vec![],
+            album: String::new(),
+            duration_ms: 0,
+            cover_url: String::new(),
+        };
+        let prepared = prepare_with(
+            &song,
+            "",
+            AUDIO_BITRATE_LOW,
+            &directory,
+            |request| {
+                if request.url.ends_with("/song/enhance/player/url") {
+                    Ok(br#"{"code":200,"data":[{"url":"https://audio"}]}"#.to_vec())
+                } else if request.url.ends_with("/v3/song/detail") {
+                    Ok(br#"{"code":200,"songs":[]}"#.to_vec())
+                } else {
+                    Ok(br#"{"code":200,"nolyric":true}"#.to_vec())
+                }
+            },
+            |_, path, _| {
+                let mut frame = vec![0; 417];
+                frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+                fs::write(path, frame.repeat(2)).unwrap();
+                Ok(834)
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.warnings.len(), 1);
+        assert!(prepared.warnings[0].contains("无法取得封面"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_warns_when_detail_omits_cover_address() {
+        for detail in [
+            br#"{"code":200,"songs":[{"id":7,"name":"Track","al":{}}]}"#.as_slice(),
+            br#"{"code":200,"songs":[{"id":7,"name":"Track","al":{"picUrl":"  "}}]}"#.as_slice(),
+            br#"{"code":200,"songs":[{"id":8,"name":"Other","al":{"picUrl":"https://cover"}}]}"#
+                .as_slice(),
+        ] {
+            let directory = artwork::unique_output_directory("netease-missing-cover-test");
+            let song = CloudSong {
+                id: 7,
+                name: "Track".into(),
+                artists: vec![],
+                album: String::new(),
+                duration_ms: 0,
+                cover_url: String::new(),
+            };
+            let prepared = prepare_with(
+                &song,
+                "",
+                AUDIO_BITRATE_LOW,
+                &directory,
+                |request| {
+                    if request.url.ends_with("/song/enhance/player/url") {
+                        Ok(br#"{"code":200,"data":[{"url":"https://audio"}]}"#.to_vec())
+                    } else if request.url.ends_with("/v3/song/detail") {
+                        Ok(detail.to_vec())
+                    } else {
+                        Ok(br#"{"code":200,"nolyric":true}"#.to_vec())
+                    }
+                },
+                |url, path, _| {
+                    assert_eq!(url, "https://audio");
+                    let mut frame = vec![0; 417];
+                    frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+                    fs::write(path, frame.repeat(2)).unwrap();
+                    Ok(834)
+                },
+            )
+            .unwrap();
+            assert_eq!(prepared.warnings.len(), 1);
+            assert!(prepared.warnings[0].contains("无法取得封面"));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
 
     #[test]
     fn eapi_encrypts_search_and_attaches_cookie() {

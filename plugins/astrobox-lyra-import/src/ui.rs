@@ -175,7 +175,10 @@ pub async fn on_event(event_id: &str, payload: &str) {
         EVENT_QR_BEGIN => begin_qr(),
         EVENT_QR_POLL => poll_qr(),
         EVENT_LOGOUT => logout_netease(),
-        EVENT_CANCEL => import::cancel().await,
+        EVENT_CANCEL => {
+            import::cancel().await;
+            import::drive_queue().await;
+        },
         EVENT_DISMISS => state::with_state(|state| {
             if !state.active {
                 state.sent = 0;
@@ -427,6 +430,7 @@ async fn start_local() {
         duration_ms: snapshot.duration_ms,
         palette,
         assets,
+        temp_directory: None,
     })
     .await;
     if let Err(error) = result {
@@ -512,10 +516,20 @@ async fn start_playlist_track(index: usize) {
 }
 
 async fn start_cloud_song(song: state::CloudSong, snapshot: UiState) {
-    state::with_state(|state| {
-        state.import_title = song.name.clone();
-        state.status = format!("正在下载《{}》…", song.name);
+    let accepted = state::with_state(|state| {
+        if state.selected_addr.is_empty() || state.cloud_song_pending(song.id) {
+            return false;
+        }
+        state.cloud_error.clear();
+        state.cloud_downloading.push(song.id);
+        if !state.active {
+            state.status = format!("正在下载《{}》…", song.name);
+        }
+        true
     });
+    if !accepted {
+        return;
+    }
     rerender();
     let prepared = match netease::prepare(
         &song,
@@ -524,24 +538,34 @@ async fn start_cloud_song(song: state::CloudSong, snapshot: UiState) {
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
-            state::with_state(|state| state.status = error);
+            state::with_state(|state| {
+                state.cloud_downloading.retain(|id| *id != song.id);
+                state.cloud_error = format!("《{}》下载失败：{error}", song.name);
+            });
             return;
         }
     };
-    let result = import::start(import::ImportRequest {
-        addr: snapshot.selected_addr,
-        track_id: prepared.song.id,
-        name: prepared.song.name,
-        artists: prepared.song.artists,
-        album: prepared.song.album,
-        duration_ms: prepared.song.duration_ms,
-        palette: prepared.palette,
-        assets: prepared.assets,
-    })
-    .await;
-    if let Err(error) = result {
-        state::with_state(|state| state.status = format!("无法开始导入：{error}"));
-    }
+    let temp_directory = Some(std::sync::Arc::new(import::TempDirectory(
+        prepared.temp_directory,
+    )));
+    state::with_state(|state| {
+        state.cloud_downloading.retain(|id| *id != song.id);
+        state.cloud_warnings.extend(prepared.warnings.iter().map(|warning| format!("《{}》：{warning}", song.name)));
+        state.status = format!("《{}》下载完成，等待排队导入。", prepared.song.name);
+        state.cloud_queue.push(import::ImportRequest {
+            addr: snapshot.selected_addr,
+            track_id: prepared.song.id,
+            name: prepared.song.name,
+            artists: prepared.song.artists,
+            album: prepared.song.album,
+            duration_ms: prepared.song.duration_ms,
+            palette: prepared.palette,
+            assets: prepared.assets,
+            temp_directory,
+        });
+    });
+    rerender();
+    import::drive_queue().await;
 }
 
 fn begin_qr() {
@@ -774,6 +798,7 @@ pub fn page(state: &UiState) -> View {
         .maybe((!device).then(no_device))
         .maybe(transfer(state))
         .maybe(notice(state))
+        .maybe(import::abort_blocked().then(|| button("重试取消", EVENT_CANCEL, "soft", "red", "1")))
         .child(tabs(state))
 }
 
@@ -1030,7 +1055,10 @@ fn cloud_tab(state: &UiState) -> View {
             None,
         ),
     };
-    stack(14).child(search).child(toolbar).maybe(hint).child(results)
+    stack(14).child(search).child(toolbar).maybe(hint)
+        .maybe((!state.cloud_error.is_empty()).then(|| callout("", &state.cloud_error, tone::WELL, tone::RED)))
+        .maybe((!state.cloud_warnings.is_empty()).then(|| callout("", &state.cloud_warnings.join("\n"), tone::WELL, tone::MUTED)))
+        .child(results)
 }
 
 fn cloud_login(state: &UiState) -> View {
@@ -1102,7 +1130,7 @@ fn cover(url: &str) -> Option<View> {
     )
 }
 
-fn song_row(song: &state::CloudSong, event: &str, blocked: bool) -> View {
+fn song_row(song: &state::CloudSong, event: &str, state: &UiState) -> View {
     let artists = if song.artists.is_empty() {
         "未知歌手".to_string()
     } else {
@@ -1116,7 +1144,13 @@ fn song_row(song: &state::CloudSong, event: &str, blocked: bool) -> View {
     row()
         .maybe(cover(&song.cover_url))
         .child(stack(2).grow().child(title(&song.name, 14)).child(line(&meta, 12, tone::MUTED)))
-        .child(button("导入", event, "soft", "red", "2").disabled_if(blocked))
+        .child(button(
+            if state.cloud_downloading.contains(&song.id) { "下载中" }
+            else if state.cloud_current == Some(song.id) { "导入中" }
+            else if state.cloud_song_pending(song.id) { "等待导入" }
+            else { "导入" },
+            event, "soft", "red", "2",
+        ).disabled_if(state.selected_addr.is_empty() || state.cloud_song_pending(song.id)))
 }
 
 fn song_section(
@@ -1131,13 +1165,12 @@ fn song_section(
     if songs.is_empty() {
         return empty_state("没有找到歌曲", "换个关键词试试。", None);
     }
-    let blocked = import_blocked(state);
     let rows = songs
         .iter()
         .enumerate()
         .skip(start)
         .take(PLAYLIST_PAGE_SIZE)
-        .map(|(index, song)| song_row(song, &format!("{prefix}{index}"), blocked))
+        .map(|(index, song)| song_row(song, &format!("{prefix}{index}"), state))
         .collect();
     stack(10).child(section_header(label, detail, action)).child(list(rows))
 }
@@ -1573,6 +1606,41 @@ fn qr_image_url(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::state::{CloudPlaylist, CloudSong, DeviceInfo, DeviceLibraryTrack, DevicePlaylist, SelectedFile};
+
+    #[test]
+    fn cloud_rows_only_block_pending_songs() {
+        let mut state = UiState::default();
+        state.selected_addr = "watch".into();
+        state.active = true;
+        state.cloud_current = Some(1);
+        state.cloud_queue.push(import::ImportRequest {
+            addr: "watch".into(), track_id: 2, name: "second".into(),
+            artists: vec![], album: String::new(), duration_ms: 0,
+            palette: artwork::Palette::default(), assets: vec![], temp_directory: None,
+        });
+        let first = song(1, "first", "", "", 1);
+        let second = song(2, "second", "", "", 1);
+        let third = song(3, "third", "", "", 1);
+        let current = song_row(&first, "first", &state).to_json(&mut 0).to_string();
+        let queued = song_row(&second, "second", &state).to_json(&mut 0).to_string();
+        let available = song_row(&third, "third", &state).to_json(&mut 0).to_string();
+        assert!(current.contains("导入中") && current.contains("disabled"));
+        assert!(queued.contains("等待导入") && queued.contains("disabled"));
+        assert!(!available.contains("disabled"));
+        state.cloud_downloading.extend([3, 4]);
+        assert!(state.cloud_song_pending(3));
+        state.cloud_downloading.retain(|id| *id != 3);
+        assert!(state.cloud_song_pending(4));
+        state.cloud_current = None;
+        state.cloud_queue.clear();
+        state.cloud_downloading.clear();
+        assert!(!state.cloud_song_pending(1));
+        assert!(!state.cloud_song_pending(2));
+        state.netease_cookie = "cookie".into();
+        state.cloud_warnings.push("封面下载失败".into());
+        let tree = cloud_tab(&state).to_json(&mut 0).to_string();
+        assert!(tree.contains("封面下载失败"));
+    }
 
     #[test]
     fn remaining_time_rounds_up_and_needs_a_speed() {

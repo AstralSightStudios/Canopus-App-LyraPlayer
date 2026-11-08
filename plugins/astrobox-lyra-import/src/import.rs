@@ -7,18 +7,21 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::Path,
-    sync::{Mutex, OnceLock},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use lyra_protocol::{Asset, Incoming, MIN_VERSION, Reply, Request, Status, TrackMeta};
 use lyra_transfer::{Failure, Sender, Source, State, specs};
 
-use crate::{artwork::Palette, astrobox::psys_host_v4::timer, connect, lyrics, state};
+use crate::{artwork::Palette, connect, lyrics, state};
+#[cfg(not(test))]
+use crate::astrobox::psys_host_v4::timer;
 
 /// The watch has to answer within this time or the import is given up.
 const STALL: Duration = Duration::from_secs(45);
 const HELLO_REQ: u16 = 1;
+const ABORT_BLOCKED_ERROR: &str = "正在等待取消操作确认，请稍后重试";
 pub const STALL_TIMER_PAYLOAD: &str = "lyra-import-stall";
 
 #[derive(Clone, Debug)]
@@ -55,6 +58,17 @@ impl ImportAsset {
     }
 }
 
+#[derive(Debug)]
+pub struct TempDirectory(pub std::path::PathBuf);
+
+impl Drop for TempDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            tracing::warn!(path = ?self.0, %error, "failed to remove cloud import directory");
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportRequest {
     pub addr: String,
@@ -65,6 +79,7 @@ pub struct ImportRequest {
     pub duration_ms: u32,
     pub palette: Palette,
     pub assets: Vec<ImportAsset>,
+    pub temp_directory: Option<Arc<TempDirectory>>,
 }
 
 /// `len` bytes of a file from `start` on.
@@ -89,8 +104,10 @@ impl Source for FileSource {
 }
 
 struct Active {
+    id: u64,
     addr: String,
     sender: Sender,
+    _temp_directory: Option<Arc<TempDirectory>>,
     /// The module has answered `HELLO`; until then nothing else is sent.
     greeted: bool,
     total: u64,
@@ -105,6 +122,45 @@ struct Active {
 }
 
 static ACTIVE: OnceLock<Mutex<Option<Active>>> = OnceLock::new();
+static ABORT: OnceLock<Mutex<Option<AbortBarrier>>> = OnceLock::new();
+
+struct AbortBarrier {
+    addr: String,
+    req: u16,
+    sending: bool,
+    acknowledged: bool,
+    started: Instant,
+}
+
+fn abort_barrier() -> &'static Mutex<Option<AbortBarrier>> {
+    ABORT.get_or_init(|| Mutex::new(None))
+}
+
+fn lock_abort() -> std::sync::MutexGuard<'static, Option<AbortBarrier>> {
+    abort_barrier().lock().unwrap_or_else(|item| item.into_inner())
+}
+static NEXT_ACTIVE_ID: AtomicU64 = AtomicU64::new(1);
+// Do not reuse a request number: a late ACK must not clear a later barrier.
+static NEXT_ABORT_REQ: AtomicU64 = AtomicU64::new(2);
+
+fn next_abort_req() -> Option<u16> {
+    NEXT_ABORT_REQ.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        (value <= u64::from(u16::MAX)).then_some(value + 1)
+    }).ok().and_then(|value| u16::try_from(value).ok())
+}
+
+pub fn abort_blocked() -> bool {
+    lock_abort().is_some()
+}
+
+fn take_matching<T>(slot: &mut Option<T>, predicate: impl FnOnce(&T) -> bool) -> bool {
+    if slot.as_ref().is_some_and(predicate) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
 
 fn active() -> &'static Mutex<Option<Active>> {
     ACTIVE.get_or_init(|| Mutex::new(None))
@@ -229,21 +285,83 @@ fn prepare(request: &ImportRequest) -> Result<Sender, String> {
     Ok(Sender::new(meta, sources.into_iter().map(|(_, source)| source).collect()))
 }
 
+fn next_queued_request() -> Option<ImportRequest> {
+    next_queued_request_with(|| {})
+}
+
+fn next_queued_request_with(after_lock: impl FnOnce()) -> Option<ImportRequest> {
+    let barrier = lock_abort();
+    after_lock();
+    state::with_state(|state| {
+        if barrier.is_some() || state.active || state.cloud_queue.is_empty() {
+            if !state.active {
+                state.cloud_current = None;
+            }
+            state.cloud_driving = false;
+            return None;
+        }
+        let request = state.cloud_queue.remove(0);
+        state.cloud_current = Some(request.track_id);
+        state.import_title = request.name.clone();
+        Some(request)
+    })
+}
+
+pub async fn drive_queue() {
+    let acquired = state::with_state(|state| {
+        if state.cloud_driving {
+            false
+        } else {
+            state.cloud_driving = true;
+            true
+        }
+    });
+    if !acquired {
+        return;
+    }
+    loop {
+        let Some(request) = next_queued_request() else { break };
+        let name = request.name.clone();
+        let retry = request.clone();
+        if let Err(error) = start(request).await {
+            if error == ABORT_BLOCKED_ERROR {
+                state::with_state(|state| {
+                    state.cloud_queue.insert(0, retry);
+                    state.cloud_current = None;
+                });
+                continue;
+            }
+            state::with_state(|state| {
+                state.cloud_current = None;
+                state.cloud_error = format!("《{name}》无法开始导入：{error}");
+            });
+        }
+    }
+    crate::ui::rerender();
+}
+
 pub async fn start(request: ImportRequest) -> Result<(), String> {
+    let abort_guard = lock_abort();
+    if abort_guard.is_some() {
+        return Err(ABORT_BLOCKED_ERROR.to_string());
+    }
     if lock().is_some() {
         return Err("已有导入任务正在运行".to_string());
     }
     let sender = prepare(&request)?;
     let total = sender.total_bytes();
     let addr = request.addr;
+    let id = NEXT_ACTIVE_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut guard = lock();
         if guard.is_some() {
             return Err("已有导入任务正在运行".to_string());
         }
         *guard = Some(Active {
+            id,
             addr: addr.clone(),
             sender,
+            _temp_directory: request.temp_directory,
             greeted: false,
             total,
             started: Instant::now(),
@@ -252,15 +370,16 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
             speed_mark: (Instant::now(), 0),
             round_trips: (Duration::ZERO, 0),
         });
+        state::with_state(|state| {
+            state.active = true;
+            state.sent = 0;
+            state.total = total;
+            state.speed_bytes_per_second = 0;
+            state.round_trip_ms = 0;
+            state.status = "正在连接手表上的 Lyra Player…".to_string();
+        });
     }
-    state::with_state(|state| {
-        state.active = true;
-        state.sent = 0;
-        state.total = total;
-        state.speed_bytes_per_second = 0;
-        state.round_trip_ms = 0;
-        state.status = "正在连接手表上的 Lyra Player…".to_string();
-    });
+    drop(abort_guard);
     let hello = Request::Hello {
         req: HELLO_REQ,
         version: MIN_VERSION,
@@ -276,7 +395,7 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
     };
     if let Err(error) = result {
         let message = format!("无法联系手表上的 Lyra Player（请确认模块已启用、手表已连接）：{error}");
-        finish_error(&message);
+        finish_active_error(id, &message);
         return Err(message);
     }
     arm_watchdog();
@@ -284,6 +403,7 @@ pub async fn start(request: ImportRequest) -> Result<(), String> {
 }
 
 fn arm_watchdog() {
+    #[cfg(not(test))]
     timer::set_timeout(STALL.as_millis() as u64, STALL_TIMER_PAYLOAD);
 }
 
@@ -292,8 +412,25 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
     let Ok(incoming) = Incoming::decode(frame) else {
         return false;
     };
+    if let Incoming::Reply(Reply::Ack { op, req, status, .. }) = &incoming {
+        if *op == lyra_protocol::op::ABORT {
+            let mut barrier = lock_abort();
+            if let Some(pending) = barrier.as_mut().filter(|pending| pending.req != 0 && pending.addr == addr && pending.req == *req) {
+                if *status == Status::Ok {
+                    pending.acknowledged = true;
+                    if !pending.sending {
+                        *barrier = None;
+                        state::with_state(|state| state.status = "手表已确认取消。".into());
+                    }
+                } else {
+                    state::with_state(|state| state.status = "手表拒绝取消，已暂停后续导入，请重试取消。".into());
+                }
+                return true;
+            }
+        }
+    }
     let mut hello_failed = None;
-    let mut start_pumping = false;
+    let mut start_pumping = None;
     {
         let mut guard = lock();
         let Some(active) = guard.as_mut() else {
@@ -305,7 +442,7 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
         active.last_progress = Instant::now();
         if active.greeted {
             active.sender.on_frame(frame);
-            start_pumping = true;
+            start_pumping = Some(active.id);
         } else if let Incoming::Reply(Reply::Hello {
             req,
             status,
@@ -316,20 +453,19 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
             if req == HELLO_REQ {
                 if status == Status::Ok && version >= 1 {
                     active.greeted = true;
-                    start_pumping = true;
+                    start_pumping = Some(active.id);
                 } else {
-                    hello_failed = Some("手表上的 Lyra Player 版本过旧，请先更新模块。".to_string());
+                    hello_failed = Some((active.id, "手表上的 Lyra Player 版本过旧，请先更新模块。".to_string()));
                 }
             }
         }
     }
-    if let Some(error) = hello_failed {
-        *lock() = None;
-        finish_error(&error);
+    if let Some((id, error)) = hello_failed {
+        finish_active_error(id, &error);
         return true;
     }
-    if start_pumping {
-        pump().await;
+    if let Some(id) = start_pumping {
+        pump(id).await;
     }
     true
 }
@@ -343,10 +479,10 @@ const IN_FLIGHT: usize = 15;
 
 /// Sends every frame the sender has ready, [`IN_FLIGHT`] at a time. Only one call does this at a
 /// time; events that arrive meanwhile are fed in by `on_frame` and picked up by the running loop.
-async fn pump() {
+async fn pump(id: u64) {
     {
         let mut guard = lock();
-        let Some(active) = guard.as_mut() else { return };
+        let Some(active) = guard.as_mut().filter(|active| active.id == id) else { return };
         if active.pumping {
             return;
         }
@@ -359,7 +495,7 @@ async fn pump() {
         while sends.len() < IN_FLIGHT {
             let next = {
                 let mut guard = lock();
-                let Some(active) = guard.as_mut() else { return };
+                let Some(active) = guard.as_mut().filter(|active| active.id == id) else { return };
                 if !active.greeted {
                     active.pumping = false;
                     return;
@@ -376,19 +512,18 @@ async fn pump() {
                         let seconds = active.started.elapsed().as_secs_f64().max(0.001);
                         let total = active.total;
                         *guard = None;
-                        drop(guard);
                         state::with_state(|state| {
                             state.active = false;
                             state.sent = total;
                             state.speed_bytes_per_second = (total as f64 / seconds) as u64;
                             state.status = "导入完成，歌曲已出现在手表的 Lyra Player 中。".to_string();
                         });
+                        drop(guard);
                         crate::library::refresh().await;
                         return;
                     }
                     State::Failed(failure) => {
                         *guard = None;
-                        drop(guard);
                         finish_error(&failure_text(failure));
                         return;
                     }
@@ -407,25 +542,45 @@ async fn pump() {
         }
         if sends.is_empty() {
             // Nothing to send and nothing on its way: the watch's next frame starts the loop again.
-            if let Some(active) = lock().as_mut() {
+            if let Some(active) = lock().as_mut().filter(|active| active.id == id) {
                 active.pumping = false;
             }
             return;
         }
         match sends.next().await {
-            Some((Err(error), _)) => {
-                *lock() = None;
-                finish_error(&format!("发送失败：{error}"));
-                return;
-            }
-            Some((Ok(()), elapsed)) => {
-                if let Some(active) = lock().as_mut() {
-                    active.round_trips.0 += elapsed;
-                    active.round_trips.1 += 1;
+            Some((result, elapsed)) => {
+                if !handle_send_result(id, result, elapsed) {
+                    return;
                 }
             }
             None => {}
         }
+    }
+}
+
+fn handle_send_result(id: u64, result: Result<(), String>, elapsed: Duration) -> bool {
+    let mut guard = lock();
+    let Some(active) = guard.as_mut().filter(|active| active.id == id) else {
+        return false;
+    };
+    match result {
+        Ok(()) => {
+            active.round_trips.0 += elapsed;
+            active.round_trips.1 += 1;
+            true
+        }
+        Err(error) => {
+            *guard = None;
+            finish_error(&format!("发送失败：{error}"));
+            false
+        }
+    }
+}
+
+fn finish_active_error(id: u64, error: &str) {
+    let mut guard = lock();
+    if take_matching(&mut *guard, |active| active.id == id) {
+        finish_error(error);
     }
 }
 
@@ -480,6 +635,9 @@ fn failure_text(failure: Failure) -> String {
 fn finish_error(error: &str) {
     state::with_state(|state| {
         state.active = false;
+        if state.cloud_current.is_some() {
+            state.cloud_error = format!("《{}》导入失败：{error}", state.import_title);
+        }
         state.status = error.to_string();
     });
 }
@@ -487,30 +645,313 @@ fn finish_error(error: &str) {
 /// The stall timer fired: give up when the watch has been silent for too long, otherwise
 /// keep watching.
 pub fn check_stall() {
-    let stalled = {
-        let guard = lock();
-        match guard.as_ref() {
-            None => return,
-            Some(active) => active.last_progress.elapsed() >= STALL,
+    check_stall_with(|| {});
+}
+
+fn check_stall_with(after_active_lock: impl FnOnce()) {
+    {
+        let barrier = lock_abort();
+        if let Some(pending) = barrier.as_ref() {
+            if pending.started.elapsed() >= STALL {
+                state::with_state(|state| state.status = if pending.sending {
+                    "取消请求仍在发送，请等待发送结束。".into()
+                } else {
+                    "等待手表取消确认超时，后续导入已暂停，请重试取消。".into()
+                });
+            } else {
+                arm_watchdog();
+            }
+            return;
         }
-    };
-    if stalled {
+    }
+    let mut guard = lock();
+    after_active_lock();
+    match guard.as_ref() {
+        None => {},
+        Some(active) if active.last_progress.elapsed() >= STALL => {
+            *guard = None;
+            finish_error("手表长时间没有响应，导入已中止。");
+        }
+        Some(_) => arm_watchdog(),
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    static TEST_ACTIVE: Mutex<()> = Mutex::new(());
+
+    fn test_active(id: u64) -> Active {
+        let meta = TrackMeta {
+            id, duration_ms: 0, name: String::new(), artists: vec![],
+            album: String::new(), palette_top: 0, palette_bottom: 0, assets: vec![],
+        };
+        Active {
+            id, addr: "watch".into(), sender: Sender::new(meta, vec![]),
+            _temp_directory: None, greeted: true, total: 0,
+            started: Instant::now(), last_progress: Instant::now(), pumping: true,
+            speed_mark: (Instant::now(), 0), round_trips: (Duration::ZERO, 0),
+        }
+    }
+
+    #[test]
+    fn failed_start_only_removes_its_own_active_task() {
+        let mut slot = Some(12);
+        assert!(!take_matching(&mut slot, |id| *id == 11));
+        assert_eq!(slot, Some(12));
+        assert!(take_matching(&mut slot, |id| *id == 12));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn stale_send_success_and_failure_leave_replacement_untouched() {
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock() = Some(test_active(2));
+        assert!(!handle_send_result(1, Ok(()), Duration::from_secs(1)));
+        assert!(!handle_send_result(1, Err("old failure".into()), Duration::ZERO));
+        let mut guard = lock();
+        let active = guard.as_ref().unwrap();
+        assert_eq!(active.id, 2);
+        assert!(active.pumping);
+        assert_eq!(active.round_trips, (Duration::ZERO, 0));
+        *guard = None;
+    }
+
+    #[test]
+    fn cancel_abort_completion_does_not_overwrite_replacement() {
+        use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock() = Some(test_active(1));
+        state::with_state(|state| { state.active = true; state.status = "old".into(); });
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let mut future = pin!(cancel_with(|_, _| async move {
+            let _ = rx.await;
+            Ok(())
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        assert!(!state::snapshot().active);
+        assert!(lock_abort().is_some());
+        let request = ImportRequest { addr: "watch".into(), track_id: 2, name: "new".into(), artists: vec![], album: String::new(), duration_ms: 0, palette: Palette::default(), assets: vec![], temp_directory: None };
+        let mut start_future = pin!(start(request));
+        assert!(matches!(start_future.as_mut().poll(&mut context), Poll::Ready(Err(_))));
+        tx.send(()).unwrap();
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(())));
+        assert!(lock_abort().is_some());
+        *lock_abort() = None;
+        state::with_state(|state| { state.active = false; state.status.clear(); });
+    }
+
+    #[test]
+    fn abort_ack_before_send_completion_keeps_barrier_until_send_finishes() {
+        use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock() = Some(test_active(1));
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let mut future = pin!(cancel_with(|_, _| async move { let _ = rx.await; Ok(()) }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        let req = lock_abort().as_ref().unwrap().req;
+        let ack = Reply::Ack { op: lyra_protocol::op::ABORT, req, status: Status::Ok, value: 0 }.encode().unwrap();
+        let mut frame = pin!(on_frame("watch", &ack));
+        assert!(matches!(frame.as_mut().poll(&mut context), Poll::Ready(true)));
+        assert!(lock_abort().is_some());
+        tx.send(()).unwrap();
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(())));
+        assert!(lock_abort().is_none());
+        state::with_state(|state| { state.active = false; state.status.clear(); });
+    }
+
+    #[test]
+    fn failed_abort_keeps_barrier_and_queue() {
+        use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock() = Some(test_active(1));
+        let mut future = pin!(cancel_with(|_, _| async { Err("offline".into()) }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(())));
+        assert!(lock_abort().is_some());
+        assert!(state::snapshot().status.contains("offline"));
+        *lock_abort() = None;
+        state::with_state(|state| { state.active = false; state.status.clear(); });
+    }
+
+    #[test]
+    fn retry_ignores_old_and_wrong_device_ack() {
+        use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock() = Some(test_active(1));
+        let mut context = Context::from_waker(Waker::noop());
+        let mut first = pin!(cancel_with(|_, _| async { Err("offline".into()) }));
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Ready(())));
+        let old = lock_abort().as_ref().unwrap().req;
+        let mut retry = pin!(cancel_with(|_, _| async { Ok(()) }));
+        assert!(matches!(retry.as_mut().poll(&mut context), Poll::Ready(())));
+        let current = lock_abort().as_ref().unwrap().req;
+        assert_ne!(old, current);
+        let ack = |req| Reply::Ack { op: lyra_protocol::op::ABORT, req, status: Status::Ok, value: 0 }.encode().unwrap();
+        let old_ack = ack(old);
+        let mut frame = pin!(on_frame("watch", &old_ack));
+        assert!(matches!(frame.as_mut().poll(&mut context), Poll::Ready(false)));
+        let current_ack = ack(current);
+        let mut frame = pin!(on_frame("other", &current_ack));
+        assert!(matches!(frame.as_mut().poll(&mut context), Poll::Ready(false)));
+        assert!(lock_abort().is_some());
+        let mut frame = pin!(on_frame("watch", &current_ack));
+        assert!(matches!(frame.as_mut().poll(&mut context), Poll::Ready(true)));
+        assert!(lock_abort().is_none());
+        state::with_state(|state| { state.active = false; state.status.clear(); });
+    }
+
+    #[test]
+    fn retry_waits_for_previous_send_to_finish() {
+        use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock() = Some(test_active(1));
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let mut first = pin!(cancel_with(|_, _| async move { let _ = rx.await; Ok(()) }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        let req = lock_abort().as_ref().unwrap().req;
+        let mut retry = pin!(cancel_with(|_, _| async { panic!("concurrent retry sent") }));
+        assert!(matches!(retry.as_mut().poll(&mut context), Poll::Ready(())));
+        assert_eq!(lock_abort().as_ref().unwrap().req, req);
+        tx.send(()).unwrap();
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Ready(())));
+        *lock_abort() = None;
+        state::with_state(|state| { state.active = false; state.status.clear(); });
+    }
+
+    #[test]
+    fn barrier_release_cannot_overtake_queue_handoff() {
+        use std::sync::mpsc;
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        *lock_abort() = Some(AbortBarrier { addr: "watch".into(), req: 99, sending: false, acknowledged: false, started: Instant::now() });
+        state::with_state(|state| {
+            state.active = false;
+            state.cloud_driving = true;
+            state.cloud_queue.clear();
+            state.cloud_queue.push(ImportRequest { addr: "watch".into(), track_id: 7, name: "queued".into(), artists: vec![], album: String::new(), duration_ms: 0, palette: Palette::default(), assets: vec![], temp_directory: None });
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let driver = std::thread::spawn(move || next_queued_request_with(|| {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        entered_rx.recv().unwrap();
+        assert!(abort_barrier().try_lock().is_err());
+        let ack = std::thread::spawn(|| {
+            let frame = Reply::Ack { op: lyra_protocol::op::ABORT, req: 99, status: Status::Ok, value: 0 }.encode().unwrap();
+            use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+            let mut future = pin!(on_frame("watch", &frame));
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(true)));
+        });
+        resume_tx.send(()).unwrap();
+        assert!(driver.join().unwrap().is_none());
+        ack.join().unwrap();
+        assert!(!state::snapshot().cloud_driving);
+        assert!(lock_abort().is_none());
+        state::with_state(|state| state.cloud_driving = true);
+        assert_eq!(next_queued_request().unwrap().track_id, 7);
+        state::with_state(|state| { state.cloud_driving = false; state.cloud_current = None; state.status.clear(); });
+    }
+
+    #[test]
+    fn stall_check_cannot_remove_a_replacement() {
+        use std::sync::mpsc;
+        let _test_guard = TEST_ACTIVE.lock().unwrap();
+        let mut old = test_active(1);
+        old.last_progress = Instant::now() - STALL - Duration::from_secs(1);
+        *lock() = Some(old);
+        state::with_state(|state| { state.active = true; state.status = "old".into(); });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let watchdog = std::thread::spawn(move || check_stall_with(|| {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        entered_rx.recv().unwrap();
+        assert!(active().try_lock().is_err());
+        let replacement = std::thread::spawn(|| {
+            let mut guard = lock();
+            *guard = Some(test_active(2));
+            state::with_state(|state| { state.active = true; state.status = "replacement".into(); });
+        });
+        resume_tx.send(()).unwrap();
+        watchdog.join().unwrap();
+        replacement.join().unwrap();
+        assert_eq!(lock().as_ref().unwrap().id, 2);
+        let snapshot = state::snapshot();
+        assert!(snapshot.active);
+        assert_eq!(snapshot.status, "replacement");
         *lock() = None;
-        finish_error("手表长时间没有响应，导入已中止。");
-    } else {
-        arm_watchdog();
+        state::with_state(|state| { state.active = false; state.status.clear(); });
+    }
+
+    #[test]
+    fn temporary_directory_lives_until_last_owner_drops() {
+        let path = crate::artwork::unique_output_directory("queue-cleanup-test");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("audio.mp3"), b"test").unwrap();
+        let owner = Arc::new(TempDirectory(path.clone()));
+        let active = owner.clone();
+        drop(owner);
+        assert!(path.exists());
+        drop(active);
+        assert!(!path.exists());
     }
 }
 
 pub async fn cancel() {
-    let target = lock().take().map(|active| active.addr);
-    if let Some(addr) = target {
-        if let Ok(frame) = (Request::Abort { req: 2 }).encode() {
-            let _ = connect::send(&addr, &frame).await;
+    cancel_with(|addr, frame| async move {
+        connect::ensure_listening(&addr).await?;
+        connect::send(&addr, &frame).await
+    }).await;
+}
+
+async fn cancel_with<F, Fut>(send: F)
+where
+    F: FnOnce(String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let (addr, req) = {
+        let mut barrier = lock_abort();
+        let mut guard = lock();
+        if let Some(active) = guard.take() {
+            *barrier = Some(AbortBarrier {
+                addr: active.addr, req: 0, sending: false,
+                acknowledged: false, started: Instant::now(),
+            });
+            state::with_state(|state| state.active = false);
+        }
+        let Some(pending) = barrier.as_mut() else { return };
+        if pending.sending { return; }
+        let Some(req) = next_abort_req() else {
+            state::with_state(|state| state.status = "取消请求编号已耗尽，后续导入保持暂停；请联系开发者。".into());
+            return;
+        };
+        pending.req = req;
+        pending.sending = true;
+        pending.acknowledged = false;
+        pending.started = Instant::now();
+        state::with_state(|state| state.status = "正在等待手表确认取消…".into());
+        (pending.addr.clone(), req)
+    };
+    arm_watchdog();
+    let result = match (Request::Abort { req }).encode() {
+        Ok(frame) => send(addr.clone(), frame).await,
+        Err(_) => Err("无法编码取消请求".into()),
+    };
+    let mut barrier = lock_abort();
+    if let Some(pending) = barrier.as_mut().filter(|pending| pending.addr == addr && pending.req == req) {
+        pending.sending = false;
+        if pending.acknowledged {
+            *barrier = None;
+            state::with_state(|state| state.status = "手表已确认取消。".into());
+        } else if let Err(error) = result {
+            state::with_state(|state| state.status = format!("取消发送失败，后续导入已暂停，请重试取消：{error}"));
         }
     }
-    state::with_state(|state| {
-        state.active = false;
-        state.status = "已取消导入。".to_string();
-    });
 }
