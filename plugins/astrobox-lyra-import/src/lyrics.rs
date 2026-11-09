@@ -106,6 +106,56 @@ pub fn to_lrc(bytes: &[u8], format: &str) -> Result<Vec<u8>, String> {
     Ok(fit(merged).into_bytes())
 }
 
+/// Lyrics embedded in an MP3. Text that already has LRC stamps is used as it
+/// is; plain lines are spread over the track so the watch has something to
+/// scroll through instead of dropping them.
+pub fn embedded_to_lrc(text: &str, timed: bool, duration_ms: u32) -> Option<Vec<u8>> {
+    if timed {
+        return to_lrc(text.as_bytes(), "lrc").ok();
+    }
+    if duration_ms == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_metadata(line))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let first = 500u32.min(duration_ms);
+    let last = duration_ms.saturating_sub(500).max(first);
+    let step = if lines.len() > 1 {
+        (last - first) / (lines.len() as u32 - 1)
+    } else {
+        0
+    };
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        out.push_str(&stamp_text(first + step * index as u32));
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(fit(out).into_bytes())
+}
+
+fn is_metadata(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some((tag, _)) = rest.split_once(']') else {
+        return false;
+    };
+    let Some((key, _)) = tag.split_once(':') else {
+        return false;
+    };
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "ti" | "ar" | "al" | "by" | "offset" | "re" | "ve"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn netease_json_is_converted_and_garbage_is_refused() {
+    fn json_lyrics_are_converted_and_garbage_is_refused() {
         let json = r#"{"code":200,"lrc":{"lyric":"[00:00.50]a\n[00:02.00]b"},"tlyric":{"lyric":"[00:00.50]甲"}}"#;
         let lrc = String::from_utf8(to_lrc(json.as_bytes(), "json").unwrap()).unwrap();
         assert_eq!(lrc, "[00:00.50]a\n[00:00.50]甲\n[00:02.00]b\n");
@@ -138,5 +188,23 @@ mod tests {
         let out = String::from_utf8(to_lrc(big.as_bytes(), "lrc").unwrap()).unwrap();
         assert!(out.len() <= MAX_BYTES);
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn embedded_plain_lyrics_get_evenly_spread_stamps() {
+        let lrc = embedded_to_lrc("[ti:歌名]\n第一句\n第二句\n第三句", false, 10_000).unwrap();
+        let lrc = String::from_utf8(lrc).unwrap();
+        assert!(!lrc.contains("[ti:"));
+        assert_eq!(lrc.lines().count(), 3);
+        assert!(lrc.starts_with("[00:00.50]第一句"));
+        assert!(lrc.contains("第三句"));
+        assert!(embedded_to_lrc("", false, 10_000).is_none());
+        assert!(embedded_to_lrc("词", false, 0).is_none());
+    }
+
+    #[test]
+    fn embedded_timed_lyrics_are_kept_as_is() {
+        let lrc = embedded_to_lrc("[00:03.00]一句", true, 10_000).unwrap();
+        assert_eq!(String::from_utf8(lrc).unwrap(), "[00:03.00]一句");
     }
 }

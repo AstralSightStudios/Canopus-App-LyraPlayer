@@ -35,21 +35,48 @@ impl TrackTags {
     }
 }
 
-/// Tags found in the file; unreadable or untagged files yield empty tags.
-pub fn read_tags(path: &Path) -> TrackTags {
-    let Ok(mut file) = File::open(path) else {
-        return TrackTags::default();
-    };
-    let mut tags = read_id3v2(&mut file).unwrap_or_default();
-    if !tags.is_complete()
-        && let Some(v1) = read_id3v1(&mut file)
-    {
-        tags.merge_missing(v1);
-    }
-    tags
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedCover {
+    pub bytes: Vec<u8>,
+    pub kind: crate::sniff::ImageFormat,
 }
 
-fn read_id3v2(file: &mut File) -> Option<TrackTags> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedLyrics {
+    pub text: String,
+    /// Whether the text already carries LRC timestamps.
+    pub timed: bool,
+}
+
+/// Everything useful an MP3 carries in its ID3v2 tag: text metadata plus the
+/// embedded front cover and lyrics, when present.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmbeddedMedia {
+    pub tags: TrackTags,
+    pub cover: Option<EmbeddedCover>,
+    pub lyrics: Option<EmbeddedLyrics>,
+}
+
+/// Tags found in the file; unreadable or untagged files yield empty tags.
+pub fn read_media(path: &Path) -> EmbeddedMedia {
+    let Ok(mut file) = File::open(path) else {
+        return EmbeddedMedia::default();
+    };
+    let mut media = read_id3v2(&mut file).unwrap_or_default();
+    if !media.tags.is_complete()
+        && let Some(v1) = read_id3v1(&mut file)
+    {
+        media.tags.merge_missing(v1);
+    }
+    media
+}
+
+#[cfg(test)]
+fn read_tags(path: &Path) -> TrackTags {
+    read_media(path).tags
+}
+
+fn read_id3v2(file: &mut File) -> Option<EmbeddedMedia> {
     let mut header = [0u8; 10];
     file.read_exact(&mut header).ok()?;
     if &header[..3] != b"ID3" || header[6..10].iter().any(|byte| byte & 0x80 != 0) {
@@ -64,10 +91,10 @@ fn read_id3v2(file: &mut File) -> Option<TrackTags> {
 }
 
 /// Parses the body of an ID3v2 tag (everything after the 10-byte header).
-fn parse_id3v2(version: u8, flags: u8, mut tag: Vec<u8>) -> TrackTags {
-    let mut tags = TrackTags::default();
+fn parse_id3v2(version: u8, flags: u8, mut tag: Vec<u8>) -> EmbeddedMedia {
+    let mut media = EmbeddedMedia::default();
     if !(2..=4).contains(&version) {
-        return tags;
+        return media;
     }
     // Before v2.4, unsynchronisation applies to the whole tag at once.
     if flags & 0x80 != 0 && version < 4 {
@@ -76,7 +103,7 @@ fn parse_id3v2(version: u8, flags: u8, mut tag: Vec<u8>) -> TrackTags {
     let mut offset = 0usize;
     if flags & 0x40 != 0 && version >= 3 {
         let Some(size) = tag.get(..4) else {
-            return tags;
+            return media;
         };
         // v2.3 counts only the bytes after its size field; v2.4 counts all.
         offset = if version == 3 {
@@ -87,6 +114,8 @@ fn parse_id3v2(version: u8, flags: u8, mut tag: Vec<u8>) -> TrackTags {
     }
 
     let (id_len, header_len) = if version == 2 { (3, 6) } else { (4, 10) };
+    let mut cover_is_front = false;
+    let mut lyrics_rank = 0u8;
     while let Some(header) = tag.get(offset..offset + header_len) {
         if header[0] == 0 {
             break; // padding
@@ -109,20 +138,178 @@ fn parse_id3v2(version: u8, flags: u8, mut tag: Vec<u8>) -> TrackTags {
         offset = start + size;
 
         let field = match id {
-            b"TIT2" | b"TT2" => &mut tags.title,
-            b"TPE1" | b"TP1" => &mut tags.artist,
-            b"TALB" | b"TAL" => &mut tags.album,
-            _ => continue,
+            b"TIT2" | b"TT2" => Some(&mut media.tags.title),
+            b"TPE1" | b"TP1" => Some(&mut media.tags.artist),
+            b"TALB" | b"TAL" => Some(&mut media.tags.album),
+            _ => None,
         };
-        if field.is_some() {
+        if let Some(field) = field {
+            if field.is_some() {
+                continue;
+            }
+            if let Some(body) = frame_body(version, header, body) {
+                *field = decode_text_frame(&body);
+            }
             continue;
         }
+
         let Some(body) = frame_body(version, header, body) else {
             continue;
         };
-        *field = decode_text_frame(&body);
+        match id {
+            b"APIC" | b"PIC" => {
+                let Some((picture_type, bytes)) = parse_apic(version, &body) else {
+                    continue;
+                };
+                let Some(kind) = crate::sniff::image_format_of(&bytes) else {
+                    continue;
+                };
+                let is_front = picture_type == 3;
+                if media.cover.is_none() || (is_front && !cover_is_front) {
+                    media.cover = Some(EmbeddedCover { bytes, kind });
+                    cover_is_front = is_front;
+                }
+            }
+            b"USLT" | b"ULT" => {
+                if lyrics_rank < 1
+                    && let Some(lyrics) = parse_uslt(&body)
+                {
+                    media.lyrics = Some(lyrics);
+                    lyrics_rank = 1;
+                }
+            }
+            b"SYLT" => {
+                if let Some(lyrics) = parse_sylt(&body) {
+                    media.lyrics = Some(lyrics);
+                    lyrics_rank = 2;
+                }
+            }
+            _ => {}
+        }
     }
-    tags
+    media
+}
+
+/// An attached picture frame: `(picture type, image bytes)`.
+fn parse_apic(version: u8, body: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let (&encoding, rest) = body.split_first()?;
+    let (picture_type, rest) = if version == 2 {
+        // v2.2 PIC: a fixed three-byte "JPG"/"PNG" format instead of a MIME type.
+        let rest = rest.get(3..)?;
+        let (&picture_type, rest) = rest.split_first()?;
+        (picture_type, rest)
+    } else {
+        let (mime, rest) = split_once_terminated(rest, 1)?;
+        // A picture that is only a link to another file is not embedded art.
+        if mime.starts_with(b"-->") {
+            return None;
+        }
+        let (&picture_type, rest) = rest.split_first()?;
+        (picture_type, rest)
+    };
+    let (_, data) = split_once_terminated(rest, text_unit(encoding))?;
+    (!data.is_empty()).then(|| (picture_type, data.to_vec()))
+}
+
+/// An unsynchronised lyrics frame; timestamps are kept when the text has them.
+fn parse_uslt(body: &[u8]) -> Option<EmbeddedLyrics> {
+    let (&encoding, rest) = body.split_first()?;
+    let rest = rest.get(3..)?; // language
+    let (_, text) = split_once_terminated(rest, text_unit(encoding))?;
+    let text = decode_text(encoding, text)?;
+    let text = text
+        .trim_start_matches('\u{feff}')
+        .trim_matches('\0')
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let timed = has_timestamps(&text);
+    Some(EmbeddedLyrics { text, timed })
+}
+
+/// A synchronised lyrics frame, converted to timed LRC. Only millisecond
+/// timestamps are understood; the rarer MPEG-frame variant is skipped.
+fn parse_sylt(body: &[u8]) -> Option<EmbeddedLyrics> {
+    let (&encoding, rest) = body.split_first()?;
+    let rest = rest.get(3..)?; // language
+    let (&timestamp_format, rest) = rest.split_first()?;
+    let (&_content_type, rest) = rest.split_first()?;
+    let (_, mut rest) = split_once_terminated(rest, text_unit(encoding))?;
+    if timestamp_format != 2 {
+        return None;
+    }
+    let mut text = String::new();
+    while !rest.is_empty() {
+        let (line, after) = split_once_terminated(rest, text_unit(encoding))?;
+        let stamp = after.get(..4)?;
+        rest = after.get(4..)?;
+        let millis = u32::from_be_bytes([stamp[0], stamp[1], stamp[2], stamp[3]]);
+        let line = decode_text(encoding, line)?;
+        let line = line.trim_matches('\0').trim();
+        if !line.is_empty() {
+            text.push_str(&format!(
+                "[{:02}:{:02}.{:02}]{line}\n",
+                millis / 60_000,
+                millis / 1_000 % 60,
+                millis % 1_000 / 10
+            ));
+        }
+    }
+    (!text.is_empty()).then_some(EmbeddedLyrics { text, timed: true })
+}
+
+/// The terminator width of an encoded string: UTF-16 uses two bytes.
+fn text_unit(encoding: u8) -> usize {
+    if matches!(encoding, 1 | 2) { 2 } else { 1 }
+}
+
+/// Splits at the first NUL terminator of `unit` bytes, aligned to the unit.
+fn split_once_terminated(text: &[u8], unit: usize) -> Option<(&[u8], &[u8])> {
+    let mut index = 0;
+    while index + unit <= text.len() {
+        if text[index..index + unit].iter().all(|byte| *byte == 0) {
+            return Some((&text[..index], &text[index + unit..]));
+        }
+        index += unit;
+    }
+    None
+}
+
+fn decode_text(encoding: u8, bytes: &[u8]) -> Option<String> {
+    match encoding {
+        0 => latin1_or_utf8(trim_nuls(bytes, 1)),
+        1 | 2 => utf16(trim_nuls(bytes, 2), encoding == 2),
+        3 => String::from_utf8(trim_nuls(bytes, 1).to_vec()).ok(),
+        _ => None,
+    }
+}
+
+fn trim_nuls(bytes: &[u8], unit: usize) -> &[u8] {
+    let mut end = bytes.len();
+    while end >= unit && bytes[end - unit..end].iter().all(|byte| *byte == 0) {
+        end -= unit;
+    }
+    &bytes[..end]
+}
+
+fn has_timestamps(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+            .is_some_and(|(tag, _)| is_stamp_tag(tag))
+    })
+}
+
+/// `[mm:ss.xx]` rather than a metadata tag such as `[ti:歌名]`.
+fn is_stamp_tag(tag: &str) -> bool {
+    let Some((minutes, rest)) = tag.split_once(':') else {
+        return false;
+    };
+    let seconds = rest.split_once('.').map_or(rest, |(seconds, _)| seconds);
+    minutes.trim().parse::<u32>().is_ok() && seconds.trim().parse::<u32>().is_ok()
 }
 
 /// The frame payload with its per-frame transforms undone, or `None` for
@@ -521,7 +708,7 @@ mod tests {
         truncated.splice(10..10, *b"TIT2\x00\x10\x00\x00\x00\x00\x03");
         assert_eq!(read_bytes(&truncated), TrackTags::default());
         assert_eq!(
-            parse_id3v2(4, 0, frame(4, b"TIT2", &text(9, b"bad encoding"))),
+            parse_id3v2(4, 0, frame(4, b"TIT2", &text(9, b"bad encoding"))).tags,
             TrackTags::default()
         );
     }
@@ -542,7 +729,7 @@ mod tests {
         }
         // Without resynchronisation the inserted bytes would shift the second
         // frame out of place.
-        let tags = parse_id3v2(3, 0x80, unsynced);
+        let tags = parse_id3v2(3, 0x80, unsynced).tags;
         assert_eq!(tags.title.as_deref(), Some("ÿ标题"));
         assert_eq!(tags.artist.as_deref(), Some("Artist"));
         assert_eq!(
@@ -561,8 +748,72 @@ mod tests {
         // A compressed frame is skipped, not misread.
         let mut compressed = frame(4, b"TPE1", &text(3, b"zlib"));
         compressed[9] = 0x09;
-        let tags = parse_id3v2(4, 0, [grouped, compressed].concat());
+        let tags = parse_id3v2(4, 0, [grouped, compressed].concat()).tags;
         assert_eq!(tags.title.as_deref(), Some("Song"));
         assert_eq!(tags.artist, None);
+    }
+
+    fn apic(picture_type: u8, image: &[u8]) -> Vec<u8> {
+        let mut body = vec![0]; // Latin-1
+        body.extend(b"image/jpeg\0");
+        body.push(picture_type);
+        body.push(0); // empty description
+        body.extend(image);
+        body
+    }
+
+    #[test]
+    fn extracts_the_front_cover_and_prefers_it_over_other_pictures() {
+        let media = parse_id3v2(
+            3,
+            0,
+            [
+                frame(3, b"APIC", &apic(4, b"\xFF\xD8\xFF\xE0back")),
+                frame(3, b"APIC", &apic(3, b"\xFF\xD8\xFF\xE0front")),
+            ]
+            .concat(),
+        );
+        let cover = media.cover.unwrap();
+        assert_eq!(cover.kind, crate::sniff::ImageFormat::Jpeg);
+        assert_eq!(cover.bytes, b"\xFF\xD8\xFF\xE0front");
+    }
+
+    #[test]
+    fn extracts_embedded_lyrics_with_and_without_timestamps() {
+        let mut timed = vec![3u8]; // UTF-8
+        timed.extend(b"eng");
+        timed.push(0); // empty descriptor
+        timed.extend("[00:01.00]第一句\n[00:02.00]第二句".as_bytes());
+        let media = parse_id3v2(3, 0, frame(3, b"USLT", &timed));
+        let lyrics = media.lyrics.unwrap();
+        assert!(lyrics.timed);
+        assert!(lyrics.text.contains("第二句"));
+
+        let mut plain = vec![3u8];
+        plain.extend(b"eng");
+        plain.push(0);
+        plain.extend("第一句\n第二句".as_bytes());
+        let media = parse_id3v2(3, 0, frame(3, b"USLT", &plain));
+        let lyrics = media.lyrics.unwrap();
+        assert!(!lyrics.timed);
+        assert_eq!(lyrics.text, "第一句\n第二句");
+    }
+
+    #[test]
+    fn converts_synchronised_lyrics_to_timed_lrc() {
+        let mut body = vec![3u8]; // UTF-8
+        body.extend(b"eng");
+        body.push(2); // millisecond timestamps
+        body.push(1); // lyrics
+        body.push(0); // empty descriptor
+        for (millis, line) in [(1_000u32, "one"), (2_500, "two")] {
+            body.extend(line.as_bytes());
+            body.push(0);
+            body.extend(millis.to_be_bytes());
+        }
+        let media = parse_id3v2(4, 0, frame(4, b"SYLT", &body));
+        let lyrics = media.lyrics.unwrap();
+        assert!(lyrics.timed);
+        assert_eq!(lyrics.text, "[00:01.00]one\n[00:02.50]two\n");
     }
 }

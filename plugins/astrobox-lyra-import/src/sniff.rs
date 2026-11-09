@@ -25,7 +25,7 @@ pub enum ImageFormat {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LyricsFormat {
-    /// A NetEase lyric envelope, as exported by the cloud import.
+    /// A JSON lyric envelope with `lrc`/`tlyric` fields.
     Json,
     Lrc,
 }
@@ -81,7 +81,7 @@ pub fn lyrics_format(bytes: &[u8]) -> Option<LyricsFormat> {
     }
 }
 
-fn image_format_of(header: &[u8]) -> Option<ImageFormat> {
+pub(crate) fn image_format_of(header: &[u8]) -> Option<ImageFormat> {
     if header.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some(ImageFormat::Jpeg)
     } else if header.starts_with(b"\x89PNG\r\n\x1A\n") {

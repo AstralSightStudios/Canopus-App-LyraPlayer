@@ -4,6 +4,7 @@ use crate::exports::astrobox::psys_plugin_v4::{
 };
 
 mod artwork;
+mod audio;
 mod connect;
 mod id3;
 mod import;

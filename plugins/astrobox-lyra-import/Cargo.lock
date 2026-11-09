@@ -52,6 +52,7 @@ dependencies = [
  "mp3-duration",
  "num-bigint",
  "qrcode",
+ "rusty_mp3",
  "serde",
  "serde_json",
  "tracing",
@@ -707,6 +708,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rusty_mp3"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eda7c6c82285d2bc3f1e6aded40ca6f7572fe9eec77f18fb10efc1d03aed3877"
 
 [[package]]
 name = "semver"
