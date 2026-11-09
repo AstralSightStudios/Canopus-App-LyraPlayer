@@ -50,7 +50,6 @@ enum Style {
     MarginTop(u32),
     AlignCenter,
     AlignStart,
-    JustifyCenter,
     Bg(String),
     Color(String),
     FontSize(u32),
@@ -156,10 +155,6 @@ impl View {
         self.style(Style::AlignStart)
     }
 
-    pub fn justify_center(self) -> Self {
-        self.style(Style::JustifyCenter)
-    }
-
     pub fn bg(self, color: &str) -> Self {
         self.style(Style::Bg(color.to_string()))
     }
@@ -238,7 +233,6 @@ impl View {
                 Style::MarginTop(margin) => element.margin_top(margin),
                 Style::AlignCenter => element.align_center(),
                 Style::AlignStart => element.align_start(),
-                Style::JustifyCenter => element.justify_center(),
                 Style::Bg(color) => element.bg(&color),
                 Style::Color(color) => element.text_color(&color),
                 Style::FontSize(size) => element.size(size),
@@ -333,7 +327,6 @@ impl View {
                 Style::MarginTop(v) => set("margin-top", format!("{v}px")),
                 Style::AlignCenter => set("align-items", "center".into()),
                 Style::AlignStart => set("align-items", "flex-start".into()),
-                Style::JustifyCenter => set("justify-content", "center".into()),
                 Style::Bg(c) => set("background", c.clone()),
                 Style::Color(c) => set("color", c.clone()),
                 Style::FontSize(v) => set("font-size", format!("{v}px")),

@@ -3,17 +3,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use qrcode::{QrCode, render::svg};
 use serde::Deserialize;
 
 use crate::astrobox::psys_host_v4::{
     dialog::{self, DialogButton, DialogInfo, DialogStyle, DialogType, FilterConfig, PickConfig},
     ui,
 };
-use crate::state::{self, NeteaseView, PlaylistEditor, Tab, UiState};
+use crate::state::{self, PlaylistEditor, Tab, UiState};
 use crate::view::{Kind, On, View};
-use crate::{artwork, connect, id3, import, library, netease};
+use crate::{artwork, audio, connect, id3, import, library};
 
 const EVENT_TAB_PREFIX: &str = "action:tab.";
 const EVENT_PICK_AUDIO: &str = "action:file.audio";
@@ -27,20 +25,7 @@ const EVENT_DEVICE: &str = "input:device";
 const EVENT_NAME: &str = "input:name";
 const EVENT_ARTIST: &str = "input:artist";
 const EVENT_ALBUM: &str = "input:album";
-const EVENT_QUERY: &str = "input:netease.query";
-const EVENT_AUDIO_QUALITY: &str = "input:netease.audio-quality";
-const EVENT_SEARCH_CLOUD: &str = "action:netease.search";
-const EVENT_LOAD_PLAYLISTS: &str = "action:netease.playlists";
-const EVENT_CLOSE_PLAYLIST: &str = "action:netease.playlist.close";
-const EVENT_PLAYLIST_PAGE_PREVIOUS: &str = "action:netease.playlist.page.previous";
-const EVENT_PLAYLIST_PAGE_NEXT: &str = "action:netease.playlist.page.next";
-const PLAYLIST_PAGE_SIZE: usize = 50;
-const EVENT_SEARCH_RESULT_PREFIX: &str = "action:netease.result.";
-const EVENT_PLAYLIST_PREFIX: &str = "action:netease.playlist.";
-const EVENT_PLAYLIST_TRACK_PREFIX: &str = "action:netease.track.";
-const EVENT_QR_BEGIN: &str = "action:netease.qr.begin";
-const EVENT_QR_POLL: &str = "action:netease.qr.poll";
-const EVENT_LOGOUT: &str = "action:netease.logout";
+const EVENT_LOCAL_QUALITY: &str = "input:local.audio-quality";
 const EVENT_LIBRARY_REFRESH: &str = "action:library.refresh";
 const EVENT_LIBRARY_MOVE_UP_PREFIX: &str = "action:library.move.up.";
 const EVENT_LIBRARY_MOVE_DOWN_PREFIX: &str = "action:library.move.down.";
@@ -93,7 +78,6 @@ pub async fn on_event(event_id: &str, payload: &str) {
         EVENT_NAME => return state::with_state(|state| state.track_name = value),
         EVENT_ARTIST => return state::with_state(|state| state.artist = value),
         EVENT_ALBUM => return state::with_state(|state| state.album = value),
-        EVENT_QUERY => return state::with_state(|state| state.netease_query = value),
         EVENT_PL_NAME => {
             return state::with_state(|state| {
                 if let Some(editor) = &mut state.playlist_editor {
@@ -117,9 +101,8 @@ pub async fn on_event(event_id: &str, payload: &str) {
         }),
         event if event.starts_with(EVENT_TAB_PREFIX) => {
             let tab = match &event[EVENT_TAB_PREFIX.len()..] {
-                "local" => Tab::Local,
                 "library" => Tab::Library,
-                _ => Tab::Cloud,
+                _ => Tab::Local,
             };
             state::with_state(|state| state.tab = tab);
             let snapshot = state::snapshot();
@@ -147,37 +130,15 @@ pub async fn on_event(event_id: &str, payload: &str) {
                 }
             });
         }
-        EVENT_AUDIO_QUALITY => {
-            let bitrate = value.parse().unwrap_or(netease::AUDIO_BITRATE_LOW);
+        EVENT_LOCAL_QUALITY => {
+            let bitrate = value.parse().unwrap_or(audio::DEFAULT);
             state::with_state(|state| {
-                state.netease_audio_bitrate = netease::normalized_audio_bitrate(bitrate);
+                state.local_audio_bitrate = audio::normalized(bitrate);
             });
         }
         EVENT_START_LOCAL => start_local().await,
-        EVENT_SEARCH_CLOUD => search_cloud(),
-        EVENT_LOAD_PLAYLISTS => load_playlists(),
-        EVENT_CLOSE_PLAYLIST => state::with_state(|state| {
-            state.netease_playlist_name.clear();
-            state.netease_playlist_tracks.clear();
-            state.netease_playlist_page = 0;
-            state.netease_view = NeteaseView::Playlists;
-        }),
-        EVENT_PLAYLIST_PAGE_PREVIOUS => state::with_state(|state| {
-            state.netease_playlist_page = state.netease_playlist_page.saturating_sub(1);
-        }),
-        EVENT_PLAYLIST_PAGE_NEXT => state::with_state(|state| {
-            if (state.netease_playlist_page + 1) * PLAYLIST_PAGE_SIZE
-                < state.netease_playlist_tracks.len()
-            {
-                state.netease_playlist_page += 1;
-            }
-        }),
-        EVENT_QR_BEGIN => begin_qr(),
-        EVENT_QR_POLL => poll_qr(),
-        EVENT_LOGOUT => logout_netease(),
         EVENT_CANCEL => {
             import::cancel().await;
-            import::drive_queue().await;
         },
         EVENT_DISMISS => state::with_state(|state| {
             if !state.active {
@@ -251,20 +212,6 @@ pub async fn on_event(event_id: &str, payload: &str) {
                 confirm_delete(track, &name).await;
             }
         }
-        event if event.starts_with(EVENT_SEARCH_RESULT_PREFIX) => {
-            if let Some(index) = id(event, EVENT_SEARCH_RESULT_PREFIX) {
-                start_search_result(index as usize).await;
-            }
-        }
-        event if event.starts_with(EVENT_PLAYLIST_TRACK_PREFIX) => {
-            if let Some(index) = id(event, EVENT_PLAYLIST_TRACK_PREFIX) {
-                start_playlist_track(index as usize).await;
-            }
-        }
-        event if event.starts_with(EVENT_PLAYLIST_PREFIX) => match id(event, EVENT_PLAYLIST_PREFIX) {
-            Some(id) => open_playlist(id),
-            None => tracing::warn!(event_id = event, "invalid NetEase playlist UI event"),
-        },
         _ => {}
     }
     rerender();
@@ -295,7 +242,12 @@ fn dialog_buttons(cancel: &str, confirm: &str) -> Vec<DialogButton> {
 }
 
 async fn confirm(title: &str, content: String, confirm: &str) -> bool {
-    dialog::show_dialog(
+    // The menu can deliver the same click twice; only the first one opens a dialog.
+    if state::with_state(|state| state.confirm_open) {
+        return false;
+    }
+    state::with_state(|state| state.confirm_open = true);
+    let confirmed = dialog::show_dialog(
         DialogType::Alert,
         DialogStyle::System,
         DialogInfo {
@@ -306,13 +258,29 @@ async fn confirm(title: &str, content: String, confirm: &str) -> bool {
     )
     .await
     .clicked_btn_id
-        == "confirm"
+        == "confirm";
+    state::with_state(|state| state.confirm_open = false);
+    confirmed
 }
 
 async fn confirm_delete(track_id: u64, track_name: &str) {
+    // A duplicate click must not ask a second time while the first delete is still running.
+    let snapshot = state::snapshot();
+    if snapshot.library_busy || snapshot.deleting_tracks.contains(&track_id) {
+        return;
+    }
+    state::with_state(|state| state.deleting_tracks.push(track_id));
     let content = format!("确定从手表删除《{track_name}》吗？音频、封面、背景和歌词都会被永久删除。");
     if confirm("删除歌曲", content, "删除").await {
         library::delete_track(track_id).await;
+        // The request was refused before it started; allow deleting the song again.
+        state::with_state(|state| {
+            if !state.library_busy {
+                state.deleting_tracks.retain(|id| *id != track_id);
+            }
+        });
+    } else {
+        state::with_state(|state| state.deleting_tracks.retain(|id| *id != track_id));
     }
 }
 
@@ -352,10 +320,28 @@ async fn pick_asset(kind: &str, extensions: &[&str]) {
     let inspected = import::inspect_file(&path, &result.name, kind);
     // On Android the name is a content URI segment such as "audio%3A1000012345",
     // so the file's own tags are the only meaningful source for these fields.
-    let tags = match &inspected {
-        Ok(selected) if kind == "audio" => id3::read_tags(Path::new(&selected.path)),
-        _ => id3::TrackTags::default(),
+    let media = match &inspected {
+        Ok(selected) if kind == "audio" => id3::read_media(Path::new(&selected.path)),
+        _ => id3::EmbeddedMedia::default(),
     };
+    let (use_embedded_cover, use_embedded_lyrics) = state::with_state(|state| {
+        (
+            state.cover_embedded || state.cover.is_none(),
+            state.lyrics_embedded || state.lyrics.is_none(),
+        )
+    });
+    let embedded_cover = if use_embedded_cover {
+        media.cover.and_then(store_embedded_cover)
+    } else {
+        None
+    };
+    let embedded_lyrics = match &inspected {
+        Ok(selected) if kind == "audio" && use_embedded_lyrics => media
+            .lyrics
+            .and_then(|lyrics| store_embedded_lyrics(lyrics, selected.duration_ms)),
+        _ => None,
+    };
+    let tags = media.tags;
     match inspected {
         Ok(selected) => state::with_state(|state| {
             if kind == "audio" {
@@ -373,15 +359,80 @@ async fn pick_asset(kind: &str, extensions: &[&str]) {
                 state.album = tags.album.unwrap_or_default();
                 state.duration_ms = selected.duration_ms;
                 state.audio = Some(selected);
+
+                // Embedded artwork and lyrics are used unless the user picked
+                // their own after the previous song.
+                if state.cover_embedded || state.cover.is_none() {
+                    remove_embedded(&mut state.cover);
+                    state.cover = embedded_cover;
+                    state.cover_embedded = state.cover.is_some();
+                }
+                if state.lyrics_embedded || state.lyrics.is_none() {
+                    remove_embedded(&mut state.lyrics);
+                    state.lyrics = embedded_lyrics;
+                    state.lyrics_embedded = state.lyrics.is_some();
+                }
             } else if kind == "cover" {
+                if state.cover_embedded {
+                    remove_embedded(&mut state.cover);
+                }
                 state.cover = Some(selected);
+                state.cover_embedded = false;
             } else {
+                if state.lyrics_embedded {
+                    remove_embedded(&mut state.lyrics);
+                }
                 state.lyrics = Some(selected);
+                state.lyrics_embedded = false;
             }
             state.status.clear();
         }),
         Err(error) => state::with_state(|state| state.status = format!("文件读取失败：{error}")),
     }
+}
+
+/// Drops a previously extracted file; manually picked files are left alone
+/// because their copies already live in `media/`.
+fn remove_embedded(file: &mut Option<state::SelectedFile>) {
+    if let Some(file) = file.take() {
+        let _ = std::fs::remove_file(&file.path);
+    }
+}
+
+fn store_embedded_cover(cover: id3::EmbeddedCover) -> Option<state::SelectedFile> {
+    let (extension, format) = match cover.kind {
+        crate::sniff::ImageFormat::Jpeg => ("jpg", "jpeg"),
+        crate::sniff::ImageFormat::Png => ("png", "png"),
+    };
+    let directory = artwork::unique_output_directory("embedded-cover");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join(format!("cover.{extension}"));
+    std::fs::write(&path, &cover.bytes).ok()?;
+    Some(state::SelectedFile {
+        name: "内嵌封面".to_string(),
+        path: path.to_string_lossy().into_owned(),
+        size: cover.bytes.len() as u64,
+        duration_ms: 0,
+        format,
+    })
+}
+
+fn store_embedded_lyrics(
+    lyrics: id3::EmbeddedLyrics,
+    duration_ms: u32,
+) -> Option<state::SelectedFile> {
+    let bytes = crate::lyrics::embedded_to_lrc(&lyrics.text, lyrics.timed, duration_ms)?;
+    let directory = artwork::unique_output_directory("embedded-lyrics");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join("lyrics.lrc");
+    std::fs::write(&path, &bytes).ok()?;
+    Some(state::SelectedFile {
+        name: "内嵌歌词".to_string(),
+        path: path.to_string_lossy().into_owned(),
+        size: bytes.len() as u64,
+        duration_ms: 0,
+        format: "lrc",
+    })
 }
 
 async fn start_local() {
@@ -394,7 +445,44 @@ async fn start_local() {
         state::with_state(|state| state.status = "曲名不能为空。".to_string());
         return;
     }
-    let mut assets = vec![import::ImportAsset::audio(audio.path)];
+    let source_kbps = if audio.duration_ms > 0 {
+        (audio.size.saturating_mul(8) / u64::from(audio.duration_ms)) as u32
+    } else {
+        0
+    };
+    let mut audio_path = audio.path;
+    let mut temp_directory = None;
+    // Never "upscale" a file that is already below the selected bitrate.
+    let compress = snapshot.local_audio_bitrate != audio::ORIGINAL
+        && (source_kbps == 0 || snapshot.local_audio_bitrate < source_kbps);
+    if compress {
+        let directory = artwork::unique_output_directory("local-audio");
+        let compressed = directory.join("audio.mp3");
+        state::with_state(|state| state.status = "正在压缩音频，请稍候…".to_string());
+        rerender();
+        let compressed_result = std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("无法创建压缩目录：{error}"))
+            .and_then(|_| {
+                audio::compress(
+                    Path::new(&audio_path),
+                    &compressed,
+                    snapshot.local_audio_bitrate,
+                )
+            });
+        match compressed_result {
+            Ok(()) => {
+                audio_path = compressed.to_string_lossy().into_owned();
+                temp_directory = Some(std::sync::Arc::new(import::TempDirectory(directory)));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&directory);
+                state::with_state(|state| {
+                    state.status = format!("音频压缩失败，将导入原文件：{error}");
+                });
+            }
+        }
+    }
+    let mut assets = vec![import::ImportAsset::audio(audio_path)];
     let mut palette = artwork::Palette::default();
     if let Some(cover) = snapshot.cover {
         let output = artwork::unique_output_directory("local-artwork");
@@ -430,198 +518,12 @@ async fn start_local() {
         duration_ms: snapshot.duration_ms,
         palette,
         assets,
-        temp_directory: None,
+        temp_directory,
     })
     .await;
     if let Err(error) = result {
         state::with_state(|state| state.status = format!("无法开始导入：{error}"));
     }
-}
-
-fn search_cloud() {
-    let snapshot = state::snapshot();
-    if snapshot.netease_query.trim().is_empty() {
-        state::with_state(|state| state.status = "请输入要搜索的歌曲。".to_string());
-        return;
-    }
-    match netease::search(&snapshot.netease_query, &snapshot.netease_cookie) {
-        Ok(results) => state::with_state(|state| {
-            state.netease_results = results;
-            state.netease_view = NeteaseView::SearchResults;
-            state.status.clear();
-        }),
-        Err(error) => state::with_state(|state| state.status = error),
-    }
-}
-
-fn load_playlists() {
-    let snapshot = state::snapshot();
-    match netease::user_playlists(&snapshot.netease_cookie) {
-        Ok(playlists) => state::with_state(|state| {
-            state.netease_playlists = playlists;
-            state.netease_playlist_name.clear();
-            state.netease_playlist_tracks.clear();
-            state.netease_playlist_page = 0;
-            state.netease_view = NeteaseView::Playlists;
-            state.status.clear();
-        }),
-        Err(error) => state::with_state(|state| state.status = error),
-    }
-}
-
-fn open_playlist(id: u64) {
-    let snapshot = state::snapshot();
-    tracing::info!(
-        playlist_id = id,
-        has_login = !snapshot.netease_cookie.is_empty(),
-        "requesting NetEase playlist tracks"
-    );
-    match netease::playlist_tracks(id, &snapshot.netease_cookie) {
-        Ok((name, tracks)) => state::with_state(|state| {
-            tracing::info!(
-                playlist_id = id,
-                track_count = tracks.len(),
-                playlist_name = %name,
-                "NetEase playlist tracks loaded"
-            );
-            state.netease_playlist_name = name;
-            state.netease_playlist_tracks = tracks;
-            state.netease_playlist_page = 0;
-            state.netease_view = NeteaseView::PlaylistTracks;
-            state.status.clear();
-        }),
-        Err(error) => {
-            tracing::warn!(playlist_id = id, error = %error, "NetEase playlist request failed");
-            state::with_state(|state| state.status = error);
-        }
-    }
-}
-
-async fn start_search_result(index: usize) {
-    let snapshot = state::snapshot();
-    let Some(song) = snapshot.netease_results.get(index).cloned() else {
-        state::with_state(|state| state.status = "搜索结果已失效，请重新搜索。".to_string());
-        return;
-    };
-    start_cloud_song(song, snapshot).await;
-}
-
-async fn start_playlist_track(index: usize) {
-    let snapshot = state::snapshot();
-    let Some(song) = snapshot.netease_playlist_tracks.get(index).cloned() else {
-        state::with_state(|state| state.status = "歌单歌曲已失效，请重新打开歌单。".to_string());
-        return;
-    };
-    start_cloud_song(song, snapshot).await;
-}
-
-async fn start_cloud_song(song: state::CloudSong, snapshot: UiState) {
-    let accepted = state::with_state(|state| {
-        if state.selected_addr.is_empty() || state.cloud_song_pending(song.id) {
-            return false;
-        }
-        state.cloud_error.clear();
-        state.cloud_downloading.push(song.id);
-        if !state.active {
-            state.status = format!("正在下载《{}》…", song.name);
-        }
-        true
-    });
-    if !accepted {
-        return;
-    }
-    rerender();
-    let prepared = match netease::prepare(
-        &song,
-        &snapshot.netease_cookie,
-        snapshot.netease_audio_bitrate,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            state::with_state(|state| {
-                state.cloud_downloading.retain(|id| *id != song.id);
-                state.cloud_error = format!("《{}》下载失败：{error}", song.name);
-            });
-            return;
-        }
-    };
-    let temp_directory = Some(std::sync::Arc::new(import::TempDirectory(
-        prepared.temp_directory,
-    )));
-    state::with_state(|state| {
-        state.cloud_downloading.retain(|id| *id != song.id);
-        state.cloud_warnings.extend(prepared.warnings.iter().map(|warning| format!("《{}》：{warning}", song.name)));
-        state.status = format!("《{}》下载完成，等待排队导入。", prepared.song.name);
-        state.cloud_queue.push(import::ImportRequest {
-            addr: snapshot.selected_addr,
-            track_id: prepared.song.id,
-            name: prepared.song.name,
-            artists: prepared.song.artists,
-            album: prepared.song.album,
-            duration_ms: prepared.song.duration_ms,
-            palette: prepared.palette,
-            assets: prepared.assets,
-            temp_directory,
-        });
-    });
-    rerender();
-    import::drive_queue().await;
-}
-
-fn begin_qr() {
-    match netease::begin_qr_login() {
-        Ok((key, url)) => state::with_state(|state| {
-            state.qr_key = key;
-            state.qr_url = url;
-            state.status.clear();
-        }),
-        Err(error) => state::with_state(|state| state.status = error),
-    }
-}
-
-fn poll_qr() {
-    let snapshot = state::snapshot();
-    if snapshot.qr_key.is_empty() {
-        return;
-    }
-    match netease::poll_qr_login(&snapshot.qr_key) {
-        Ok(Some(cookie)) => {
-            let saved = state::save_netease_session(&cookie);
-            state::with_state(|state| {
-                state.netease_cookie = cookie;
-                state.qr_key.clear();
-                state.qr_url.clear();
-                state.status = "网易云登录成功。".to_string();
-            });
-            load_playlists();
-            if let Err(error) = saved {
-                state::with_state(|state| state.status = error);
-            }
-        }
-        Ok(None) => state::with_state(|state| {
-            state.status = "还没有确认登录：请在网易云音乐 App 里扫码，并在手机上点确认。".to_string()
-        }),
-        Err(error) => state::with_state(|state| state.status = error),
-    }
-}
-
-fn logout_netease() {
-    let result = state::clear_netease_session();
-    state::with_state(|state| {
-        state.netease_cookie.clear();
-        state.netease_view = NeteaseView::Home;
-        state.netease_results.clear();
-        state.netease_playlists.clear();
-        state.netease_playlist_name.clear();
-        state.netease_playlist_tracks.clear();
-        state.netease_playlist_page = 0;
-        state.qr_key.clear();
-        state.qr_url.clear();
-        state.status = match result {
-            Ok(()) => "已退出网易云登录。".to_string(),
-            Err(error) => error,
-        };
-    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -712,10 +614,6 @@ fn row() -> View {
 
 fn stack(gap: u32) -> View {
     View::new(Kind::Div, None).column().gap(gap)
-}
-
-fn spacer() -> View {
-    View::new(Kind::Div, None).grow()
 }
 
 fn section_header(label: &str, detail: &str, action: Option<View>) -> View {
@@ -973,7 +871,6 @@ fn transfer(state: &UiState) -> Option<View> {
 
 fn tabs(state: &UiState) -> View {
     let current = match state.tab {
-        Tab::Cloud => "cloud",
         Tab::Local => "local",
         Tab::Library => "library",
     };
@@ -993,7 +890,6 @@ fn tabs(state: &UiState) -> View {
             .child(body.margin_top(16))
     };
     let body = match state.tab {
-        Tab::Cloud => cloud_tab(state),
         Tab::Local => local_tab(state),
         Tab::Library => library_tab(state),
     };
@@ -1002,7 +898,6 @@ fn tabs(state: &UiState) -> View {
         .child(
             View::new(Kind::TabsList, None)
                 .prop("size", "2")
-                .child(trigger("cloud", "网易云音乐"))
                 .child(trigger("local", "本地文件"))
                 .child(trigger("library", &library_label)),
         )
@@ -1014,240 +909,6 @@ fn import_blocked(state: &UiState) -> bool {
     state.active || state.selected_addr.is_empty()
 }
 
-// --- NetEase ---------------------------------------------------------------------------------
-
-fn cloud_tab(state: &UiState) -> View {
-    if state.netease_cookie.is_empty() {
-        return cloud_login(state);
-    }
-    let bitrate = netease::normalized_audio_bitrate(state.netease_audio_bitrate);
-    let search = row()
-        .gap(8)
-        .child(input("搜索歌曲、歌手或专辑", &state.netease_query, EVENT_QUERY).grow())
-        .child(button("搜索", EVENT_SEARCH_CLOUD, "solid", "red", "3"));
-    let toolbar = row()
-        .gap(8)
-        .child(button("我的歌单", EVENT_LOAD_PLAYLISTS, "soft", "gray", "2"))
-        .child(quality_select(bitrate))
-        .child(spacer())
-        .child(button("退出", EVENT_LOGOUT, "ghost", "gray", "2"));
-    let hint = (bitrate > netease::AUDIO_BITRATE_LOW).then(|| {
-        callout("",
-            "音质越高，下载和传到手表越慢，播放也更容易卡顿。一般选 128 kbps 就够了。",
-            tone::WELL,
-            tone::MUTED,
-        )
-    });
-    let results = match state.netease_view {
-        NeteaseView::SearchResults => song_section(
-            "搜索结果",
-            &format!("{} 首", state.netease_results.len()),
-            &state.netease_results,
-            EVENT_SEARCH_RESULT_PREFIX,
-            0,
-            state,
-            None,
-        ),
-        NeteaseView::Playlists => cloud_playlists(state),
-        NeteaseView::PlaylistTracks => cloud_playlist_tracks(state),
-        NeteaseView::Home => empty_state("找一首歌",
-            "在上面搜索，或者打开“我的歌单”，点歌曲旁的“导入”就能传到手表。",
-            None,
-        ),
-    };
-    stack(14).child(search).child(toolbar).maybe(hint)
-        .maybe((!state.cloud_error.is_empty()).then(|| callout("", &state.cloud_error, tone::WELL, tone::RED)))
-        .maybe((!state.cloud_warnings.is_empty()).then(|| callout("", &state.cloud_warnings.join("\n"), tone::WELL, tone::MUTED)))
-        .child(results)
-}
-
-fn cloud_login(state: &UiState) -> View {
-    let mut panel = card()
-        .align_center()
-        .padding(28)
-        .child(heading("登录网易云音乐", 18))
-        .child(
-            text(
-                "登录后可以搜索歌曲、浏览你的歌单，一键导入到手表。登录信息只保存在本机。",
-                13,
-                tone::MUTED,
-            )
-            .class("rt-r-ta-center")
-            .max_width(340),
-        );
-    if state.qr_url.is_empty() {
-        panel = panel.child(button("扫码登录", EVENT_QR_BEGIN, "solid", "red", "3"));
-    } else {
-        panel = panel
-            .child(
-                View::new(Kind::Div, None)
-                    .padding(12)
-                    .radius(16)
-                    .bg("#ffffff")
-                    .child(
-                        View::new(Kind::Image, Some(&qr_image_url(&state.qr_url)))
-                            .width(196)
-                            .height(196),
-                    ),
-            )
-            .child(text("用网易云音乐 App 扫一扫，并在手机上确认", 13, tone::MUTED))
-            .child(
-                row()
-                    .gap(8)
-                    .child(button("我已确认", EVENT_QR_POLL, "solid", "red", "3"))
-                    .child(button("换一张", EVENT_QR_BEGIN, "soft", "gray", "3")),
-            );
-    }
-    panel
-}
-
-fn quality_select(bitrate: u32) -> View {
-    let option = |label: &str, value: u32| {
-        View::new(Kind::Option, Some(label)).prop("value", &value.to_string())
-    };
-    View::new(Kind::Select, None)
-        .prop("size", "2")
-        .prop("default-value", &bitrate.to_string())
-        .prop("key", EVENT_AUDIO_QUALITY)
-        .on(On::Change, EVENT_AUDIO_QUALITY)
-        .child(option("128 kbps · 推荐", netease::AUDIO_BITRATE_LOW))
-        .child(option("192 kbps", netease::AUDIO_BITRATE_MEDIUM))
-        .child(option("320 kbps", netease::AUDIO_BITRATE_HIGH))
-}
-
-/// A small cover from NetEase's image service; the well behind it shows while it loads.
-fn cover(url: &str) -> Option<View> {
-    if url.is_empty() {
-        return None;
-    }
-    let url = url.replacen("http://", "https://", 1);
-    let separator = if url.contains('?') { '&' } else { '?' };
-    Some(
-        View::new(Kind::Image, Some(&format!("{url}{separator}param=96y96")))
-            .square(44)
-            .radius(8)
-            .bg(tone::WELL),
-    )
-}
-
-fn song_row(song: &state::CloudSong, event: &str, state: &UiState) -> View {
-    let artists = if song.artists.is_empty() {
-        "未知歌手".to_string()
-    } else {
-        song.artists.join(" / ")
-    };
-    let meta = if song.album.is_empty() {
-        format!("{artists} · {}", duration_text(song.duration_ms))
-    } else {
-        format!("{artists} · {} · {}", song.album, duration_text(song.duration_ms))
-    };
-    row()
-        .maybe(cover(&song.cover_url))
-        .child(stack(2).grow().child(title(&song.name, 14)).child(line(&meta, 12, tone::MUTED)))
-        .child(button(
-            if state.cloud_downloading.contains(&song.id) { "下载中" }
-            else if state.cloud_current == Some(song.id) { "导入中" }
-            else if state.cloud_song_pending(song.id) { "等待导入" }
-            else { "导入" },
-            event, "soft", "red", "2",
-        ).disabled_if(state.selected_addr.is_empty() || state.cloud_song_pending(song.id)))
-}
-
-fn song_section(
-    label: &str,
-    detail: &str,
-    songs: &[state::CloudSong],
-    prefix: &str,
-    start: usize,
-    state: &UiState,
-    action: Option<View>,
-) -> View {
-    if songs.is_empty() {
-        return empty_state("没有找到歌曲", "换个关键词试试。", None);
-    }
-    let rows = songs
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(PLAYLIST_PAGE_SIZE)
-        .map(|(index, song)| song_row(song, &format!("{prefix}{index}"), state))
-        .collect();
-    stack(10).child(section_header(label, detail, action)).child(list(rows))
-}
-
-fn cloud_playlists(state: &UiState) -> View {
-    if state.netease_playlists.is_empty() {
-        return empty_state("没有歌单", "这个账号还没有创建或收藏歌单。", None);
-    }
-    let rows = state
-        .netease_playlists
-        .iter()
-        .take(60)
-        .map(|playlist| {
-            let creator = if playlist.creator.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", playlist.creator)
-            };
-            row()
-                .on(On::Click, &format!("{EVENT_PLAYLIST_PREFIX}{}", playlist.id))
-                .child(
-                    stack(2)
-                        .grow()
-                        .child(title(&playlist.name, 14))
-                        .child(line(
-                            &format!("{} 首{creator}", playlist.track_count),
-                            12,
-                            tone::MUTED,
-                        )),
-                )
-                .child(svg(icon::CHEVRON_RIGHT, 18, tone::FAINT))
-        })
-        .collect();
-    stack(10)
-        .child(section_header(
-            "我的歌单",
-            &format!("{} 个 · 点开后选择要导入的歌曲", state.netease_playlists.len()),
-            None,
-        ))
-        .child(list(rows))
-}
-
-fn cloud_playlist_tracks(state: &UiState) -> View {
-    let pages = state
-        .netease_playlist_tracks
-        .len()
-        .div_ceil(PLAYLIST_PAGE_SIZE)
-        .max(1);
-    let page = state.netease_playlist_page.min(pages - 1);
-    let back = button("返回我的歌单", EVENT_CLOSE_PLAYLIST, "ghost", "gray", "2");
-    let mut body = stack(10).child(row().child(back)).child(song_section(
-        &state.netease_playlist_name,
-        &format!("{} 首", state.netease_playlist_tracks.len()),
-        &state.netease_playlist_tracks,
-        EVENT_PLAYLIST_TRACK_PREFIX,
-        page * PLAYLIST_PAGE_SIZE,
-        state,
-        None,
-    ));
-    if pages > 1 {
-        body = body.child(
-            row()
-                .justify_center()
-                .child(
-                    button("上一页", EVENT_PLAYLIST_PAGE_PREVIOUS, "soft", "gray", "2")
-                        .disabled_if(page == 0),
-                )
-                .child(text(&format!("{} / {}", page + 1, pages), 13, tone::MUTED))
-                .child(
-                    button("下一页", EVENT_PLAYLIST_PAGE_NEXT, "soft", "gray", "2")
-                        .disabled_if(page + 1 >= pages),
-                ),
-        );
-    }
-    body
-}
-
 // --- Local files -----------------------------------------------------------------------------
 
 fn local_tab(state: &UiState) -> View {
@@ -1257,7 +918,7 @@ fn local_tab(state: &UiState) -> View {
             .padding(28)
             .child(heading("选择一首 MP3", 18))
             .child(
-                text("会自动读取歌名、歌手、专辑和时长。", 13, tone::MUTED)
+                text("自动读取歌名、歌手、专辑、内嵌封面与歌词", 13, tone::MUTED)
                     .class("rt-r-ta-center"),
             )
             .child(button("选择文件", EVENT_PICK_AUDIO, "solid", "blue", "3")),
@@ -1286,30 +947,44 @@ fn local_tab(state: &UiState) -> View {
                 .child(field("歌手", input("可不填", &state.artist, EVENT_ARTIST)))
                 .child(field("专辑", input("可不填", &state.album, EVENT_ALBUM))),
         );
-    let extra = |label: &str, file: Option<&state::SelectedFile>, empty: &str, event: &str| {
-        let (detail, action) = match file {
-            Some(file) => (file.name.clone(), "更换"),
-            None => (empty.to_string(), "选择"),
+    let extra =
+        |label: &str, file: Option<&state::SelectedFile>, empty: &str, event: &str, embedded: bool| {
+            let (detail, action) = match file {
+                Some(file) => (
+                    if embedded {
+                        format!("已从音频提取 · {}", file.name)
+                    } else {
+                        file.name.clone()
+                    },
+                    "更换",
+                ),
+                None => (empty.to_string(), "选择"),
+            };
+            row()
+                .child(stack(2).grow().child(title(label, 14)).child(line(&detail, 12, tone::MUTED)))
+                .child(button(action, event, "soft", "gray", "2"))
         };
-        row()
-            .child(stack(2).grow().child(title(label, 14)).child(line(&detail, 12, tone::MUTED)))
-            .child(button(action, event, "soft", "gray", "2"))
-    };
     let extras = card()
         .child(heading("封面和歌词", 15))
         .child(extra(
             "封面",
             state.cover.as_ref(),
-            "JPG 或 PNG，会自动裁剪并取色",
+            "未找到内嵌封面，可手动选择 JPG/PNG",
             EVENT_PICK_COVER,
+            state.cover_embedded,
         ))
         .child(View::new(Kind::Separator, None).prop("size", "4"))
         .child(extra(
             "歌词",
             state.lyrics.as_ref(),
-            "LRC、JSON 或 TXT",
+            "未找到内嵌歌词，可手动选择 LRC/JSON/TXT",
             EVENT_PICK_LYRICS,
+            state.lyrics_embedded,
         ));
+    let quality = card()
+        .child(heading("音质压缩", 15))
+        .child(local_quality_select(state.local_audio_bitrate))
+        .child(line(&compressed_size_text(state), 12, tone::MUTED));
     let start = View::new(Kind::Button, None)
         .prop("variant", "solid")
         .prop("color", "blue")
@@ -1318,7 +993,43 @@ fn local_tab(state: &UiState) -> View {
         .on(On::Click, EVENT_START_LOCAL)
         .disabled_if(import_blocked(state) || state.track_name.trim().is_empty())
         .child(View::new(Kind::Span, Some("导入到手表")));
-    stack(14).child(audio).child(details).child(extras).child(start)
+    stack(14)
+        .child(audio)
+        .child(details)
+        .child(quality)
+        .child(extras)
+        .child(start)
+}
+
+fn local_quality_select(bitrate: u32) -> View {
+    let option = |label: &str, value: u32| {
+        View::new(Kind::Option, Some(label)).prop("value", &value.to_string())
+    };
+    View::new(Kind::Select, None)
+        .prop("size", "2")
+        .prop("default-value", &bitrate.to_string())
+        .prop("key", EVENT_LOCAL_QUALITY)
+        .on(On::Change, EVENT_LOCAL_QUALITY)
+        .child(option("不压缩音质 · 默认", audio::ORIGINAL))
+        .child(option("128 kbps · 高音质", audio::HIGH))
+        .child(option("96 kbps · 中音质", audio::STANDARD))
+        .child(option("64 kbps · 低音质", audio::SMALL))
+}
+
+/// What the file will weigh after the selected compression.
+fn compressed_size_text(state: &UiState) -> String {
+    let Some(audio) = &state.audio else {
+        return String::new();
+    };
+    if state.local_audio_bitrate == audio::ORIGINAL {
+        return format!("文件压缩后的体积：保持原始大小（{}）", size_text(audio.size));
+    }
+    if audio.duration_ms == 0 {
+        return "文件压缩后的体积：无法估算".to_string();
+    }
+    // duration (ms) × bitrate (kbps) ÷ 8 = bytes.
+    let bytes = u64::from(audio.duration_ms) * u64::from(state.local_audio_bitrate) / 8;
+    format!("文件压缩后的体积约 {}", size_text(bytes))
 }
 
 // --- The watch's library ---------------------------------------------------------------------
@@ -1352,8 +1063,8 @@ fn library_tab(state: &UiState) -> View {
     let mut body = stack(12).child(section_header("歌曲", &summary, Some(refresh)));
     if state.device_library.is_empty() {
         body = body.child(empty_state("手表上还没有歌曲",
-            "从网易云音乐或本地文件导入一首吧。",
-            Some(button("去导入", &format!("{EVENT_TAB_PREFIX}cloud"), "soft", "blue", "2")),
+            "从本地文件导入一首吧。",
+            Some(button("去导入", &format!("{EVENT_TAB_PREFIX}local"), "soft", "blue", "2")),
         ));
     } else {
         body = body.child(list(library_rows(state, playlists_ok)));
@@ -1590,57 +1301,10 @@ fn local_track_id() -> u64 {
         .as_millis() as u64
 }
 
-fn qr_image_url(value: &str) -> String {
-    let Ok(code) = QrCode::new(value.as_bytes()) else {
-        return String::new();
-    };
-    let image = code
-        .render::<svg::Color>()
-        .min_dimensions(260, 260)
-        .quiet_zone(false)
-        .build();
-    format!("data:image/svg+xml;base64,{}", BASE64.encode(image))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{CloudPlaylist, CloudSong, DeviceInfo, DeviceLibraryTrack, DevicePlaylist, SelectedFile};
-
-    #[test]
-    fn cloud_rows_only_block_pending_songs() {
-        let mut state = UiState::default();
-        state.selected_addr = "watch".into();
-        state.active = true;
-        state.cloud_current = Some(1);
-        state.cloud_queue.push(import::ImportRequest {
-            addr: "watch".into(), track_id: 2, name: "second".into(),
-            artists: vec![], album: String::new(), duration_ms: 0,
-            palette: artwork::Palette::default(), assets: vec![], temp_directory: None,
-        });
-        let first = song(1, "first", "", "", 1);
-        let second = song(2, "second", "", "", 1);
-        let third = song(3, "third", "", "", 1);
-        let current = song_row(&first, "first", &state).to_json(&mut 0).to_string();
-        let queued = song_row(&second, "second", &state).to_json(&mut 0).to_string();
-        let available = song_row(&third, "third", &state).to_json(&mut 0).to_string();
-        assert!(current.contains("导入中") && current.contains("disabled"));
-        assert!(queued.contains("等待导入") && queued.contains("disabled"));
-        assert!(!available.contains("disabled"));
-        state.cloud_downloading.extend([3, 4]);
-        assert!(state.cloud_song_pending(3));
-        state.cloud_downloading.retain(|id| *id != 3);
-        assert!(state.cloud_song_pending(4));
-        state.cloud_current = None;
-        state.cloud_queue.clear();
-        state.cloud_downloading.clear();
-        assert!(!state.cloud_song_pending(1));
-        assert!(!state.cloud_song_pending(2));
-        state.netease_cookie = "cookie".into();
-        state.cloud_warnings.push("封面下载失败".into());
-        let tree = cloud_tab(&state).to_json(&mut 0).to_string();
-        assert!(tree.contains("封面下载失败"));
-    }
+    use crate::state::{DeviceInfo, DeviceLibraryTrack, DevicePlaylist, SelectedFile};
 
     #[test]
     fn remaining_time_rounds_up_and_needs_a_speed() {
@@ -1648,15 +1312,6 @@ mod tests {
         assert_eq!(remaining_text(10_000, 0), None);
         assert_eq!(remaining_text(10_001, 10_000).as_deref(), Some("剩余约 2 秒"));
         assert_eq!(remaining_text(5 * 1_048_576, 12_000).as_deref(), Some("剩余约 7 分 17 秒"));
-    }
-
-    #[test]
-    fn qr_login_image_is_embedded_data_uri() {
-        let uri = qr_image_url("https://music.163.com/login?codekey=test");
-        assert!(uri.starts_with("data:image/svg+xml;base64,"));
-        let encoded = uri.split_once(',').unwrap().1;
-        let svg = BASE64.decode(encoded).unwrap();
-        assert!(svg.starts_with(b"<?xml"));
     }
 
     #[test]
@@ -1710,14 +1365,13 @@ mod tests {
         state::with_state(|state| *state = UiState::default());
     }
 
-    fn song(id: u64, name: &str, artist: &str, album: &str, seconds: u32) -> CloudSong {
-        CloudSong {
+    fn song(id: u64, name: &str, artist: &str, album: &str, seconds: u32) -> DeviceLibraryTrack {
+        DeviceLibraryTrack {
             id,
             name: name.into(),
             artists: vec![artist.into()],
             album: album.into(),
             duration_ms: seconds * 1000,
-            cover_url: String::new(),
         }
     }
 
@@ -1742,34 +1396,6 @@ mod tests {
         ];
         let mut scenes = Vec::new();
 
-        scenes.push(("cloud-login", connected()));
-
-        let mut search = connected();
-        search.netease_cookie = "x".into();
-        search.netease_query = "周杰伦".into();
-        search.netease_view = NeteaseView::SearchResults;
-        search.netease_results = songs.clone();
-        search.netease_audio_bitrate = netease::AUDIO_BITRATE_LOW;
-        scenes.push(("cloud-search", search.clone()));
-
-        let mut importing = search.clone();
-        importing.active = true;
-        importing.import_title = "晴天".into();
-        importing.sent = 2_300_000;
-        importing.total = 4_300_000;
-        importing.speed_bytes_per_second = 72_000;
-        importing.status = "正在传输到手表…".into();
-        scenes.push(("cloud-importing", importing));
-
-        let mut playlists = search.clone();
-        playlists.netease_view = NeteaseView::Playlists;
-        playlists.netease_playlists = vec![
-            CloudPlaylist { id: 1, name: "我喜欢的音乐".into(), creator: "Lyra".into(), track_count: 328 },
-            CloudPlaylist { id: 2, name: "通勤路上".into(), creator: "Lyra".into(), track_count: 46 },
-            CloudPlaylist { id: 3, name: "跑步 BPM 170".into(), creator: "跑者".into(), track_count: 21 },
-        ];
-        scenes.push(("cloud-playlists", playlists));
-
         let mut local = connected();
         local.tab = Tab::Local;
         scenes.push(("local-empty", local.clone()));
@@ -1789,16 +1415,7 @@ mod tests {
         library.tab = Tab::Library;
         library.library_revision = "r1".into();
         library.device_version = library::PLAYLIST_VERSION;
-        library.device_library = songs
-            .iter()
-            .map(|song| DeviceLibraryTrack {
-                id: song.id,
-                name: song.name.clone(),
-                artists: song.artists.clone(),
-                album: song.album.clone(),
-                duration_ms: song.duration_ms,
-            })
-            .collect();
+        library.device_library = songs.clone();
         library.device_playlists = vec![
             DevicePlaylist { id: 10, name: "跑步".into(), tracks: vec![2, 4] },
             DevicePlaylist { id: 11, name: "睡前".into(), tracks: vec![] },

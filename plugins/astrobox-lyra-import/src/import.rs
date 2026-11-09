@@ -64,7 +64,7 @@ pub struct TempDirectory(pub std::path::PathBuf);
 impl Drop for TempDirectory {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.0) {
-            tracing::warn!(path = ?self.0, %error, "failed to remove cloud import directory");
+            tracing::warn!(path = ?self.0, %error, "failed to remove import directory");
         }
     }
 }
@@ -283,61 +283,6 @@ fn prepare(request: &ImportRequest) -> Result<Sender, String> {
         assets,
     };
     Ok(Sender::new(meta, sources.into_iter().map(|(_, source)| source).collect()))
-}
-
-fn next_queued_request() -> Option<ImportRequest> {
-    next_queued_request_with(|| {})
-}
-
-fn next_queued_request_with(after_lock: impl FnOnce()) -> Option<ImportRequest> {
-    let barrier = lock_abort();
-    after_lock();
-    state::with_state(|state| {
-        if barrier.is_some() || state.active || state.cloud_queue.is_empty() {
-            if !state.active {
-                state.cloud_current = None;
-            }
-            state.cloud_driving = false;
-            return None;
-        }
-        let request = state.cloud_queue.remove(0);
-        state.cloud_current = Some(request.track_id);
-        state.import_title = request.name.clone();
-        Some(request)
-    })
-}
-
-pub async fn drive_queue() {
-    let acquired = state::with_state(|state| {
-        if state.cloud_driving {
-            false
-        } else {
-            state.cloud_driving = true;
-            true
-        }
-    });
-    if !acquired {
-        return;
-    }
-    loop {
-        let Some(request) = next_queued_request() else { break };
-        let name = request.name.clone();
-        let retry = request.clone();
-        if let Err(error) = start(request).await {
-            if error == ABORT_BLOCKED_ERROR {
-                state::with_state(|state| {
-                    state.cloud_queue.insert(0, retry);
-                    state.cloud_current = None;
-                });
-                continue;
-            }
-            state::with_state(|state| {
-                state.cloud_current = None;
-                state.cloud_error = format!("《{name}》无法开始导入：{error}");
-            });
-        }
-    }
-    crate::ui::rerender();
 }
 
 pub async fn start(request: ImportRequest) -> Result<(), String> {
@@ -635,9 +580,6 @@ fn failure_text(failure: Failure) -> String {
 fn finish_error(error: &str) {
     state::with_state(|state| {
         state.active = false;
-        if state.cloud_current.is_some() {
-            state.cloud_error = format!("《{}》导入失败：{error}", state.import_title);
-        }
         state.status = error.to_string();
     });
 }
@@ -821,41 +763,6 @@ mod queue_tests {
         assert!(matches!(first.as_mut().poll(&mut context), Poll::Ready(())));
         *lock_abort() = None;
         state::with_state(|state| { state.active = false; state.status.clear(); });
-    }
-
-    #[test]
-    fn barrier_release_cannot_overtake_queue_handoff() {
-        use std::sync::mpsc;
-        let _test_guard = TEST_ACTIVE.lock().unwrap();
-        *lock_abort() = Some(AbortBarrier { addr: "watch".into(), req: 99, sending: false, acknowledged: false, started: Instant::now() });
-        state::with_state(|state| {
-            state.active = false;
-            state.cloud_driving = true;
-            state.cloud_queue.clear();
-            state.cloud_queue.push(ImportRequest { addr: "watch".into(), track_id: 7, name: "queued".into(), artists: vec![], album: String::new(), duration_ms: 0, palette: Palette::default(), assets: vec![], temp_directory: None });
-        });
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let driver = std::thread::spawn(move || next_queued_request_with(|| {
-            entered_tx.send(()).unwrap();
-            resume_rx.recv().unwrap();
-        }));
-        entered_rx.recv().unwrap();
-        assert!(abort_barrier().try_lock().is_err());
-        let ack = std::thread::spawn(|| {
-            let frame = Reply::Ack { op: lyra_protocol::op::ABORT, req: 99, status: Status::Ok, value: 0 }.encode().unwrap();
-            use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
-            let mut future = pin!(on_frame("watch", &frame));
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(true)));
-        });
-        resume_tx.send(()).unwrap();
-        assert!(driver.join().unwrap().is_none());
-        ack.join().unwrap();
-        assert!(!state::snapshot().cloud_driving);
-        assert!(lock_abort().is_none());
-        state::with_state(|state| state.cloud_driving = true);
-        assert_eq!(next_queued_request().unwrap().track_id, 7);
-        state::with_state(|state| { state.cloud_driving = false; state.cloud_current = None; state.status.clear(); });
     }
 
     #[test]

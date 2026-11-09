@@ -42,7 +42,6 @@ impl Default for Palette {
 #[derive(Clone, Debug)]
 pub struct PreparedArtwork {
     pub cover_path: String,
-    pub cover_size: u64,
     pub palette: Palette,
 }
 
@@ -65,7 +64,6 @@ pub fn prepare(source: &Path, output_directory: &Path) -> Result<PreparedArtwork
     }
     Ok(PreparedArtwork {
         cover_path: path_text(&cover_path)?,
-        cover_size,
         palette,
     })
 }
@@ -305,7 +303,6 @@ mod tests {
         let source = directory.join("source.png");
         RgbaImage::from_pixel(400, 300, Rgba([30, 120, 200, 255])).save(&source).unwrap();
         let prepared = prepare(&source, &directory.join("out")).unwrap();
-        assert_eq!(prepared.cover_size, COVER_BIN_BYTES);
         let header = fs::read(&prepared.cover_path).unwrap();
         assert_eq!(&header[..4], &[0x19, 0x10, 0, 0]);
         assert_eq!(u16::from_le_bytes([header[4], header[5]]), COVER_SIZE as u16);

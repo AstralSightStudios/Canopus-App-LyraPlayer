@@ -4,12 +4,12 @@ use crate::exports::astrobox::psys_plugin_v4::{
 };
 
 mod artwork;
+mod audio;
 mod connect;
 mod id3;
 mod import;
 mod library;
 mod lyrics;
-mod netease;
 mod sniff;
 mod state;
 mod ui;
@@ -33,7 +33,6 @@ impl event::Guest for LyraImportPlugin {
             EventType::Timer => {
                 if event_payload == import::STALL_TIMER_PAYLOAD {
                     import::check_stall();
-                    import::drive_queue().await;
                     ui::rerender();
                 }
             }
@@ -64,7 +63,6 @@ impl plugin_connect::Guest for LyraImportPlugin {
             if !import::on_frame(&device_addr, &frame).await {
                 library::on_frame(&device_addr, &frame).await;
             }
-            import::drive_queue().await;
             ui::rerender();
         }
     }
@@ -78,18 +76,6 @@ impl lifecycle::Guest for LyraImportPlugin {
             .compact()
             .init();
         connect::refresh_devices().await;
-        let restored = state::load_netease_session();
-        state::with_state(|state| {
-            state.netease_audio_bitrate =
-                netease::normalized_audio_bitrate(state.netease_audio_bitrate);
-            if let Ok(Some(cookie)) = &restored {
-                state.netease_cookie = cookie.clone();
-            }
-            // The page itself shows the login and device state; only a problem needs words.
-            if let Err(error) = &restored {
-                state.status = error.clone();
-            }
-        });
     }
 }
 
