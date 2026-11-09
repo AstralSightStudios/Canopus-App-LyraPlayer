@@ -98,6 +98,11 @@ pub struct UiState {
     pub audio: Option<SelectedFile>,
     pub cover: Option<SelectedFile>,
     pub lyrics: Option<SelectedFile>,
+    /// Whether the cover/lyrics came out of the picked MP3's ID3 tag.
+    pub cover_embedded: bool,
+    pub lyrics_embedded: bool,
+    /// Bitrate the local import is compressed to; 0 keeps the original.
+    pub local_audio_bitrate: u32,
     pub track_name: String,
     pub artist: String,
     pub album: String,
@@ -109,6 +114,10 @@ pub struct UiState {
     /// Average time the watch took to take one frame, over the last speed sample.
     pub round_trip_ms: u32,
     pub active: bool,
+    /// A confirmation dialog is waiting for an answer; duplicate clicks are ignored.
+    pub confirm_open: bool,
+    /// Songs whose deletion was confirmed and has not finished refreshing yet.
+    pub deleting_tracks: Vec<u64>,
     pub cloud_downloading: Vec<u64>,
     pub cloud_current: Option<u64>,
     pub cloud_queue: Vec<crate::import::ImportRequest>,
@@ -149,7 +158,10 @@ static STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
 pub fn with_state<R>(f: impl FnOnce(&mut UiState) -> R) -> R {
     let mut state = STATE
         .get_or_init(|| {
-            Mutex::new(UiState::default())
+            Mutex::new(UiState {
+                local_audio_bitrate: crate::audio::DEFAULT,
+                ..UiState::default()
+            })
         })
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

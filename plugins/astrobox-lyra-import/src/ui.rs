@@ -13,7 +13,7 @@ use crate::astrobox::psys_host_v4::{
 };
 use crate::state::{self, NeteaseView, PlaylistEditor, Tab, UiState};
 use crate::view::{Kind, On, View};
-use crate::{artwork, connect, id3, import, library, netease};
+use crate::{artwork, audio, connect, id3, import, library, netease};
 
 const EVENT_TAB_PREFIX: &str = "action:tab.";
 const EVENT_PICK_AUDIO: &str = "action:file.audio";
@@ -29,6 +29,7 @@ const EVENT_ARTIST: &str = "input:artist";
 const EVENT_ALBUM: &str = "input:album";
 const EVENT_QUERY: &str = "input:netease.query";
 const EVENT_AUDIO_QUALITY: &str = "input:netease.audio-quality";
+const EVENT_LOCAL_QUALITY: &str = "input:local.audio-quality";
 const EVENT_SEARCH_CLOUD: &str = "action:netease.search";
 const EVENT_LOAD_PLAYLISTS: &str = "action:netease.playlists";
 const EVENT_CLOSE_PLAYLIST: &str = "action:netease.playlist.close";
@@ -151,6 +152,12 @@ pub async fn on_event(event_id: &str, payload: &str) {
             let bitrate = value.parse().unwrap_or(netease::AUDIO_BITRATE_LOW);
             state::with_state(|state| {
                 state.netease_audio_bitrate = netease::normalized_audio_bitrate(bitrate);
+            });
+        }
+        EVENT_LOCAL_QUALITY => {
+            let bitrate = value.parse().unwrap_or(audio::DEFAULT);
+            state::with_state(|state| {
+                state.local_audio_bitrate = audio::normalized(bitrate);
             });
         }
         EVENT_START_LOCAL => start_local().await,
@@ -295,7 +302,12 @@ fn dialog_buttons(cancel: &str, confirm: &str) -> Vec<DialogButton> {
 }
 
 async fn confirm(title: &str, content: String, confirm: &str) -> bool {
-    dialog::show_dialog(
+    // The menu can deliver the same click twice; only the first one opens a dialog.
+    if state::with_state(|state| state.confirm_open) {
+        return false;
+    }
+    state::with_state(|state| state.confirm_open = true);
+    let confirmed = dialog::show_dialog(
         DialogType::Alert,
         DialogStyle::System,
         DialogInfo {
@@ -306,13 +318,29 @@ async fn confirm(title: &str, content: String, confirm: &str) -> bool {
     )
     .await
     .clicked_btn_id
-        == "confirm"
+        == "confirm";
+    state::with_state(|state| state.confirm_open = false);
+    confirmed
 }
 
 async fn confirm_delete(track_id: u64, track_name: &str) {
+    // A duplicate click must not ask a second time while the first delete is still running.
+    let snapshot = state::snapshot();
+    if snapshot.library_busy || snapshot.deleting_tracks.contains(&track_id) {
+        return;
+    }
+    state::with_state(|state| state.deleting_tracks.push(track_id));
     let content = format!("确定从手表删除《{track_name}》吗？音频、封面、背景和歌词都会被永久删除。");
     if confirm("删除歌曲", content, "删除").await {
         library::delete_track(track_id).await;
+        // The request was refused before it started; allow deleting the song again.
+        state::with_state(|state| {
+            if !state.library_busy {
+                state.deleting_tracks.retain(|id| *id != track_id);
+            }
+        });
+    } else {
+        state::with_state(|state| state.deleting_tracks.retain(|id| *id != track_id));
     }
 }
 
@@ -352,10 +380,28 @@ async fn pick_asset(kind: &str, extensions: &[&str]) {
     let inspected = import::inspect_file(&path, &result.name, kind);
     // On Android the name is a content URI segment such as "audio%3A1000012345",
     // so the file's own tags are the only meaningful source for these fields.
-    let tags = match &inspected {
-        Ok(selected) if kind == "audio" => id3::read_tags(Path::new(&selected.path)),
-        _ => id3::TrackTags::default(),
+    let media = match &inspected {
+        Ok(selected) if kind == "audio" => id3::read_media(Path::new(&selected.path)),
+        _ => id3::EmbeddedMedia::default(),
     };
+    let (use_embedded_cover, use_embedded_lyrics) = state::with_state(|state| {
+        (
+            state.cover_embedded || state.cover.is_none(),
+            state.lyrics_embedded || state.lyrics.is_none(),
+        )
+    });
+    let embedded_cover = if use_embedded_cover {
+        media.cover.and_then(store_embedded_cover)
+    } else {
+        None
+    };
+    let embedded_lyrics = match &inspected {
+        Ok(selected) if kind == "audio" && use_embedded_lyrics => media
+            .lyrics
+            .and_then(|lyrics| store_embedded_lyrics(lyrics, selected.duration_ms)),
+        _ => None,
+    };
+    let tags = media.tags;
     match inspected {
         Ok(selected) => state::with_state(|state| {
             if kind == "audio" {
@@ -373,15 +419,80 @@ async fn pick_asset(kind: &str, extensions: &[&str]) {
                 state.album = tags.album.unwrap_or_default();
                 state.duration_ms = selected.duration_ms;
                 state.audio = Some(selected);
+
+                // Embedded artwork and lyrics are used unless the user picked
+                // their own after the previous song.
+                if state.cover_embedded || state.cover.is_none() {
+                    remove_embedded(&mut state.cover);
+                    state.cover = embedded_cover;
+                    state.cover_embedded = state.cover.is_some();
+                }
+                if state.lyrics_embedded || state.lyrics.is_none() {
+                    remove_embedded(&mut state.lyrics);
+                    state.lyrics = embedded_lyrics;
+                    state.lyrics_embedded = state.lyrics.is_some();
+                }
             } else if kind == "cover" {
+                if state.cover_embedded {
+                    remove_embedded(&mut state.cover);
+                }
                 state.cover = Some(selected);
+                state.cover_embedded = false;
             } else {
+                if state.lyrics_embedded {
+                    remove_embedded(&mut state.lyrics);
+                }
                 state.lyrics = Some(selected);
+                state.lyrics_embedded = false;
             }
             state.status.clear();
         }),
         Err(error) => state::with_state(|state| state.status = format!("文件读取失败：{error}")),
     }
+}
+
+/// Drops a previously extracted file; manually picked files are left alone
+/// because their copies already live in `media/`.
+fn remove_embedded(file: &mut Option<state::SelectedFile>) {
+    if let Some(file) = file.take() {
+        let _ = std::fs::remove_file(&file.path);
+    }
+}
+
+fn store_embedded_cover(cover: id3::EmbeddedCover) -> Option<state::SelectedFile> {
+    let (extension, format) = match cover.kind {
+        crate::sniff::ImageFormat::Jpeg => ("jpg", "jpeg"),
+        crate::sniff::ImageFormat::Png => ("png", "png"),
+    };
+    let directory = artwork::unique_output_directory("embedded-cover");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join(format!("cover.{extension}"));
+    std::fs::write(&path, &cover.bytes).ok()?;
+    Some(state::SelectedFile {
+        name: "内嵌封面".to_string(),
+        path: path.to_string_lossy().into_owned(),
+        size: cover.bytes.len() as u64,
+        duration_ms: 0,
+        format,
+    })
+}
+
+fn store_embedded_lyrics(
+    lyrics: id3::EmbeddedLyrics,
+    duration_ms: u32,
+) -> Option<state::SelectedFile> {
+    let bytes = crate::lyrics::embedded_to_lrc(&lyrics.text, lyrics.timed, duration_ms)?;
+    let directory = artwork::unique_output_directory("embedded-lyrics");
+    std::fs::create_dir_all(&directory).ok()?;
+    let path = directory.join("lyrics.lrc");
+    std::fs::write(&path, &bytes).ok()?;
+    Some(state::SelectedFile {
+        name: "内嵌歌词".to_string(),
+        path: path.to_string_lossy().into_owned(),
+        size: bytes.len() as u64,
+        duration_ms: 0,
+        format: "lrc",
+    })
 }
 
 async fn start_local() {
@@ -394,7 +505,44 @@ async fn start_local() {
         state::with_state(|state| state.status = "曲名不能为空。".to_string());
         return;
     }
-    let mut assets = vec![import::ImportAsset::audio(audio.path)];
+    let source_kbps = if audio.duration_ms > 0 {
+        (audio.size.saturating_mul(8) / u64::from(audio.duration_ms)) as u32
+    } else {
+        0
+    };
+    let mut audio_path = audio.path;
+    let mut temp_directory = None;
+    // Never "upscale" a file that is already below the selected bitrate.
+    let compress = snapshot.local_audio_bitrate != audio::ORIGINAL
+        && (source_kbps == 0 || snapshot.local_audio_bitrate < source_kbps);
+    if compress {
+        let directory = artwork::unique_output_directory("local-audio");
+        let compressed = directory.join("audio.mp3");
+        state::with_state(|state| state.status = "正在压缩音频，请稍候…".to_string());
+        rerender();
+        let compressed_result = std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("无法创建压缩目录：{error}"))
+            .and_then(|_| {
+                audio::compress(
+                    Path::new(&audio_path),
+                    &compressed,
+                    snapshot.local_audio_bitrate,
+                )
+            });
+        match compressed_result {
+            Ok(()) => {
+                audio_path = compressed.to_string_lossy().into_owned();
+                temp_directory = Some(std::sync::Arc::new(import::TempDirectory(directory)));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&directory);
+                state::with_state(|state| {
+                    state.status = format!("音频压缩失败，将导入原文件：{error}");
+                });
+            }
+        }
+    }
+    let mut assets = vec![import::ImportAsset::audio(audio_path)];
     let mut palette = artwork::Palette::default();
     if let Some(cover) = snapshot.cover {
         let output = artwork::unique_output_directory("local-artwork");
@@ -430,7 +578,7 @@ async fn start_local() {
         duration_ms: snapshot.duration_ms,
         palette,
         assets,
-        temp_directory: None,
+        temp_directory,
     })
     .await;
     if let Err(error) = result {
@@ -1257,7 +1405,7 @@ fn local_tab(state: &UiState) -> View {
             .padding(28)
             .child(heading("选择一首 MP3", 18))
             .child(
-                text("会自动读取歌名、歌手、专辑和时长。", 13, tone::MUTED)
+                text("自动读取歌名、歌手、专辑、内嵌封面与歌词", 13, tone::MUTED)
                     .class("rt-r-ta-center"),
             )
             .child(button("选择文件", EVENT_PICK_AUDIO, "solid", "blue", "3")),
@@ -1286,30 +1434,44 @@ fn local_tab(state: &UiState) -> View {
                 .child(field("歌手", input("可不填", &state.artist, EVENT_ARTIST)))
                 .child(field("专辑", input("可不填", &state.album, EVENT_ALBUM))),
         );
-    let extra = |label: &str, file: Option<&state::SelectedFile>, empty: &str, event: &str| {
-        let (detail, action) = match file {
-            Some(file) => (file.name.clone(), "更换"),
-            None => (empty.to_string(), "选择"),
+    let extra =
+        |label: &str, file: Option<&state::SelectedFile>, empty: &str, event: &str, embedded: bool| {
+            let (detail, action) = match file {
+                Some(file) => (
+                    if embedded {
+                        format!("已从音频提取 · {}", file.name)
+                    } else {
+                        file.name.clone()
+                    },
+                    "更换",
+                ),
+                None => (empty.to_string(), "选择"),
+            };
+            row()
+                .child(stack(2).grow().child(title(label, 14)).child(line(&detail, 12, tone::MUTED)))
+                .child(button(action, event, "soft", "gray", "2"))
         };
-        row()
-            .child(stack(2).grow().child(title(label, 14)).child(line(&detail, 12, tone::MUTED)))
-            .child(button(action, event, "soft", "gray", "2"))
-    };
     let extras = card()
         .child(heading("封面和歌词", 15))
         .child(extra(
             "封面",
             state.cover.as_ref(),
-            "JPG 或 PNG，会自动裁剪并取色",
+            "未找到内嵌封面，可手动选择 JPG/PNG",
             EVENT_PICK_COVER,
+            state.cover_embedded,
         ))
         .child(View::new(Kind::Separator, None).prop("size", "4"))
         .child(extra(
             "歌词",
             state.lyrics.as_ref(),
-            "LRC、JSON 或 TXT",
+            "未找到内嵌歌词，可手动选择 LRC/JSON/TXT",
             EVENT_PICK_LYRICS,
+            state.lyrics_embedded,
         ));
+    let quality = card()
+        .child(heading("音质压缩", 15))
+        .child(local_quality_select(state.local_audio_bitrate))
+        .child(line(&compressed_size_text(state), 12, tone::MUTED));
     let start = View::new(Kind::Button, None)
         .prop("variant", "solid")
         .prop("color", "blue")
@@ -1318,7 +1480,43 @@ fn local_tab(state: &UiState) -> View {
         .on(On::Click, EVENT_START_LOCAL)
         .disabled_if(import_blocked(state) || state.track_name.trim().is_empty())
         .child(View::new(Kind::Span, Some("导入到手表")));
-    stack(14).child(audio).child(details).child(extras).child(start)
+    stack(14)
+        .child(audio)
+        .child(details)
+        .child(quality)
+        .child(extras)
+        .child(start)
+}
+
+fn local_quality_select(bitrate: u32) -> View {
+    let option = |label: &str, value: u32| {
+        View::new(Kind::Option, Some(label)).prop("value", &value.to_string())
+    };
+    View::new(Kind::Select, None)
+        .prop("size", "2")
+        .prop("default-value", &bitrate.to_string())
+        .prop("key", EVENT_LOCAL_QUALITY)
+        .on(On::Change, EVENT_LOCAL_QUALITY)
+        .child(option("不压缩音质 · 默认", audio::ORIGINAL))
+        .child(option("128 kbps · 高音质", audio::HIGH))
+        .child(option("96 kbps · 中音质", audio::STANDARD))
+        .child(option("64 kbps · 低音质", audio::SMALL))
+}
+
+/// What the file will weigh after the selected compression.
+fn compressed_size_text(state: &UiState) -> String {
+    let Some(audio) = &state.audio else {
+        return String::new();
+    };
+    if state.local_audio_bitrate == audio::ORIGINAL {
+        return format!("文件压缩后的体积：保持原始大小（{}）", size_text(audio.size));
+    }
+    if audio.duration_ms == 0 {
+        return "文件压缩后的体积：无法估算".to_string();
+    }
+    // duration (ms) × bitrate (kbps) ÷ 8 = bytes.
+    let bytes = u64::from(audio.duration_ms) * u64::from(state.local_audio_bitrate) / 8;
+    format!("文件压缩后的体积约 {}", size_text(bytes))
 }
 
 // --- The watch's library ---------------------------------------------------------------------

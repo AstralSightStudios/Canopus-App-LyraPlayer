@@ -251,6 +251,7 @@ fn fail(message: &str) {
     state::with_state(|state| {
         state.library_busy = false;
         state.library_target = None;
+        state.deleting_tracks.clear();
         state.status = message.to_string();
     });
 }
@@ -446,7 +447,10 @@ pub async fn on_frame(addr: &str, frame: &[u8]) -> bool {
                 }
                 refresh().await;
             } else {
-                state::with_state(|state| state.status = format!("手表拒绝了该操作：{status:?}"));
+                state::with_state(|state| {
+                    state.deleting_tracks.clear();
+                    state.status = format!("手表拒绝了该操作：{status:?}");
+                });
             }
             true
         }
@@ -487,6 +491,7 @@ async fn advance(addr: &str, next: Next) {
                 state.device_playlists = listing.playlists;
                 state.library_busy = false;
                 state.library_target = None;
+                state.deleting_tracks.clear();
                 state.status = format!(
                     "手表上有 {} 首歌曲、{} 个歌单。",
                     state.library_total,
